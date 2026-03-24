@@ -46,9 +46,10 @@ from matplotlib.widgets import Slider, RadioButtons, Button, TextBox
 from matplotlib.animation import FuncAnimation
 
 # --- Project toolboxes (adjust paths to your installation) ---
-sys.path.insert(0, r"D:\PROJECTS_US\TOOLBOXES")
-sys.path.insert(0, r"D:\PROJECTS_US\TOOLBOXES\ultrasound_velocity_tools_package")
-sys.path.append(r"D:/PROJECTS_US/P09_PVA_PHANTOMS/")
+sys.path.insert(0, r"D:\ECOS\tools")
+sys.path.insert(0, r"D:\ECOS\tools\ultrasound_velocity_tools")
+sys.path.append(r"D:\ECOS\database")
+sys.path.append(r"D:\ECOS\hardware")
 
 import SeDaq as SD
 import ACQ_ToolBox as ACQ
@@ -73,7 +74,7 @@ from BD_Experimentos_PVA import (
 # ==============================================================================
 
 # --- Hardware paths ---
-RUTA_DLL       = r"D:\PROJECTS_US\TOOLBOXES\SeDaqDLL.dll"
+RUTA_DLL = r"D:\PROJECTS_US\TOOLBOXES\SeDaqDLL.dll"
 ARDUINO_PORT   = 'COM4'
 ARDUINO_BAUD   = 115200
 
