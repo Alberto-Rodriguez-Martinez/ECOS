@@ -83,11 +83,12 @@ PROG_GEN_CLK   = 200.0e6        # Internal clock of the waveform generator (Hz)
 Fp             = 5.0e6          # Central frequency of the US excitation pulse (Hz)
 
 # --- Digitizer ---
-Fs             = 100.0e6        # ADC sampling frequency (Hz)
-RecLen         = 16 * 1024      # Acquisition record length (samples)
-AvgSamplesNum  = 25             # Number of averages per acquisition (noise reduction)
-Gain_Ch1_init  = 65             # Initial gain, channel 1 — pulse-echo receiver (dB)
-Gain_Ch2_init  = 35             # Initial gain, channel 2 — TT receiver (dB)
+Fs                  = 100.0e6        # ADC sampling frequency (Hz)
+RecLen              = 16 * 1024      # Acquisition record length (samples)
+AvgSamplesNum_live  = 1          # Averaging for the real-time display loop (speed over quality)
+AvgSamplesNum       = 25         # Averaging for PE/TT/WP captures (quality)
+Gain_Ch1_init       = 65             # Initial gain, channel 1 — pulse-echo receiver (dB)
+Gain_Ch2_init       = 35             # Initial gain, channel 2 — TT receiver (dB)
 
 # --- Windowing ---
 MyWinLen       = 200            # Initial Tukey window length (samples)
@@ -532,8 +533,9 @@ def update_rt(frame):
         return line_Ch1, line_Ch2
 
     x_unit  = samples_to_units(Smin) + samples_to_units(np.arange(ArrayLen))
-    buf_Ch1 = np.array(ACQ.GetAscan_Ch1(Smin, Smax, AvgSamplesNumber=AvgSamplesNum, Quantiz_Levels=1024))
-    buf_Ch2 = np.array(ACQ.GetAscan_Ch2(Smin, Smax, AvgSamplesNumber=AvgSamplesNum, Quantiz_Levels=1024))
+    # Acquire with reduced averaging for smooth real-time display
+    buf_Ch1 = np.array(ACQ.GetAscan_Ch1(Smin, Smax, AvgSamplesNumber=AvgSamplesNum_live, Quantiz_Levels=1024))
+    buf_Ch2 = np.array(ACQ.GetAscan_Ch2(Smin, Smax, AvgSamplesNumber=AvgSamplesNum_live, Quantiz_Levels=1024))
 
     line_Ch1.set_xdata(x_unit); line_Ch1.set_ydata(buf_Ch1)
     line_Ch2.set_xdata(x_unit); line_Ch2.set_ydata(buf_Ch2)
