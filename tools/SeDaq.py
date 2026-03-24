@@ -24,17 +24,17 @@ def ClosestPowerOf2(gencode_len):
 
 class SeDaqDLL:
     def __init__(self, dllPath=None):
-        # cmd = cdll.LoadLibrary(r"D:\PROJECTS_US\TOOLBOXES\SeDaqDLL.dll") 
-        if dllPath is None:
+        cmd = cdll.LoadLibrary(r"D:\ECOS\tools\SeDaqDLL.dll") 
+        # if dllPath is None:
 
-            dll_path = Path(__file__).parent / "SeDaqDLL.dll"
-            cmd = cdll.LoadLibrary(str(dll_path))
-            # print(dll_path)
-            # cmd = cdll.LoadLibrary((Path(__file__).parents[2] / "./SeDaqDLL.dll").__str__())
+        #     dll_path = Path(__file__).parent / "SeDaqDLL.dll"
+        #     cmd = cdll.LoadLibrary(str(dll_path))
+        #     # print(dll_path)
+        #     # cmd = cdll.LoadLibrary((Path(__file__).parents[2] / "./SeDaqDLL.dll").__str__())
             
-        else:            
-            cmd = cdll.LoadLibrary(dllPath)
-            print(r" ruta de la dll:" + dllPath)
+        # else:            
+        #     cmd = cdll.LoadLibrary(dllPath)
+        #     print(r" ruta de la dll:" + dllPath)
         self.SeDaqDLL_SetExcVoltage = cmd.SeDaqDLL_SetExcVoltage
         self.SeDaqDLL_SetSoftTrig = cmd.SeDaqDLL_SetSoftTrig
         self.SeDaqDLL_SetExcWave = cmd.SeDaqDLL_SetExcWave
