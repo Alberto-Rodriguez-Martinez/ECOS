@@ -66,7 +66,7 @@ from BD_Experimentos_PVA import (
     export_results_catalog_csv,
 )
 
-
+#%%
 # ==============================================================================
 # [1] CONFIGURATION
 # All hardware parameters and file paths in one place.
@@ -74,7 +74,7 @@ from BD_Experimentos_PVA import (
 # ==============================================================================
 
 # --- Hardware paths ---
-RUTA_DLL = r"D:\PROJECTS_US\TOOLBOXES\SeDaqDLL.dll"
+RUTA_DLL = r"D:\ECOS\tools\SeDaqDLL.dll"
 ARDUINO_PORT   = 'COM4'
 ARDUINO_BAUD   = 115200
 
@@ -102,7 +102,7 @@ MyDir          = os.path.join(CurrentDir, RootDir, Experiment, SaveDir)
 os.makedirs(MyDir, exist_ok=True)
 print(f"Working directory: {MyDir}")
 
-
+#%%
 # ==============================================================================
 # [2] UTILITY FUNCTIONS
 # ==============================================================================
@@ -195,7 +195,7 @@ def monitor_temperature(port=ARDUINO_PORT, baudrate=ARDUINO_BAUD, interval_s=10)
     fig_mon.canvas.mpl_connect('close_event', _on_close)
     plt.show()
 
-
+#%%
 # ==============================================================================
 # [3] ACQUISITION STATE
 # All mutable state shared between GUI callbacks lives here.
@@ -234,7 +234,7 @@ class AcqState:
 
 state = AcqState()
 
-
+#%%
 # ==============================================================================
 # [4] HARDWARE INITIALIZATION
 # Connect to SeDaq digitizer, upload excitation waveform, set initial gains.
@@ -269,7 +269,7 @@ SeDaq.SetGain2(state.Gain_Ch2)
 print(f"Gains — Ch1: {state.Gain_Ch1} dB  |  Ch2: {state.Gain_Ch2} dB")
 print("=" * 70)
 
-
+#%%
 # ==============================================================================
 # [5] QUICK SIGNAL CHECK
 # Acquire both channels over the full record and display the time-frequency
