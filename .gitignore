@@ -27,3 +27,6 @@ desktop.ini
 *.tmp
 *.bak
 gencode*.txt
+
+# Codigo obsoleto (solo local)
+_archive/
