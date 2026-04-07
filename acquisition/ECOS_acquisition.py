@@ -150,7 +150,7 @@ def read_temperatures(port=ARDUINO_PORT, baudrate=ARDUINO_BAUD, n_avg=3):
     return T1, T2, Cw1, Cw2
 
 
-def monitor_temperature(port=ARDUINO_PORT, baudrate=ARDUINO_BAUD, interval_s=10):
+def monitor_temperature(port=ARDUINO_PORT, baudrate=ARDUINO_BAUD, interval_s=1):
     """
     Optional diagnostic tool — real-time plot of temperature and derived
     water speed of sound from both sensors.
