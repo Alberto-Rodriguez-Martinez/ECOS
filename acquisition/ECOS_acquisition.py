@@ -38,6 +38,10 @@ import os
 import time
 from pathlib import Path                         # Required for path verification at [10]
 
+# Must be set before importing SeDaq — ctypes resolves DLL dependencies
+# using the working directory at import time, not at instantiation time
+os.chdir(r"D:\ECOS\tools")
+
 import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.animation as animation
@@ -50,6 +54,9 @@ sys.path.insert(0, r"D:\ECOS\tools")
 sys.path.insert(0, r"D:\ECOS\tools\ultrasound_velocity_tools")
 sys.path.append(r"D:\ECOS\database")
 sys.path.append(r"D:\ECOS\hardware")
+
+# Add tools directory to DLL search path (required for USB2.dll dependency)
+os.add_dll_directory(r"D:\ECOS\tools")
 
 import SeDaq as SD
 import ACQ_ToolBox as ACQ
@@ -288,7 +295,7 @@ US.Plot2Ascans_TimeFreq(
 )
 plt.show()
 
-
+#%%
 # ==============================================================================
 # [6] REAL-TIME ACQUISITION GUI
 #
@@ -573,7 +580,7 @@ def on_mouse_move(event):
 fig_rt.canvas.mpl_connect('motion_notify_event', on_mouse_move)
 plt.show()
 
-
+#%%
 # ==============================================================================
 # [7] WINDOWING GUI
 #
@@ -654,7 +661,7 @@ btn_apply.on_clicked(on_click_apply_window)
 draw_windowing_preview(MyWinLen)
 plt.show()
 
-
+#%%
 # ==============================================================================
 # [8] SIGNAL INSPECTION
 # Visual sanity check of raw and windowed signals before computation.
@@ -671,7 +678,7 @@ axs_chk[3].set_xlabel('Samples')
 plt.tight_layout()
 plt.show()
 
-
+#%%
 # ==============================================================================
 # [9] VELOCITY AND THICKNESS COMPUTATION
 #
@@ -701,7 +708,7 @@ print(f"  Longitudinal     Cl  = {Cl:.3f} m/s")
 print(f"  Thickness         L  = {L * 1000:.3f} mm")
 print("=" * 55)
 
-
+#%%
 # ==============================================================================
 # [10] SAVE EXPERIMENT
 #
