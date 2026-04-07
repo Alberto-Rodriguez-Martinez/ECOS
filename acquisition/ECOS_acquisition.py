@@ -21,10 +21,9 @@ Workflow (sections):
     [4]  Hardware initialization
     [5]  Quick signal check
     [6]  Real-time acquisition GUI
-    [7]  Windowing GUI
-    [8]  Signal inspection
-    [9]  Velocity and thickness computation
-    [10] Save experiment
+    [7]  Windowing GUI + Signal inspection
+    [8]  Velocity and thickness computation
+    [9]  Save experiment
 
 Author: Alberto
 """
@@ -198,7 +197,8 @@ def monitor_temperature(port=ARDUINO_PORT, baudrate=ARDUINO_BAUD, interval_s=10)
         print("Closing serial port (temperature monitor)...")
         arduino.close()
 
-    ani_mon = FuncAnimation(fig_mon, _update, interval=int(interval_s * 1000), blit=False)
+    # Must be assigned to a non-local variable to prevent garbage collection
+    monitor_temperature.ani = FuncAnimation(fig_mon, _update, interval=int(interval_s * 1000), blit=False)
     fig_mon.canvas.mpl_connect('close_event', _on_close)
     plt.show()
 
@@ -632,7 +632,8 @@ def submit_winlen(text):
 def on_click_apply_window(event):
     """
     Apply the current Tukey window to TT, PE, and WP signals.
-    Windowed signals and delays are stored in state for the computation step.
+    Windowed signals and delays are stored in state.
+    Closes the windowing GUI and immediately shows the inspection plot.
     """
     for attr_raw, attr_win, attr_delay in [
         ('TT_Ascan', 'TT_Ascan_win', 'Delay_TT'),
@@ -648,6 +649,21 @@ def on_click_apply_window(event):
         setattr(state, attr_delay, delay)
     print(f"Window applied — length: {MyWinLen} samples.")
 
+    # Close windowing GUI
+    plt.close(fig_win)
+
+    # [8] Signal inspection — opens automatically after windowing
+    fig_chk, axs_chk = plt.subplots(4, 1, figsize=(10, 8))
+    axs_chk[0].plot(UVT.NormSig(state.PE_Ascan));     axs_chk[0].set_title('PE raw (Ch2, sample)')
+    axs_chk[1].plot(UVT.NormSig(state.TT_Ascan_win)); axs_chk[1].set_title('TT windowed (Ch1, sample)')
+    axs_chk[2].plot(UVT.NormSig(state.WP_Ascan_win)); axs_chk[2].set_title('WP windowed (Ch1, reference)')
+    axs_chk[3].plot(UVT.NormSig(state.PE_Ascan_win)); axs_chk[3].set_title('PE windowed (Ch2, sample)')
+    for ax in axs_chk:
+        ax.set_ylabel('Norm. amplitude'); ax.grid(True)
+    axs_chk[3].set_xlabel('Samples')
+    plt.tight_layout()
+    plt.show()
+
 # TextBox: type a new window length and press Enter
 axbox    = plt.axes([0.10, 0.22, 0.30, 0.05])
 text_box = TextBox(axbox, 'Window length (samples):', initial=str(MyWinLen))
@@ -661,26 +677,10 @@ btn_apply.on_clicked(on_click_apply_window)
 draw_windowing_preview(MyWinLen)
 plt.show()
 
-#%%
-# ==============================================================================
-# [8] SIGNAL INSPECTION
-# Visual sanity check of raw and windowed signals before computation.
-# ==============================================================================
-
-fig_chk, axs_chk = plt.subplots(4, 1, figsize=(10, 8))
-axs_chk[0].plot(UVT.NormSig(state.PE_Ascan));     axs_chk[0].set_title('PE raw (Ch2, sample)')
-axs_chk[1].plot(UVT.NormSig(state.TT_Ascan_win)); axs_chk[1].set_title('TT windowed (Ch1, sample)')
-axs_chk[2].plot(UVT.NormSig(state.WP_Ascan_win)); axs_chk[2].set_title('WP windowed (Ch1, reference)')
-axs_chk[3].plot(UVT.NormSig(state.PE_Ascan_win)); axs_chk[3].set_title('PE windowed (Ch2, sample)')
-for ax in axs_chk:
-    ax.set_ylabel('Norm. amplitude'); ax.grid(True)
-axs_chk[3].set_xlabel('Samples')
-plt.tight_layout()
-plt.show()
 
 #%%
 # ==============================================================================
-# [9] VELOCITY AND THICKNESS COMPUTATION
+# [8] VELOCITY AND THICKNESS COMPUTATION
 #
 # Three-signal method (simultaneous Cl and L):
 #   - The TOF difference between TT_win and WP_win gives the delay introduced
@@ -710,7 +710,7 @@ print("=" * 55)
 
 #%%
 # ==============================================================================
-# [10] SAVE EXPERIMENT
+# [9] SAVE EXPERIMENT
 #
 # All raw signals (PE, TT, WP) and full metadata are saved to a structured
 # directory under "data_32/" via the BD_Experimentos_PVA module.
