@@ -155,22 +155,12 @@ class GaussFilterBank:
 
 
 # This function shifts a signal (delay) in a subsample basis using the fft. 
-# Its is based in the modulation of the frequency domain which results in a delay in time domain
-def ShiftSubsampleByfft( MySignal, Delay ): 
-    # Signal is the input signal to be delayed
-    # Delay is the delay to be aplied in a subsample basis
-    N = MySignal.size # signal length
-    HalfN = np.floor(N/2) # length of the semi-frequency axis in frequency domain
-    FAxis1 = np.arange(HalfN + 1) / N # Positive semi-frequency axis
-    FAxis2 = ( np.arange(HalfN+2, N+1, 1) - ( N + 1) )/ N # Negative semi-frequency axis
-    FAxis = np.concatenate((FAxis1, FAxis2)) # Full reordered frequency axis
-#    FT_Signal = np.fft.fft(Signal) # calculates the fft of the input signal
-#    Mod = np.exp(1j*2*np.pi*FAxis*Delay) # creates the modulator
-#    Mod_FT = FT_Signal * Mod    # modulates the fft of the input signal
-#    Shifted_Signal = np.real( np.fft.ifft( Mod_FT ) ); # calculate the delayed signal intime as the inverse fft of the signal
-    
-    #Returned value is the delayed or shifted signal
-    return np.real( np.fft.ifft( np.fft.fft(MySignal) * np.exp(1j*2*np.pi*FAxis*Delay) ) )
+# Shifts a signal in time by a fractional number of samples using frequency-domain modulation
+def ShiftSubsampleByfft(MySignal, Delay):
+    N = MySignal.size
+    freqs = np.fft.fftfreq(N)
+    modulation = np.exp(1j * 2 * np.pi * freqs * Delay)
+    return np.real(np.fft.ifft(np.fft.fft(MySignal) * modulation))
 
 
 # filtering using fft with all the filters of the bank
@@ -185,33 +175,31 @@ def SS_filter_ZeroPhase(FTSignal, FTBank, ScanLength):
     return FilteredSignal
 
 
-# This function calculates the maxima location in subsample basis using cosine interpolation
-def CosineInterpMax(MySignal, UseHilbEnv = False):
-    # MySignal = the input signal    
-    # UseHilbEnv, true if to use hilbert envelope to find maxima
+# Calculates the maxima location in subsample basis using cosine interpolation
+def CosineInterpMax(MySignal, UseHilbEnv=False):
     if UseHilbEnv:
-        MySignal = np.absolute( signal.hilbert(MySignal) )
-    
-    MaxLoc = np.argmax(np.abs(MySignal)) # find index of maximum
-    N = MySignal.size # signal length
-    A = MaxLoc-1 #left proxima
-    B = MaxLoc+1 #Right proxima
-    if MaxLoc==0: # Check if maxima is in the first of the last sample
-        A = MySignal.size-1
-    elif MaxLoc==MySignal.size-1:
+        MySignal = np.abs(signal.hilbert(MySignal))
+
+    MaxLoc = np.argmax(np.abs(MySignal))
+    N = MySignal.size
+    A = MaxLoc - 1
+    B = MaxLoc + 1
+
+    if MaxLoc == 0:
+        A = N - 1
+    elif MaxLoc == N - 1:
         B = 0
-        # calculate interpolation maxima according to cosine interpolation
-    Alpha = np.arccos( (MySignal[A] + MySignal[B]) / (2 * MySignal[MaxLoc]) )
-    Beta = np.arctan( (MySignal[A] - MySignal[B]) / (2 * MySignal[MaxLoc] * np.sin(Alpha) ) )
+
+    ratio = (MySignal[A] + MySignal[B]) / (2 * MySignal[MaxLoc])
+    ratio = np.clip(ratio, -1.0, 1.0)
+    Alpha = np.arccos(ratio)
+    Beta = np.arctan((MySignal[A] - MySignal[B]) / (2 * MySignal[MaxLoc] * np.sin(Alpha)))
     Px = Beta / Alpha
-    
-    # Calculate ToF in samples
+
     DeltaToF = MaxLoc - Px
-    # Check wherter if delay is to the right or to the left and correct ToF
-    if MaxLoc>N/2:
+    if MaxLoc > N / 2:
         DeltaToF = -(N - DeltaToF)
-        
-    #Returned value is DeltaToF, the location of the maxima in subsample basis
+
     return DeltaToF
 
 
@@ -339,46 +327,47 @@ def nextpow2(i):
 
 # make window general purpose
     
-def MakeWindow(SortofWin = 'boxcar', WinLen = 512, param1 = 1, param2 = 1, Span = 0, Delay = 0):
+def MakeWindow(SortofWin='boxcar', WinLen=512, param1=1, param2=1, Span=0, Delay=0):
     '''
-    Make window 
-    SortofWin can be any of the following, entered as plaintext
-        boxcar, triang, blackman, hamming, hann, bartlett, flattop, parzen, bohman, 
-        blackmanharris, nuttall, barthannkaiser (needs beta), gaussian (needs standard deviation), 
-        general_gaussian (needs power, width), slepian (needs width), dpss (needs normalized half-bandwidth), 
+    Make window.
+    SortofWin can be any of the following, entered as plaintext:
+        boxcar, triang, blackman, hamming, hann, bartlett, flattop, parzen, bohman,
+        blackmanharris, nuttall, barthannkaiser (needs beta), gaussian (needs standard deviation),
+        general_gaussian (needs power, width), slepian (needs width), dpss (needs normalized half-bandwidth),
         chebwin (needs attenuation), exponential (needs decay scale), tukey (needs taper fraction)
     WinLen = Length of the desired window
     param1 = beta (kaiser), std (Gaussian), power (general gaussian), width (slepian), norm h-b (dpss),
-            attenuation (chebwin), decay scale (exponential), tapper fraction (tukey)
+             attenuation (chebwin), decay scale (exponential), taper fraction (tukey)
     param2 = width (general gaussian)
-    Span = final length of the required window, in case expansion needed
-    Delay = Required delay to the right, in samples
+    Span   = final length after zero-padding (must be >= WinLen)
+    Delay  = delay in samples (can be fractional)
     '''
-    
     lstWinWithParameter = ['barthannkaiser', 'gaussian', 'slepian', 'dpss', 'chebwin', 'exponential', 'tukey', 'general_gaussian']
     if any(SortofWin.lower() in x for x in lstWinWithParameter):
         if SortofWin.lower() == 'general_gaussian':
             MyWin = signal.get_window(('general_gaussian', param1, param2), WinLen)
         else:
-            MyWin = signal.get_window((str(SortofWin.lower()), param1), WinLen)
+            MyWin = signal.get_window((SortofWin.lower(), param1), WinLen)
     else:
-        MyWin = signal.get_window(str(SortofWin.lower()), WinLen)
-        
-    if not(Span==0): # if Span, add zeros to the end
-        MyWin = np.append(MyWin,np.zeros(Span-WinLen))
-    
-    if not(Delay==0): #if Delay, circshift to right Delay samples
-        if Delay.is_integer():
-            MyWin = np.roll(MyWin, int(Delay)) # if interger use numpy roll
+        MyWin = signal.get_window(SortofWin.lower(), WinLen)
+
+    if Span > 0:
+        if Span < WinLen:
+            raise ValueError("Span must be greater than or equal to WinLen.")
+        MyWin = np.append(MyWin, np.zeros(Span - WinLen))
+
+    if Delay != 0:
+        if float(Delay).is_integer():
+            MyWin = np.roll(MyWin, int(Delay))
         else:
-            MyWin = ShiftSubsampleByfft(MyWin,-Delay) # if float use subsample
-        
+            MyWin = ShiftSubsampleByfft(MyWin, -Delay)
+
     return MyWin
     
 # calculates centroid of a vector
 def Centroid(x):
     '''
-    Calculates centorid of a vector
+    Calculates centroid of a vector
     '''
     n = np.arange(len(x))
     return np.sum(n*(x**2))/np.sum(x**2)
@@ -390,7 +379,26 @@ def Envelope(MySignal):
     Calculates envelope of a signal
     as the absolute value of its Hilbert Transform
     '''
-    return np.absolute( signal.hilbert(MySignal) )
+    return np.abs(signal.hilbert(MySignal))
+
+
+def pad_to_pow2(sig):
+    """
+    Zero-pad signal to the next power-of-2 length.
+    """
+    N = len(sig)
+    next_pow2 = 2 ** int(np.ceil(np.log2(N)))
+    padded = np.zeros(next_pow2)
+    padded[:N] = sig
+    return padded
+
+
+def NormSig(x):
+    """
+    Normalizes a signal to unit maximum absolute value.
+    """
+    max_val = np.max(np.abs(x))
+    return x / max_val if max_val > 0 else x
 
 # Estimates spectroscopy resosnces
 def estimateSpectroscopyParam(Param = 'Fr',Fr=1.,h=1.,v=1.,n=1.):
@@ -441,163 +449,113 @@ def movingAverage(Signal, SortofWin = 'boxcar', WinLen = 5, param1 = 1, param2 =
     OutSig = (np.real( np.fft.ifft(np.fft.fft(AuxSig)*np.fft.fft(MyWin))))/np.sum(MyWin)
     return OutSig[:len(Signal)]
 
-def CalcToFAscanCosine_XCRFFT(Data, Ref, UseHilbEnv = False):
-    #----------------------------------------------
-    # used to align one Ascan to a Reference by ToF subsample estimate using cosine
-    # also returns ToFmap and Xcorr. Xcoor is calculated using FFT
-    # It uses cosine interpolation to approximate peak location
-    #
-    # Inputs:
-    #   Data = Ascan 
-    #   Ref = Refference to align
-    #   UseHilbEnv = boolean, True if using hilbert trransform
-    #   ChangeSignal = boolean, True to mutate input
-    # Outputs:
-    #   AlignedData = Aligned array to Ref
-    #   MyXcor = Result of xcorrelation
-    #   DeltaToF = Time of flight between pulses
-    #
-    # Alberto
-    # 23/05/2017
-    #----------------------------------------------
-    try:
-        # Calculates xcorr in frequency domain
-        MyXcor = np.real( np.fft.ifft( np.fft.fft( Data ) * np.conj( np.fft.fft( Ref ) ) ) )
-        
-        # determine time of flight
-        DeltaToF=CosineInterpMax(MyXcor, UseHilbEnv = UseHilbEnv)
-    
-        # Delay to align
-        AlignedData = ShiftSubsampleByfft(Data,DeltaToF)
-        return DeltaToF, MyXcor, AlignedData
-        
-    except Exception as ex:
-        print(ex)
-
-def MyThick_Vel(PE_Ascan,TT_Ascan,TT45_Ascan,WP_Ascan,Ref_PE,Fs,Cw,Angle,UseHilbEnv):
-    #----------------------------------------------
-    # Calcutes thickness and velocity os a sample using PE and TT
-    # uses refference signal to align signals XCOR in freq domain
-    # it aso uses iterative deconvolution
-    #
-    # Inputs:
-    #   PE_Ascan = PE Ascan
-    #   TT_Ascan = TT Ascan
-    #   TT45_Ascan = TT45  Ascan
-    #   WP_Ascan = Water Path Ascan
-    #   Ref_PE = Reference Ascan for PE
-    #   Fs = sampling frequency
-    #   Cw = speed of sound inwater
-    #   Angle = Rotation angle for shear wave in degrees
-    #   UseHilbEnv = True to use hilber envelope, Falsew for maximum
-    # Outputs:
-    #   Cl, Cs, L
-    #
-    # Alberto
-    # 24/05/2017
-    #----------------------------------------------
-    try:
-        TOF_TW = -CalcToFAscanCosine_XCRFFT(TT_Ascan,WP_Ascan,UseHilbEnv=UseHilbEnv)[0]
-        
-        RAmp=np.sum(np.power(Ref_PE,2))/len(Ref_PE) # mean power of refference 
-        TOF_PE = np.zeros(2) # preallocates TOF_PE
-        Stripped1 = np.copy(PE_Ascan)
-        TOF_PE[0] = CalcToFAscanCosine_XCRFFT(Stripped1,Ref_PE,UseHilbEnv=True)[0] #time of flight of first echo        
-        RefShifted = ShiftSubsampleByfft(Ref_PE,-TOF_PE[0]) #  Shift the ref to the Ascan position
-        Amp = np.sum(Stripped1 * RefShifted) / len(RefShifted) / RAmp # Amplitude Ponderation factor
-        Stripped2 = Stripped1 - RefShifted*Amp # strip pulse
-        TOF_PE[1] = CalcToFAscanCosine_XCRFFT(Stripped2,Ref_PE,UseHilbEnv=True)[0] #time of flight second echo
-        
-        # TOF for TT00 signal
-#        TOF_TW = CalcToFAscanCosine_XCRFFT(TT_Ascan,WP_Ascan)[0]
-#        if DoIPlot: #only for visualization purposes
-#            patata1,XCOR,patata2 = CalcToFAscanCosine_XCRFFT(TT_Ascan,WP_Ascan,UseHilbEnv=UseHilbEnv) #[0]
-#            Plot3Ascans_Time(TT_Ascan,WP_Ascan, XCOR, 'TT_Ascan', 'WP_Ascan', 'XCOR',1,'') 
-#            
-#        RAmp=np.sum( np.power(Ref_PE,2))/len(Ref_PE) # mean power of refference 
-#        stripIterNo = 2 # number of iterations of deconvolution
-#        StrippedAscans = np.zeros((stripIterNo+1, len(Ref_PE))) #preallocates stripped
-#        TOF_PE = np.zeros(stripIterNo) # preallocates TOF_PE
-#        StrippedAscans[0] = PE_Ascan
-#               
-#        for LayerNo in range(stripIterNo):
-#            TOF_PE[LayerNo] = CalcToFAscanCosine_XCRFFT(StrippedAscans[LayerNo],Ref_PE,UseHilbEnv=UseHilbEnv)[0]
-#            RefShifted = ShiftSubsampleByfft(Ref_PE,-TOF_PE[LayerNo]) #  Shift the ref to the Ascan position
-#            Amp = np.sum(StrippedAscans[LayerNo] * RefShifted) / len(RefShifted) / RAmp # Amplitude Ponderation factor
-#            StrippedAscans[LayerNo+1] = StrippedAscans[LayerNo] - RefShifted*Amp # strip puls
-
-        TOF_Aux = np.abs(TOF_PE[1]-TOF_PE[0]) # TOF between echoes in PE
-
-        Cl = Cw * (1 + ( ( 2 * TOF_TW / Fs ) / ( TOF_Aux / Fs ) ) ) # Longitudinal velotity
-        L = (Cw / 2) * ( 2 * ( TOF_TW / Fs ) + ( TOF_Aux /Fs ) ) #Thickness
-        
-        # TOF for TT45 signal
-        TOF_TW_45 = -CalcToFAscanCosine_XCRFFT(TT45_Ascan,WP_Ascan,UseHilbEnv=UseHilbEnv)[0]
-
-            
-        Ang_Crit = (Angle) * 2 * np.pi / 360 #Critical angle in radians
-        
-        Cs = Cw / np.sqrt( np.power(np.sin(Ang_Crit),2) + np.power( ( ( TOF_TW_45 / Fs * Cw / L ) - np.cos(Ang_Crit) ),2) )
-
-        return Cl, Cs, L
-
-    except Exception as ex:
-        print(ex)
-
-def LongVelocity_Thickness(PE_Ascan,TT_Ascan,WP_Ascan,Ref_PE,Fs,Cw,UseHilbEnv):
+def CalcToFAscanCosine_XCRFFT(Data, Ref, UseHilbEnv=False):
     """
-    Calcutes thickness and velocity of a sample using PE and TT
-    uses refference signal to align signals XCOR in freq domain
-    it aso uses iterative deconvolution
-    
+    TOF between Data and Ref via cross-correlation (FFT) and cosine interpolation.
+
     Inputs:
-      PE_Ascan = PE Ascan
-      TT_Ascan = TT Ascan    
-      WP_Ascan = Water Path Ascan
-      Ref_PE = Reference Ascan for PE
-      Fs = sampling frequency
-      Cw = speed of sound inwater    
-      UseHilbEnv = True to use hilber envelope, False for maximum    
+        Data        = Ascan to align
+        Ref         = Reference Ascan
+        UseHilbEnv  = True to use Hilbert envelope when finding xcorr peak
     Outputs:
-      Cl = longitudinal velocity
-      L  = Thickness 
-    
-    Alberto
-    17/12/2019    
+        DeltaToF    = subsample TOF estimate (samples)
+        MyXcor      = cross-correlation vector
+        AlignedData = Data shifted to align with Ref
     """
     try:
-        dt = 1 / Fs  # time resolution
+        Data = pad_to_pow2(Data)
+        Ref  = pad_to_pow2(Ref)
+        MyXcor = np.real(np.fft.ifft(np.fft.fft(Data) * np.conj(np.fft.fft(Ref))))
+        DeltaToF = CosineInterpMax(MyXcor, UseHilbEnv=UseHilbEnv)
+        AlignedData = ShiftSubsampleByfft(Data, DeltaToF)
+        return DeltaToF, MyXcor, AlignedData
+    except Exception as ex:
+        print(f"Error in CalcToFAscanCosine_XCRFFT: {ex}")
+        raise
 
-        # TOF from TT and WP
+def MyThick_Vel(PE_Ascan, TT_Ascan, TT45_Ascan, WP_Ascan, Ref_PE, Fs, Cw, Angle, UseHilbEnv):
+    """
+    Computes longitudinal velocity, shear velocity, and sample thickness from A-scans.
+
+    Inputs:
+        PE_Ascan    = pulse-echo A-scan
+        TT_Ascan    = through-transmission A-scan (0 deg)
+        TT45_Ascan  = through-transmission A-scan (oblique, for shear)
+        WP_Ascan    = water-path reference A-scan
+        Ref_PE      = PE reference signal
+        Fs          = sampling frequency (Hz)
+        Cw          = speed of sound in water (m/s)
+        Angle       = oblique incidence angle in degrees
+        UseHilbEnv  = True to use Hilbert envelope for TOF estimation
+    Outputs:
+        Cl, Cs, L   = longitudinal velocity (m/s), shear velocity (m/s), thickness (m)
+    """
+    try:
+        dt = 1 / Fs
         TOF_TW = -CalcToFAscanCosine_XCRFFT(TT_Ascan, WP_Ascan, UseHilbEnv=UseHilbEnv)[0]
 
-        # First and second echo in PE
         TOF_PE = np.zeros(2)
-        ref_energy = np.mean(Ref_PE**2)
-
-        # First echo
+        ref_energy = np.mean(Ref_PE ** 2)
         TOF_PE[0] = CalcToFAscanCosine_XCRFFT(PE_Ascan, Ref_PE, UseHilbEnv=True)[0]
         shifted_ref = ShiftSubsampleByfft(Ref_PE, -TOF_PE[0])
         amp = np.mean(PE_Ascan * shifted_ref) / ref_energy
         stripped_signal = PE_Ascan - shifted_ref * amp
-
-        # Second echo
         TOF_PE[1] = CalcToFAscanCosine_XCRFFT(stripped_signal, Ref_PE, UseHilbEnv=True)[0]
-        TOF_diff = np.abs(TOF_PE[1] - TOF_PE[0])
 
-        # Time-domain conversion
+        t_pe = np.abs(TOF_PE[1] - TOF_PE[0]) * dt
         t_tw = TOF_TW * dt
-        t_pe = TOF_diff * dt
-
-        # Compute results
         Cl = Cw * (1 + (2 * t_tw / t_pe))
-        L = (Cw / 2) * (2 * t_tw + t_pe)
+        L  = (Cw / 2) * (2 * t_tw + t_pe)
+
+        TOF_TW_45 = -CalcToFAscanCosine_XCRFFT(TT45_Ascan, WP_Ascan, UseHilbEnv=UseHilbEnv)[0]
+        t_tw_45 = TOF_TW_45 * dt
+        theta = np.deg2rad(Angle)
+        term = (t_tw_45 * Cw / L) - np.cos(theta)
+        Cs = Cw / np.sqrt(np.sin(theta)**2 + term**2)
+
+        return Cl, Cs, L
+
+    except Exception as ex:
+        print(f"Error in MyThick_Vel: {ex}")
+        return None, None, None
+
+def LongVelocity_Thickness(PE_Ascan, TT_Ascan, WP_Ascan, Ref_PE, Fs, Cw, UseHilbEnv):
+    """
+    Computes longitudinal velocity and thickness from A-scans (no shear).
+
+    Inputs:
+        PE_Ascan   = pulse-echo A-scan
+        TT_Ascan   = through-transmission A-scan
+        WP_Ascan   = water-path reference A-scan
+        Ref_PE     = PE reference signal
+        Fs         = sampling frequency (Hz)
+        Cw         = speed of sound in water (m/s)
+        UseHilbEnv = True to use Hilbert envelope for TOF estimation
+    Outputs:
+        Cl, L      = longitudinal velocity (m/s), thickness (m)
+    """
+    try:
+        dt = 1 / Fs
+        TOF_TW = -CalcToFAscanCosine_XCRFFT(TT_Ascan, WP_Ascan, UseHilbEnv=UseHilbEnv)[0]
+
+        TOF_PE = np.zeros(2)
+        ref_energy = np.mean(Ref_PE ** 2)
+        TOF_PE[0] = CalcToFAscanCosine_XCRFFT(PE_Ascan, Ref_PE, UseHilbEnv=True)[0]
+        shifted_ref = ShiftSubsampleByfft(Ref_PE, -TOF_PE[0])
+        amp = np.mean(PE_Ascan * shifted_ref) / ref_energy
+        stripped_signal = PE_Ascan - shifted_ref * amp
+        TOF_PE[1] = CalcToFAscanCosine_XCRFFT(stripped_signal, Ref_PE, UseHilbEnv=True)[0]
+
+        t_tw = TOF_TW * dt
+        t_pe = np.abs(TOF_PE[1] - TOF_PE[0]) * dt
+        Cl = Cw * (1 + (2 * t_tw / t_pe))
+        L  = (Cw / 2) * (2 * t_tw + t_pe)
 
         return Cl, L
 
     except Exception as ex:
-        print(f"Error: {ex}")
-        return None, None
+        print(f"Error in LongVelocity_Thickness: {ex}")
+        raise
 
 def Plot3Ascans_Time(Ascan1,Ascan2,Ascan3, name1, name2, name3,Normalized,ArrowLabel):
     #----------------------------------------------

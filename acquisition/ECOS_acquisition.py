@@ -50,7 +50,6 @@ from matplotlib.animation import FuncAnimation
 
 # --- Project toolboxes (adjust paths to your installation) ---
 sys.path.insert(0, r"D:\ECOS\tools")
-sys.path.insert(0, r"D:\ECOS\tools\ultrasound_velocity_tools")
 sys.path.append(r"D:\ECOS\database")
 sys.path.append(r"D:\ECOS\hardware")
 
@@ -59,8 +58,7 @@ os.add_dll_directory(r"D:\ECOS\tools")
 
 import SeDaq as SD
 import ACQ_ToolBox as ACQ
-import US_ToolBox_2025 as US
-import ultrasound_velocity_tools as UVT
+import ECOS_US_ToolBox as US
 import GenCode_ToolBox as gc
 from temperature_Alberto_temporal import Arduino
 from BD_Experimentos_PVA import (
@@ -606,10 +604,10 @@ def draw_windowing_preview(win_len):
     titles  = ['TT (Ch1, sample)', 'PE (Ch2, sample)', 'WP (Ch1, reference, no sample)']
     for ax, sig, title in zip(axs_win, signals, titles):
         ax.cla()
-        env   = UVT.Envelope(sig)
+        env   = US.Envelope(sig)
         peak  = np.argmax(env)
         delay = peak - win_len // 2           # Center the window on the peak
-        win   = UVT.MakeWindow('Tukey', WinLen=win_len, param1=0.2, param2=1,
+        win   = US.MakeWindow('Tukey', WinLen=win_len, param1=0.2, param2=1,
                                Span=len(sig), Delay=delay)
         ax.plot(sig / np.max(np.abs(sig)), label='Normalised signal', alpha=0.6)
         ax.plot(win / np.max(win),          label='Tukey window',     linestyle='--')
@@ -641,9 +639,9 @@ def on_click_apply_window(event):
         ('WP_Ascan', 'WP_Ascan_win', 'Delay_WP'),
     ]:
         sig   = getattr(state, attr_raw)
-        peak  = np.argmax(UVT.Envelope(sig))
+        peak  = np.argmax(US.Envelope(sig))
         delay = peak - MyWinLen // 2
-        win   = UVT.MakeWindow('Tukey', WinLen=MyWinLen, param1=0.2, param2=1,
+        win   = US.MakeWindow('Tukey', WinLen=MyWinLen, param1=0.2, param2=1,
                                Span=len(sig), Delay=delay)
         setattr(state, attr_win,   sig * win)
         setattr(state, attr_delay, delay)
@@ -654,10 +652,10 @@ def on_click_apply_window(event):
 
     # [8] Signal inspection — opens automatically after windowing
     fig_chk, axs_chk = plt.subplots(4, 1, figsize=(10, 8))
-    axs_chk[0].plot(UVT.NormSig(state.PE_Ascan));     axs_chk[0].set_title('PE raw (Ch2, sample)')
-    axs_chk[1].plot(UVT.NormSig(state.TT_Ascan_win)); axs_chk[1].set_title('TT windowed (Ch1, sample)')
-    axs_chk[2].plot(UVT.NormSig(state.WP_Ascan_win)); axs_chk[2].set_title('WP windowed (Ch1, reference)')
-    axs_chk[3].plot(UVT.NormSig(state.PE_Ascan_win)); axs_chk[3].set_title('PE windowed (Ch2, sample)')
+    axs_chk[0].plot(US.NormSig(state.PE_Ascan));     axs_chk[0].set_title('PE raw (Ch2, sample)')
+    axs_chk[1].plot(US.NormSig(state.TT_Ascan_win)); axs_chk[1].set_title('TT windowed (Ch1, sample)')
+    axs_chk[2].plot(US.NormSig(state.WP_Ascan_win)); axs_chk[2].set_title('WP windowed (Ch1, reference)')
+    axs_chk[3].plot(US.NormSig(state.PE_Ascan_win)); axs_chk[3].set_title('PE windowed (Ch2, sample)')
     for ax in axs_chk:
         ax.set_ylabel('Norm. amplitude'); ax.grid(True)
     axs_chk[3].set_xlabel('Samples')
@@ -690,7 +688,7 @@ plt.show()
 #   - UseHilbEnv=True: Hilbert envelope is used for TOF peak detection.
 # ==============================================================================
 
-Cl, L = UVT.LongVelocity_Thickness(
+Cl, L = US.LongVelocity_Thickness(
     state.PE_Ascan,       # Raw PE signal (used for initial TOF estimate)
     state.TT_Ascan_win,   # Windowed TT signal
     state.WP_Ascan_win,   # Windowed water-path reference
