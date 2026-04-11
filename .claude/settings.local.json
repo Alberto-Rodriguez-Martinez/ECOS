@@ -1,0 +1,14 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(git commit:*)",
+      "Bash(git push:*)",
+      "Bash(C:\\\\Python314-32\\\\python.exe --version)",
+      "Bash(C:\\\\Python314-32\\\\python.exe -m pip list)",
+      "Bash(/c/Python314-32/python.exe:*)",
+      "Bash(\"/c/Python314-32/python.exe\" -m pip index versions PyQt5)",
+      "Bash(\"/c/Python314-32/python.exe\" -m pip index versions numpy)",
+      "Bash(\"/c/Python314-32/python.exe\" -m pip install \"scipy<1.12\" --dry-run)"
+    ]
+  }
+}

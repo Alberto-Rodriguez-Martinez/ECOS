@@ -24,7 +24,7 @@ Create acquisition/density_archimedes.py for density measurement via Archimedes 
 - transducer_freq: int, 5 or 10 MHz (default 10)
 - channel: int, default 2
 - Smin: int, default 0 (configurable)
-- Smax: int, mandatory, depends on water level in vessel
+- Smax: int, default RecLen (full record length), configurable
 - temperature: float or None → if None, read from Arduino
 
 ### Excitation pulse
