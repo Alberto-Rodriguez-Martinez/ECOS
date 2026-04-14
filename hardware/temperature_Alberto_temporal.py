@@ -46,8 +46,8 @@ class Arduino:
             self.ser.close()
 
 
-#%%
-arduino = Arduino(port='COM4', baudrate=115200, N_avg=2)
-T1, T2 = arduino.getTemperatures()
-print(f"Sensor1 = {T1:.2f} °C, Sensor2 = {T2:.2f} °C")
-arduino.close()    
+if __name__ == "__main__":
+    arduino = Arduino(port='COM4', baudrate=115200, N_avg=2)
+    T1, T2 = arduino.getTemperatures()
+    print(f"Sensor1 = {T1:.2f} °C, Sensor2 = {T2:.2f} °C")
+    arduino.close()

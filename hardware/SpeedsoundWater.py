@@ -1,6 +1,6 @@
 # SpeedsoundWater.py
 import numpy as np
-from temperaturee import Arduino  # tu clase Arduino desde temperaturee.py
+from temperature_Alberto_temporal import Arduino
 
 def water_temp2sos(T):
     """
@@ -10,19 +10,21 @@ def water_temp2sos(T):
         2.574064370e4 * np.exp(-((T + 3.705052160e2) / (-1.601257116e2))**2)
     return c
 
-def get_Cw_from_arduino(N_avg=3, max_attempts=5, closePort = False):
+def get_Cw_from_arduino(N_avg=3, max_attempts=5, closePort=False, port='COM4'):
     """
     Lee las temperaturas del Arduino y calcula la velocidad del sonido en agua.
-    
+
     Parámetros:
     - N_avg: número de lecturas promedio
     - max_attempts: máximo de intentos si falla la lectura
+    - closePort: cerrar el puerto serie al terminar
+    - port: puerto COM del Arduino (por defecto 'COM4')
 
     Retorna:
     - temp1, temp2: temperaturas de los sensores (°C)
     - Cw1, Cw2: velocidades del sonido calculadas (m/s)
     """
-    arduino = Arduino(baudrate=9600, port='COM3', N_avg=N_avg)
+    arduino = Arduino(baudrate=9600, port=port, N_avg=N_avg)
     
     # Intentos de lectura segura
     for attempt in range(max_attempts):

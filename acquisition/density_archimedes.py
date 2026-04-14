@@ -74,6 +74,15 @@ _tools_dir = os.path.join(_repo_root, 'tools')
 
 os.chdir(_tools_dir)                  # DLL search path: must be tools/
 os.add_dll_directory(_tools_dir)      # Explicit DLL directory (Python 3.8+)
+
+# Guard against 64-bit conda DLLs leaking in via PATH (Anaconda3 base env).
+# Explicitly registering the 32-bit runtime directory ensures the correct
+# python3x.dll, libffi.dll, etc. are resolved first.
+if sys.maxsize <= 2**32:
+    _anaconda32_bin = r"C:\ProgramData\Anaconda32\Library\bin"
+    if os.path.isdir(_anaconda32_bin):
+        os.add_dll_directory(_anaconda32_bin)
+
 sys.path.insert(0, _tools_dir)
 sys.path.insert(0, os.path.join(_repo_root, 'hardware'))
 
@@ -179,7 +188,7 @@ def _init_hardware(transducer_freq, channel, Smax):
 # [4] TEMPERATURE AND SPEED OF SOUND
 # ==============================================================================
 
-def _get_temperature_and_cw(temperature):
+def _get_temperature_and_cw(temperature, arduino_port='COM4'):
     """
     Return water temperature [°C] and the corresponding speed of sound [m/s].
 
@@ -192,6 +201,9 @@ def _get_temperature_and_cw(temperature):
     temperature : float or None
         If a float is provided, it is used directly (Arduino is skipped).
         If None, the value is read from the Arduino (average of two sensors).
+    arduino_port : str
+        Serial port of the Arduino (e.g. 'COM4', 'COM5'). Only used when
+        temperature is None.
 
     Returns
     -------
@@ -205,15 +217,24 @@ def _get_temperature_and_cw(temperature):
         return T, cw
 
     # Read from Arduino
-    print("[Temperature] Reading from Arduino...")
-    T1, T2, Cw1, Cw2 = get_Cw_from_arduino()
+    print(f"[Temperature] Reading from Arduino on {arduino_port}...")
+    T1, T2, Cw1, Cw2 = get_Cw_from_arduino(port=arduino_port)
 
     if T1 is None and T2 is None:
-        raise RuntimeError(
-            "Could not read temperature from Arduino. "
-            "Check the USB connection and COM port in SpeedsoundWater.py, "
-            "or pass temperature manually (e.g. temperature=22.5)."
+        print(
+            f"[WARNING] Could not read temperature from Arduino on {arduino_port}. "
+            "Check the USB connection and port."
         )
+        while True:
+            try:
+                raw = input("Enter water temperature manually [°C]: ").strip()
+                T  = float(raw)
+                cw = water_temp2sos(T)
+                print(f"[Temperature] Manual input: T = {T:.2f} °C  →  cw = {cw:.2f} m/s")
+                return T, cw
+            except ValueError:
+                print("  Invalid value — please enter a number (e.g. 22.5).")
+
     elif T2 is None:
         T, cw = T1, Cw1
         print(f"  Sensor 1 only: T = {T:.2f} °C  →  cw = {cw:.2f} m/s")
@@ -418,7 +439,7 @@ def _calc_delta_tof(sW1, sW2):
 # ==============================================================================
 
 def calibrate_vessel(V_cal, temperature=None, transducer_freq=10,
-                     channel=2, Smin=0, Smax=None, N_cal=3):
+                     channel=2, Smin=0, Smax=None, N_cal=3, arduino_port='COM4'):
     """
     Estimate the effective inner radius of the cylindrical vessel by
     submerging a calibration object of known volume and measuring the
@@ -452,6 +473,9 @@ def calibrate_vessel(V_cal, temperature=None, transducer_freq=10,
         Last sample index. Default: None → use full record length (RecLen).
     N_cal : int
         Number of calibration repetitions to average. Default: 3.
+    arduino_port : str
+        Serial port of the Arduino (e.g. 'COM3'). Used only when temperature
+        is None.
 
     Returns
     -------
@@ -465,7 +489,7 @@ def calibrate_vessel(V_cal, temperature=None, transducer_freq=10,
         Smax = SeDaq.RecLen   # use the record length just set
 
     # ---- Temperature ---------------------------------------------------------
-    T, cw = _get_temperature_and_cw(temperature)
+    T, cw = _get_temperature_and_cw(temperature, arduino_port)
 
     # Convert V_cal from cm^3 to m^3 for SI-consistent computation
     V_cal_m3 = V_cal * 1e-6
@@ -542,7 +566,8 @@ def calibrate_vessel(V_cal, temperature=None, transducer_freq=10,
 # ==============================================================================
 
 def measure_density(r_vessel, mass=None, temperature=None, transducer_freq=10,
-                    channel=2, Smin=0, Smax=None, specimen_name=None):
+                    channel=2, Smin=0, Smax=None, specimen_name=None,
+                    arduino_port='COM4'):
     """
     Measure the density of a specimen using the Archimedes water-displacement
     method with ultrasonic TOF detection.
@@ -568,6 +593,10 @@ def measure_density(r_vessel, mass=None, temperature=None, transducer_freq=10,
     specimen_name : str or None
         Label for the specimen (e.g. 'PVA_10pct_FT3').
         If None, the user is prompted at runtime.
+    arduino_port : str
+        Serial port of the Arduino (e.g. 'COM4'). Used only when temperature
+        is None. If the connection fails, the user is prompted to enter the
+        temperature manually.
 
     Returns
     -------
@@ -593,7 +622,7 @@ def measure_density(r_vessel, mass=None, temperature=None, transducer_freq=10,
         Smax = SeDaq.RecLen
 
     # ---- Temperature and speed of sound in water -----------------------------
-    T, cw = _get_temperature_and_cw(temperature)
+    T, cw = _get_temperature_and_cw(temperature, arduino_port)
 
     # Convert vessel radius to metres for intermediate SI calculations
     r_vessel_m = r_vessel * 1e-2
@@ -734,10 +763,13 @@ if __name__ == "__main__":
     r = 9.85    # [cm] — replace with your calibrated or measured value
 
     measure_density(
-        r_vessel        = r,
-        mass            = None,     # [g] — set to None to skip density computation
-        temperature     = None,     # [°C] — None reads from Arduino
-        transducer_freq = 10,       # [MHz]
-        channel         = 2,
-        specimen_name   = None,     # None prompts at runtime
+        r_vessel        = r,            # [cm] inner radius of the vessel
+        mass            = None,         # [g] sample mass — set to None to skip density computation
+        temperature     = None,         # [°C] water temperature — None reads from Arduino
+        transducer_freq = 10,           # [MHz] transducer center frequency (5 or 10 MHz)
+        channel         = 2,            # acquisition channel (1 or 2)
+        specimen_name   = None,         # sample identifier — None prompts at runtime
+        arduino_port    = 'COM4',       # serial port of the Arduino temperature sensor
+        Smin            = 0,            # [samples] start of acquisition window (default 0)
+        Smax            = None,         # [samples] end of acquisition window (None = full RecLen)        
     )

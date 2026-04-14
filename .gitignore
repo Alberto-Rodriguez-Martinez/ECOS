@@ -30,3 +30,10 @@ gencode*.txt
 
 # Codigo obsoleto (solo local)
 _archive/
+run32.bat
+test_out.txt
+tools/data_32/
+tools/*.dll
+tools/*.dat
+tools/*.txt
+.claude/
