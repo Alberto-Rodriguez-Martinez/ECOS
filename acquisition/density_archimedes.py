@@ -770,6 +770,6 @@ if __name__ == "__main__":
         channel         = 2,            # acquisition channel (1 or 2)
         specimen_name   = None,         # sample identifier — None prompts at runtime
         arduino_port    = 'COM4',       # serial port of the Arduino temperature sensor
-        Smin            = 0,            # [samples] start of acquisition window (default 0)
-        Smax            = None,         # [samples] end of acquisition window (None = full RecLen)        
+        Smin            = 3000,            # [samples] start of acquisition window (default 0)
+        Smax            = 4000,         # [samples] end of acquisition window (None = full RecLen)        
     )

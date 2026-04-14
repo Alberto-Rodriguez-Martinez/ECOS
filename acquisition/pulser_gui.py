@@ -22,6 +22,19 @@ import sys
 import os
 import json
 import datetime
+import argparse
+import time
+
+os.add_dll_directory(r"D:\ECOS\tools")
+
+_TOOLS_DIR_EARLY = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'tools')
+os.chdir(_TOOLS_DIR_EARLY)
+
+if sys.maxsize <= 2**32:
+    _anaconda32_bin = r"C:\ProgramData\Anaconda32\Library\bin"
+    if os.path.isdir(_anaconda32_bin):
+        os.add_dll_directory(_anaconda32_bin)
+
 import numpy as np
 
 from PyQt5.QtWidgets import (
@@ -39,29 +52,48 @@ import pyqtgraph as pg
 # ---------------------------------------------------------------------------
 # Path setup — tools/ contains SeDaq.py, GenCode_ToolBox.py, etc.
 # ---------------------------------------------------------------------------
-_TOOLS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'tools')
+_TOOLS_DIR = _TOOLS_DIR_EARLY
 sys.path.insert(0, _TOOLS_DIR)
 
 # ---------------------------------------------------------------------------
-# Hardware import — if the DLL is absent the GUI runs in demo mode with
-# simulated signals so the interface can be tested without the digitizer.
+# CLI arguments — parsed early so --demo can suppress the DLL import.
 # ---------------------------------------------------------------------------
-try:
-    from SeDaq import SeDaqDLL
-    from GenCode_ToolBox import MakeGenCode
-    _HW_AVAILABLE = True
-    print("[pulser_gui] Hardware modules loaded OK.")
-except Exception as _hw_err:
+_arg_parser = argparse.ArgumentParser(description="ECOS Pulser GUI")
+_arg_parser.add_argument(
+    "--demo", action="store_true",
+    help="Run in demo mode — skip hardware import, use simulated signals."
+)
+_ARGS = _arg_parser.parse_args()
+
+# ---------------------------------------------------------------------------
+# Hardware import — skipped entirely when --demo is passed.
+# If the DLL is absent at runtime the GUI falls back to demo mode anyway.
+# ---------------------------------------------------------------------------
+if _ARGS.demo:
     _HW_AVAILABLE = False
-    print(f"[pulser_gui] Demo mode — hardware not available: {_hw_err}")
+    print("[pulser_gui] Demo mode — hardware import skipped (--demo flag).")
+else:
+    try:
+        from SeDaq import SeDaqDLL
+        from GenCode_ToolBox import MakeGenCode
+        _HW_AVAILABLE = True
+        print("[pulser_gui] Hardware modules loaded OK.")
+    except Exception as _hw_err:
+        _HW_AVAILABLE = False
+        print(f"[pulser_gui] Demo mode — hardware not available: {_hw_err}")
 
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
+SEDAQ_DLL_PATH    = r"D:\ECOS\tools\SeDaqDLL.dll"
+
 DEFAULT_RECLEN    = 16384   # samples — default digitizer record length
 DEFAULT_ACQ_FS    = 100e6   # Hz — digitizer sampling frequency
 DEFAULT_GEN_FS    = 200e6   # Hz — generator (KTU pulser) clock frequency
-REALTIME_INTERVAL = 50      # ms — timer period ≈ 20 fps
+REALTIME_INTERVAL = 100     # ms — timer period ≈ 10 fps
+
+SIGNAL_YMIN = -0.5          # normalised signal range lower bound
+SIGNAL_YMAX =  0.5          # normalised signal range upper bound
 
 # Bits per sample → quantisation levels (2^B).
 # GetAScan returns raw unsigned integers in [0, Quantiz_Levels-1].
@@ -129,8 +161,9 @@ class PulserGUI(QMainWindow):
         # ── Hardware connection ───────────────────────────────────────────
         if _HW_AVAILABLE:
             try:
-                self._sedaq = SeDaqDLL()
+                self._sedaq = SeDaqDLL(SEDAQ_DLL_PATH)
                 self._sedaq.SetRecLen(DEFAULT_RECLEN)
+                time.sleep(0.5)   # wait for firmware to stabilise after connection
                 self._demo = False
             except Exception as e:
                 QMessageBox.warning(
@@ -144,6 +177,7 @@ class PulserGUI(QMainWindow):
             self._demo = True
 
         self._reclen = DEFAULT_RECLEN  # kept in sync with hardware
+        self._running = True           # real-time acquisition state
 
         # ── Build UI ─────────────────────────────────────────────────────
         self._build_menu()
@@ -162,10 +196,16 @@ class PulserGUI(QMainWindow):
         main_layout.addWidget(splitter)
 
         # ── Real-time acquisition timer ───────────────────────────────────
-        # Fires every REALTIME_INTERVAL ms, acquires 1 A-scan, refreshes plots.
-        # There is no Start/Stop button — the display runs continuously.
         self._timer = QTimer()
         self._timer.timeout.connect(self._update_plots)
+        self._timer.start(REALTIME_INTERVAL)
+
+    # =======================================================================
+    #  Window resize
+    # =======================================================================
+    def resizeEvent(self, event):
+        self._timer.stop()
+        super().resizeEvent(event)
         self._timer.start(REALTIME_INTERVAL)
 
     # =======================================================================
@@ -209,38 +249,89 @@ class PulserGUI(QMainWindow):
         layout.addLayout(chk_row)
 
         # ── Zoom plot (large, top) ────────────────────────────────────────
-        # Shows only the samples inside the region selected on the overview.
         self._plot_zoom = pg.PlotWidget(title="Signal — zoom region")
         self._plot_zoom.setLabel('left', 'Amplitude', units='a.u.')
+        self._plot_zoom.getAxis('left').enableAutoSIPrefix(False)
         self._plot_zoom.setLabel('bottom', 'Sample')
         self._plot_zoom.showGrid(x=True, y=True, alpha=0.3)
         self._plot_zoom.addLegend()
+        # Fix Y range to ±0.5 — disable auto-scale and mouse Y interaction
+        self._plot_zoom.enableAutoRange(axis='y', enable=False)
+        self._plot_zoom.setYRange(-0.5, 0.5, padding=0)
+        self._plot_zoom.setLimits(xMin=0, xMax=self._reclen, yMin=-0.5, yMax=0.5)
+        self._plot_zoom.getViewBox().setMouseEnabled(y=False)
         self._curve_zoom_ch1 = self._plot_zoom.plot(
             pen=pg.mkPen('c', width=1), name="Ch1"
         )
         self._curve_zoom_ch2 = self._plot_zoom.plot(
             pen=pg.mkPen('y', width=1), name="Ch2"
         )
-        layout.addWidget(self._plot_zoom, stretch=3)
+        # Crosshair on zoom plot
+        self._vline_time = pg.InfiniteLine(angle=90, movable=False, pen='w')
+        self._vline_time.setVisible(False)
+        self._plot_zoom.addItem(self._vline_time)
+        self._cursor_text_time = pg.TextItem(anchor=(0, 1), color='white')
+        self._plot_zoom.addItem(self._cursor_text_time)
+        self._cursor_text_time.hide()
+
+        # ── Spectrum plot ─────────────────────────────────────────────────
+        self._plot_spectrum = pg.PlotWidget(title="Spectrum")
+        self._plot_spectrum.setLabel('left', 'Amplitude')
+        self._plot_spectrum.setLabel('bottom', 'Frequency (MHz)')
+        self._plot_spectrum.showGrid(x=True, y=True, alpha=0.3)
+        self._plot_spectrum.addLegend()
+        self._curve_spec_ch1 = self._plot_spectrum.plot(
+            pen=pg.mkPen('c', width=1), name="Ch1"
+        )
+        self._curve_spec_ch2 = self._plot_spectrum.plot(
+            pen=pg.mkPen('y', width=1), name="Ch2"
+        )
+        self._vline_spec = pg.InfiniteLine(angle=90, movable=False, pen='w')
+        self._vline_spec.setVisible(False)
+        self._plot_spectrum.addItem(self._vline_spec)
+        self._cursor_text_spec = pg.TextItem(anchor=(0, 1), color='white')
+        self._plot_spectrum.addItem(self._cursor_text_spec)
+        self._cursor_text_spec.hide()
+        vb = self._plot_spectrum.getViewBox()
+        vb.setMouseEnabled(x=False, y=False)
+        vb.enableAutoRange(axis='y', enable=True)
+
+        # ── Top area: zoom (left) | spectrum (right) ──────────────────────
+        top_splitter = QSplitter(Qt.Horizontal)
+        top_splitter.addWidget(self._plot_zoom)
+        top_splitter.addWidget(self._plot_spectrum)
+        top_splitter.setStretchFactor(0, 1)
+        top_splitter.setStretchFactor(1, 1)
+        layout.addWidget(top_splitter, stretch=3)
 
         # ── Overview plot (small, bottom) ─────────────────────────────────
-        # Full RecLen displayed at reduced height. A draggable LinearRegionItem
-        # defines the window shown in the zoom plot above.
         self._plot_overview = pg.PlotWidget(title="Overview — full record")
         self._plot_overview.setLabel('bottom', 'Sample')
         self._plot_overview.setMaximumHeight(180)
+        # Fix axes: X = [0, RecLen], Y = [±0.5] — no mouse interaction
+        self._plot_overview.setXRange(0, self._reclen, padding=0)
+        self._plot_overview.setYRange(SIGNAL_YMIN, SIGNAL_YMAX, padding=0)
+        self._plot_overview.setLimits(
+            xMin=0, xMax=self._reclen,
+            yMin=SIGNAL_YMIN, yMax=SIGNAL_YMAX
+        )
+        self._plot_overview.getViewBox().setMouseEnabled(x=False, y=False)
+
         self._curve_ov_ch1 = self._plot_overview.plot(pen=pg.mkPen('c', width=1))
         self._curve_ov_ch2 = self._plot_overview.plot(pen=pg.mkPen('y', width=1))
 
-        # LinearRegionItem: shaded rectangle the user can drag and resize
-        self._region = pg.LinearRegionItem([0, self._reclen // 4])
-        self._region.setZValue(10)   # draw on top of signal curves
+        # LinearRegionItem: clipped to [0, RecLen]
+        self._region = pg.LinearRegionItem(
+            values=[0, self._reclen // 4],
+            bounds=[0, self._reclen]        # hard limits — cannot drag outside
+        )
+        self._region.setZValue(10)
         self._plot_overview.addItem(self._region)
 
-        # When the region moves → update zoom plot x-range
         self._region.sigRegionChanged.connect(self._on_region_changed)
-        # When the user pans/zooms the top plot manually → sync region
         self._plot_zoom.sigXRangeChanged.connect(self._on_zoom_xrange_changed)
+        self._plot_zoom.scene().sigMouseMoved.connect(self._on_mouse_moved_time)
+        self._plot_spectrum.scene().sigMouseMoved.connect(self._on_mouse_moved_spec)
 
         layout.addWidget(self._plot_overview, stretch=1)
         return widget
@@ -249,7 +340,6 @@ class PulserGUI(QMainWindow):
     #  Right panel — three control blocks in a scroll area
     # =======================================================================
     def _build_right_panel(self):
-        # Scroll area keeps all blocks accessible when the window is short.
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         container = QWidget()
@@ -260,8 +350,9 @@ class PulserGUI(QMainWindow):
         layout.setSpacing(8)
         layout.addWidget(self._build_block_pulser())
         layout.addWidget(self._build_block_acq())
+        layout.addWidget(self._build_block_spectrum())
         layout.addWidget(self._build_block_gencode())
-        layout.addStretch()   # push blocks to the top
+        layout.addStretch()
         return scroll
 
     # =======================================================================
@@ -276,8 +367,6 @@ class PulserGUI(QMainWindow):
         self._txt_voltage  = QLineEdit("100.0")
         self._txt_acq_fs   = QLineEdit("100e6")
 
-        # Send values to hardware when the user presses Enter or leaves the field.
-        # editingFinished fires on both events, avoiding spurious calls on every keystroke.
         self._txt_gain_ch1.editingFinished.connect(self._on_gain_ch1_changed)
         self._txt_gain_ch2.editingFinished.connect(self._on_gain_ch2_changed)
         self._txt_voltage.editingFinished.connect(self._on_voltage_changed)
@@ -287,7 +376,6 @@ class PulserGUI(QMainWindow):
             self._cmb_bits.addItem(label)
         self._cmb_bits.setCurrentText("10 bit")
 
-        # Relay: checkable QPushButton so its state is visible at a glance
         self._btn_relay = QPushButton("RELAY: OFF")
         self._btn_relay.setCheckable(True)
         self._btn_relay.setChecked(False)
@@ -308,6 +396,16 @@ class PulserGUI(QMainWindow):
         box = QGroupBox("Acquisition")
         layout = QVBoxLayout(box)
 
+        # RecLen control
+        reclen_row = QHBoxLayout()
+        reclen_row.addWidget(QLabel("RecLen (samples):"))
+        self._txt_reclen = QLineEdit(str(DEFAULT_RECLEN))
+        self._txt_reclen.setMaximumWidth(80)
+        self._txt_reclen.editingFinished.connect(self._on_reclen_changed)
+        reclen_row.addWidget(self._txt_reclen)
+        reclen_row.addStretch()
+        layout.addLayout(reclen_row)
+
         # Channels to save
         chk_row = QHBoxLayout()
         chk_row.addWidget(QLabel("Channels:"))
@@ -320,7 +418,7 @@ class PulserGUI(QMainWindow):
         chk_row.addStretch()
         layout.addLayout(chk_row)
 
-        # Number of A-scans to coherently average before saving
+        # Number of A-scans to average
         n_row = QHBoxLayout()
         n_row.addWidget(QLabel("N Ascans avg:"))
         self._txt_n_avg = QLineEdit("1")
@@ -329,7 +427,14 @@ class PulserGUI(QMainWindow):
         n_row.addStretch()
         layout.addLayout(n_row)
 
-        # Acquire buttons — each opens a file dialog then saves .npy + .json
+        # Stop / Resume real-time display button
+        self._btn_stop = QPushButton("⏹  Stop")
+        self._btn_stop.setCheckable(True)
+        self._btn_stop.setChecked(False)
+        self._btn_stop.toggled.connect(self._on_stop_toggled)
+        layout.addWidget(self._btn_stop)
+
+        # Acquire buttons
         btn_ch1  = QPushButton("Acquire Ch1")
         btn_ch2  = QPushButton("Acquire Ch2")
         btn_both = QPushButton("Acquire Both")
@@ -340,7 +445,7 @@ class PulserGUI(QMainWindow):
         layout.addWidget(btn_ch2)
         layout.addWidget(btn_both)
 
-        # Free-text comment stored in the .json metadata
+        # Comment
         layout.addWidget(QLabel("Comment:"))
         self._txt_comment = QPlainTextEdit()
         self._txt_comment.setMaximumHeight(60)
@@ -349,13 +454,152 @@ class PulserGUI(QMainWindow):
         return box
 
     # =======================================================================
-    #  Block 3 — GenCode Waveform Generator
+    #  Block 3 — Spectrum
+    # =======================================================================
+    def _build_block_spectrum(self):
+        box = QGroupBox("Spectrum")
+        form = QFormLayout(box)
+
+        self._txt_spec_fmin  = QLineEdit("0")
+        self._txt_spec_fmax  = QLineEdit("15")
+        self._txt_spec_nfft  = QLineEdit("4096")
+        self._cmb_spec_scale = QComboBox()
+        self._cmb_spec_scale.addItems(["Linear", "dB"])
+        self._cmb_spec_scale.currentIndexChanged.connect(self._on_spec_scale_changed)
+
+        btn_compute = QPushButton("Compute Spectrum")
+        btn_compute.clicked.connect(self._compute_spectrum)
+
+        form.addRow("Fmin (MHz):",   self._txt_spec_fmin)
+        form.addRow("Fmax (MHz):",   self._txt_spec_fmax)
+        form.addRow("N FFT points:", self._txt_spec_nfft)
+        form.addRow("Scale:",        self._cmb_spec_scale)
+        form.addRow("",              btn_compute)
+        return box
+
+    # =======================================================================
+    #  Spectrum scale toggle
+    # =======================================================================
+    def _on_spec_scale_changed(self, index):
+        label = "Amplitude (dB)" if index == 1 else "Amplitude"
+        self._plot_spectrum.setLabel('left', label)
+
+    # =======================================================================
+    #  Compute spectrum
+    # =======================================================================
+    def _compute_spectrum(self):
+        """FFT of the current zoom-region data → update spectrum plot."""
+        try:
+            acq_fs = float(self._txt_acq_fs.text())
+            nfft   = int(self._txt_spec_nfft.text())
+            fmin   = float(self._txt_spec_fmin.text())
+            fmax   = float(self._txt_spec_fmax.text())
+        except ValueError as e:
+            QMessageBox.warning(self, "Spectrum error", f"Invalid parameter: {e}")
+            return
+
+        use_db = self._cmb_spec_scale.currentText() == "dB"
+
+        x1, y1 = self._curve_zoom_ch1.getData()
+        x2, y2 = self._curve_zoom_ch2.getData()
+
+        if (y1 is None or len(y1) == 0) and (y2 is None or len(y2) == 0):
+            QMessageBox.warning(self, "Spectrum", "No data in zoom region yet.")
+            return
+
+        freq = np.fft.rfftfreq(nfft, d=1.0 / acq_fs) / 1e6  # → MHz
+        mask = (freq >= fmin) & (freq <= fmax)
+        freq_m = freq[mask]
+
+        def _spectrum(y):
+            if y is None or len(y) == 0:
+                return None
+            seg = y[:nfft] if len(y) >= nfft else np.pad(y, (0, nfft - len(y)))
+            spec = np.abs(np.fft.rfft(seg, n=nfft)) / nfft
+            if use_db:
+                spec = 20.0 * np.log10(np.maximum(spec, 1e-12))
+                spec = np.maximum(spec, -120.0)
+            return spec[mask]
+
+        s1 = _spectrum(y1)
+        s2 = _spectrum(y2)
+
+        if s1 is not None and self._chk_ch1_vis.isChecked():
+            self._curve_spec_ch1.setData(freq_m, s1)
+        else:
+            self._curve_spec_ch1.setData([], [])
+
+        if s2 is not None and self._chk_ch2_vis.isChecked():
+            self._curve_spec_ch2.setData(freq_m, s2)
+        else:
+            self._curve_spec_ch2.setData([], [])
+
+        vb = self._plot_spectrum.getViewBox()
+        vb.setXRange(fmin, fmax, padding=0)
+        vb.setLimits(xMin=fmin, xMax=fmax)
+
+    # =======================================================================
+    #  Crosshair cursor handlers
+    # =======================================================================
+    def _on_mouse_moved_time(self, pos):
+        vb = self._plot_zoom.getViewBox()
+        if not self._plot_zoom.sceneBoundingRect().contains(pos):
+            self._vline_time.hide()
+            self._cursor_text_time.hide()
+            return
+        mp = vb.mapSceneToView(pos)
+        x = mp.x()
+        self._vline_time.setPos(x)
+        self._vline_time.show()
+
+        ch1_x, ch1_y = self._curve_zoom_ch1.getData()
+        ch2_x, ch2_y = self._curve_zoom_ch2.getData()
+
+        def get_val(xs, ys):
+            if xs is None or ys is None or len(xs) == 0:
+                return "---"
+            i = int(np.clip(np.searchsorted(xs, x), 0, len(ys) - 1))
+            return f"{ys[i]:.4f}"
+
+        v1 = get_val(ch1_x, ch1_y)
+        v2 = get_val(ch2_x, ch2_y)
+        self._cursor_text_time.setPos(x, mp.y())
+        self._cursor_text_time.setText(f"Sample: {int(x)}\nCh1: {v1}\nCh2: {v2}")
+        self._cursor_text_time.show()
+
+    def _on_mouse_moved_spec(self, pos):
+        vb = self._plot_spectrum.getViewBox()
+        if not self._plot_spectrum.sceneBoundingRect().contains(pos):
+            self._vline_spec.hide()
+            self._cursor_text_spec.hide()
+            return
+        mp = vb.mapSceneToView(pos)
+        x = mp.x()
+        self._vline_spec.setPos(x)
+        self._vline_spec.show()
+
+        ch1_x, ch1_y = self._curve_spec_ch1.getData()
+        ch2_x, ch2_y = self._curve_spec_ch2.getData()
+
+        def get_val(xs, ys):
+            if xs is None or ys is None or len(xs) == 0:
+                return "---"
+            i = int(np.clip(np.searchsorted(xs, x), 0, len(ys) - 1))
+            return f"{ys[i]:.4f}"
+
+        v1 = get_val(ch1_x, ch1_y)
+        v2 = get_val(ch2_x, ch2_y)
+        self._cursor_text_spec.setPos(x, mp.y())
+        self._cursor_text_spec.setText(f"Freq: {x:.3f} MHz\nCh1: {v1}\nCh2: {v2}")
+        self._cursor_text_spec.show()
+
+    # =======================================================================
+    #  Block 4 — GenCode Waveform Generator
     # =======================================================================
     def _build_block_gencode(self):
         box = QGroupBox("GenCode Waveform Generator")
         layout = QVBoxLayout(box)
 
-        # Excitation type — switching this changes the visible parameter page
         type_row = QHBoxLayout()
         type_row.addWidget(QLabel("Excitation:"))
         self._cmb_excitation = QComboBox()
@@ -364,15 +608,12 @@ class PulserGUI(QMainWindow):
         type_row.addWidget(self._cmb_excitation)
         layout.addLayout(type_row)
 
-        # Generator clock (independent from acquisition Fs)
         fs_row = QHBoxLayout()
         fs_row.addWidget(QLabel("Generator Fs (Hz):"))
         self._txt_gen_fs = QLineEdit("200e6")
         fs_row.addWidget(self._txt_gen_fs)
         layout.addLayout(fs_row)
 
-        # QStackedWidget: one page per excitation type.
-        # Page index matches combobox index: 0=Pulse, 1=Chirp, 2=Burst.
         self._stack = QStackedWidget()
         self._stack.addWidget(self._build_pulse_page())
         self._stack.addWidget(self._build_chirp_page())
@@ -386,7 +627,6 @@ class PulserGUI(QMainWindow):
         return box
 
     def _build_pulse_page(self):
-        """Pulse parameters: one selectable numeric parameter."""
         page = QWidget()
         form = QFormLayout(page)
         self._cmb_pulse_param    = QComboBox()
@@ -400,7 +640,6 @@ class PulserGUI(QMainWindow):
         return page
 
     def _build_chirp_page(self):
-        """Chirp parameters: swept-frequency pulse."""
         page = QWidget()
         form = QFormLayout(page)
         self._txt_chirp_fstart   = QLineEdit("2e6")
@@ -420,7 +659,6 @@ class PulserGUI(QMainWindow):
         return page
 
     def _build_burst_page(self):
-        """Burst parameters: fixed-frequency tone burst."""
         page = QWidget()
         form = QFormLayout(page)
         self._txt_burst_fo       = QLineEdit("5e6")
@@ -438,19 +676,19 @@ class PulserGUI(QMainWindow):
     def _update_plots(self):
         """
         Acquire 1 A-scan and refresh both plots.
-        No averaging — this is the live monitoring display.
-        The timer runs continuously; there is no Start/Stop button.
+        Skipped when _running is False (Stop button pressed).
         """
+        if not self._running:
+            return
+
         try:
             quant = BITS_OPTIONS[self._cmb_bits.currentText()]
 
             self._sedaq.GetAScan()
 
-            # Convert raw ADC counts to normalised float (same convention as ACQ_ToolBox)
             ch1 = self._raw_to_float(self._sedaq.DataADC1, self._reclen, quant)
             ch2 = self._raw_to_float(self._sedaq.DataADC2, self._reclen, quant)
 
-            # Read zoom window limits from the region selector
             rmin, rmax = self._region.getRegion()
             smin = max(0, int(rmin))
             smax = min(self._reclen, int(rmax))
@@ -458,13 +696,13 @@ class PulserGUI(QMainWindow):
             x_full = np.arange(self._reclen)
             x_zoom = np.arange(smin, smax)
 
-            # Overview curves (full record, downsampled implicitly by pyqtgraph)
+            # Overview curves
             self._curve_ov_ch1.setData(x_full, ch1) if self._chk_ch1_vis.isChecked() \
                 else self._curve_ov_ch1.setData([], [])
             self._curve_ov_ch2.setData(x_full, ch2) if self._chk_ch2_vis.isChecked() \
                 else self._curve_ov_ch2.setData([], [])
 
-            # Zoom curves (region only)
+            # Zoom curves
             if smax > smin:
                 self._curve_zoom_ch1.setData(x_zoom, ch1[smin:smax]) \
                     if self._chk_ch1_vis.isChecked() \
@@ -474,18 +712,13 @@ class PulserGUI(QMainWindow):
                     else self._curve_zoom_ch2.setData([], [])
 
         except Exception as e:
-            # Print but don't crash — hardware can occasionally miss a trigger
             print(f"[_update_plots] {e}")
 
     @staticmethod
     def _raw_to_float(data_buffer, reclen, quant):
         """
         Convert raw ADC buffer to normalised, DC-free float array.
-        Replicates the normalisation used in ACQ_ToolBox.GetAscan_Ch*.
-
-        raw counts ∈ [0, quant-1]
-        → normalised ∈ [-0.5, +0.5]  (subtract half-scale, divide by quant)
-        → subtract mean  (remove residual DC offset)
+        raw counts ∈ [0, quant-1] → normalised ∈ [-0.5, +0.5] → subtract mean
         """
         arr = np.array(list(data_buffer[:reclen]), dtype=float)
         arr = (arr - quant / 2.0) / quant
@@ -496,16 +729,17 @@ class PulserGUI(QMainWindow):
     #  Zoom / region synchronisation
     # =======================================================================
     def _on_region_changed(self):
-        """Region moved on overview → update zoom plot x-range."""
         rmin, rmax = self._region.getRegion()
         self._plot_zoom.blockSignals(True)
         self._plot_zoom.setXRange(rmin, rmax, padding=0)
         self._plot_zoom.blockSignals(False)
 
     def _on_zoom_xrange_changed(self, _vb, x_range):
-        """User panned/zoomed the top plot → sync the region rectangle."""
+        # Clip to valid range before syncing region
+        xmin = max(0, x_range[0])
+        xmax = min(self._reclen, x_range[1])
         self._region.blockSignals(True)
-        self._region.setRegion(x_range)
+        self._region.setRegion([xmin, xmax])
         self._region.blockSignals(False)
 
     def _toggle_ch1_vis(self, checked):
@@ -519,10 +753,45 @@ class PulserGUI(QMainWindow):
             self._curve_ov_ch2.setData([], [])
 
     # =======================================================================
+    #  Stop / Resume toggle
+    # =======================================================================
+    def _on_stop_toggled(self, checked):
+        self._running = not checked
+        self._btn_stop.setText("▶  Resume" if checked else "⏹  Stop")
+
+    # =======================================================================
+    #  RecLen change
+    # =======================================================================
+    def _on_reclen_changed(self):
+        """Update RecLen on hardware and refresh plot limits."""
+        try:
+            reclen = int(self._txt_reclen.text())
+            if reclen <= 0:
+                raise ValueError("RecLen must be positive")
+        except ValueError as e:
+            QMessageBox.warning(self, "Input error", str(e))
+            self._txt_reclen.setText(str(self._reclen))
+            return
+
+        self._reclen = reclen
+        try:
+            self._sedaq.SetRecLen(reclen)
+        except Exception as e:
+            print(f"[SetRecLen] {e}")
+
+        # Update overview axis limits and region bounds
+        self._plot_overview.setXRange(0, reclen, padding=0)
+        self._plot_overview.setLimits(xMin=0, xMax=reclen)
+        self._plot_zoom.setLimits(xMin=0, xMax=self._reclen)
+        self._region.setBounds([0, reclen])
+        # Clip current region to new bounds
+        rmin, rmax = self._region.getRegion()
+        self._region.setRegion([max(0, rmin), min(reclen, rmax)])
+
+    # =======================================================================
     #  Relay toggle
     # =======================================================================
     def _on_relay_toggled(self, checked):
-        """Send relay state to hardware and update button label."""
         state = 1 if checked else 0
         self._btn_relay.setText(f"RELAY: {'ON' if checked else 'OFF'}")
         try:
@@ -533,17 +802,15 @@ class PulserGUI(QMainWindow):
     # ── Gain / voltage hardware wiring ──────────────────────────────────────
 
     def _on_gain_ch1_changed(self):
-        """Parse Gain Ch1 field and send to hardware."""
         try:
             gain = float(self._txt_gain_ch1.text())
             self._sedaq.SetGain1(gain)
         except ValueError:
-            pass   # leave invalid text in place; hardware unchanged
+            pass
         except Exception as e:
             print(f"[SetGain1] {e}")
 
     def _on_gain_ch2_changed(self):
-        """Parse Gain Ch2 field and send to hardware."""
         try:
             gain = float(self._txt_gain_ch2.text())
             self._sedaq.SetGain2(gain)
@@ -553,7 +820,6 @@ class PulserGUI(QMainWindow):
             print(f"[SetGain2] {e}")
 
     def _on_voltage_changed(self):
-        """Parse Voltage field and send to hardware."""
         try:
             voltage = float(self._txt_voltage.text())
             self._sedaq.SetExtVoltage(voltage)
@@ -566,7 +832,6 @@ class PulserGUI(QMainWindow):
     #  Excitation type selector
     # =======================================================================
     def _on_excitation_changed(self, index):
-        """Switch parameter page when excitation type combobox changes."""
         self._stack.setCurrentIndex(index)
 
     # =======================================================================
@@ -575,19 +840,8 @@ class PulserGUI(QMainWindow):
     def _acquire(self, channels):
         """
         Acquire N averaged A-scans and save to .npy + .json.
-
-        Parameters
-        ----------
-        channels : str
-            'ch1' | 'ch2' | 'both'
-
-        Saves only the Smin→Smax range (set by the zoom region).
-        For 'both': .npy shape = (2, Smax-Smin), row 0 = Ch1, row 1 = Ch2.
-
-        The real-time timer is paused during acquisition so that the loop
-        does not compete with the display thread.
+        The real-time timer is paused during acquisition.
         """
-        # ── Read UI parameters ────────────────────────────────────────────
         try:
             n_avg = int(self._txt_n_avg.text())
         except ValueError:
@@ -604,18 +858,15 @@ class PulserGUI(QMainWindow):
                                 "Zoom region is empty — adjust the region selector.")
             return
 
-        # ── Choose save path ──────────────────────────────────────────────
         path, _ = QFileDialog.getSaveFileName(
             self, "Save acquisition", "",
             "NumPy files (*.npy);;All files (*)"
         )
         if not path:
-            return   # user cancelled
-        # Strip .npy if the user typed it — we append extensions ourselves
+            return
         base = path[:-4] if path.lower().endswith('.npy') else path
 
-        # ── Acquire N A-scans and average ─────────────────────────────────
-        self._timer.stop()  # pause real-time display
+        self._timer.stop()
         try:
             acc_ch1 = np.zeros(smax - smin)
             acc_ch2 = np.zeros(smax - smin)
@@ -629,8 +880,6 @@ class PulserGUI(QMainWindow):
                 seg1 = raw1[smin:smax]
                 seg2 = raw2[smin:smax]
 
-                # Discard all-zero frames (occasional hardware glitch protection,
-                # same strategy as ACQ_ToolBox.GetAscan_Ch*)
                 if np.all(seg1 == 0.0) or np.all(seg2 == 0.0):
                     continue
 
@@ -648,9 +897,8 @@ class PulserGUI(QMainWindow):
             self._timer.start(REALTIME_INTERVAL)
             return
         finally:
-            self._timer.start(REALTIME_INTERVAL)  # always restart timer
+            self._timer.start(REALTIME_INTERVAL)
 
-        # ── Save .npy ─────────────────────────────────────────────────────
         if channels == "ch1":
             np.save(base + ".npy", avg_ch1)
         elif channels == "ch2":
@@ -658,24 +906,23 @@ class PulserGUI(QMainWindow):
         else:
             np.save(base + ".npy", np.vstack([avg_ch1, avg_ch2]))
 
-        # ── Save .json metadata ───────────────────────────────────────────
         metadata = {
-            "datetime":         datetime.datetime.now().isoformat(),
-            "channels":         channels,
-            "gain_ch1":         self._txt_gain_ch1.text(),
-            "gain_ch2":         self._txt_gain_ch2.text(),
-            "voltage":          self._txt_voltage.text(),
-            "acq_fs_hz":        self._txt_acq_fs.text(),
-            "bits_per_sample":  self._cmb_bits.currentText(),
-            "quantiz_levels":   quant,
-            "generator_fs_hz":  self._txt_gen_fs.text(),
-            "excitation_type":  self._cmb_excitation.currentText(),
+            "datetime":          datetime.datetime.now().isoformat(),
+            "channels":          channels,
+            "gain_ch1":          self._txt_gain_ch1.text(),
+            "gain_ch2":          self._txt_gain_ch2.text(),
+            "voltage":           self._txt_voltage.text(),
+            "acq_fs_hz":         self._txt_acq_fs.text(),
+            "bits_per_sample":   self._cmb_bits.currentText(),
+            "quantiz_levels":    quant,
+            "generator_fs_hz":   self._txt_gen_fs.text(),
+            "excitation_type":   self._cmb_excitation.currentText(),
             "excitation_params": self._collect_excitation_params(),
-            "smin":             smin,
-            "smax":             smax,
-            "reclen":           self._reclen,
-            "n_avg":            n_avg,
-            "comment":          self._txt_comment.toPlainText(),
+            "smin":              smin,
+            "smax":              smax,
+            "reclen":            self._reclen,
+            "n_avg":             n_avg,
+            "comment":           self._txt_comment.toPlainText(),
         }
         with open(base + ".json", "w") as f:
             json.dump(metadata, f, indent=2)
@@ -687,10 +934,6 @@ class PulserGUI(QMainWindow):
     #  Generate & Upload GenCode
     # =======================================================================
     def _generate_upload(self):
-        """
-        Read excitation parameters from the active page, call MakeGenCode,
-        then upload the resulting byte array to the KTU pulser via UpdateGenCode.
-        """
         excitation = self._cmb_excitation.currentText()
 
         try:
@@ -711,24 +954,17 @@ class PulserGUI(QMainWindow):
                     SignalPolarity = params["polarity"],
                     Fs            = gen_fs,
                 )
-
             elif excitation == "Chirp":
-                # MakeGenCode expects ParamVal = [Fstart, Fend, Duration, method, Phase]
                 gencode = MakeGenCode(
                     Excitation    = "Chirp",
                     ParamVal      = [
-                        params["fstart"],
-                        params["fend"],
-                        params["duration"],
-                        params["method"],
-                        params["phase"],
+                        params["fstart"], params["fend"],
+                        params["duration"], params["method"], params["phase"],
                     ],
                     SignalPolarity = params["polarity"],
                     Fs            = gen_fs,
                 )
-
             else:  # Burst
-                # MakeGenCode expects ParamVal = [Fo, NoCycles]
                 gencode = MakeGenCode(
                     Excitation    = "Burst",
                     ParamVal      = [params["fo"], params["nocycles"]],
@@ -749,14 +985,9 @@ class PulserGUI(QMainWindow):
             QMessageBox.critical(self, "Upload error", f"Upload failed:\n{e}")
 
     def _collect_excitation_params(self):
-        """
-        Read the active excitation page and return a normalised parameter dict.
-        Called both by _generate_upload() and by _acquire() to populate metadata.
-        """
         excitation = self._cmb_excitation.currentText()
 
         def _polarity(cmb):
-            """Extract integer polarity from combo text, e.g. '2 (bipolar)' → 2."""
             return int(cmb.currentText().split()[0])
 
         if excitation == "Pulse":
@@ -785,63 +1016,48 @@ class PulserGUI(QMainWindow):
     #  Session save / load
     # =======================================================================
     def _collect_session(self):
-        """
-        Snapshot all interface parameter values into a flat dict for
-        session persistence. Combo boxes are saved as index integers so the
-        session is independent of locale/language.
-        """
         return {
-            # Block 1 — Pulser Control
             "gain_ch1":              self._txt_gain_ch1.text(),
             "gain_ch2":              self._txt_gain_ch2.text(),
             "voltage":               self._txt_voltage.text(),
             "acq_fs":                self._txt_acq_fs.text(),
             "bits_index":            self._cmb_bits.currentIndex(),
             "relay":                 self._btn_relay.isChecked(),
-            # Block 2 — Acquisition
+            "reclen":                self._txt_reclen.text(),
             "acq_ch1":               self._chk_acq_ch1.isChecked(),
             "acq_ch2":               self._chk_acq_ch2.isChecked(),
             "n_avg":                 self._txt_n_avg.text(),
             "comment":               self._txt_comment.toPlainText(),
-            # Block 3 — GenCode
             "excitation_index":      self._cmb_excitation.currentIndex(),
             "gen_fs":                self._txt_gen_fs.text(),
-            # Pulse page
             "pulse_param_index":     self._cmb_pulse_param.currentIndex(),
             "pulse_paramval":        self._txt_pulse_paramval.text(),
             "pulse_polarity_index":  self._cmb_pulse_polarity.currentIndex(),
-            # Chirp page
             "chirp_fstart":          self._txt_chirp_fstart.text(),
             "chirp_fend":            self._txt_chirp_fend.text(),
             "chirp_dur":             self._txt_chirp_dur.text(),
             "chirp_method_index":    self._cmb_chirp_method.currentIndex(),
             "chirp_phase":           self._txt_chirp_phase.text(),
             "chirp_polarity_index":  self._cmb_chirp_polarity.currentIndex(),
-            # Burst page
             "burst_fo":              self._txt_burst_fo.text(),
             "burst_cycles":          self._txt_burst_cycles.text(),
             "burst_polarity_index":  self._cmb_burst_polarity.currentIndex(),
-            # View state
             "vis_ch1":               self._chk_ch1_vis.isChecked(),
             "vis_ch2":               self._chk_ch2_vis.isChecked(),
             "region":                list(self._region.getRegion()),
         }
 
     def _restore_session(self, d):
-        """Restore all widget values from a session dict (inverse of _collect_session)."""
         def _txt(widget, key):
             if key in d:
                 widget.setText(str(d[key]))
-
         def _idx(combo, key):
             if key in d:
                 combo.setCurrentIndex(int(d[key]))
-
         def _chk(checkbox, key):
             if key in d:
                 checkbox.setChecked(bool(d[key]))
 
-        # Block 1
         _txt(self._txt_gain_ch1, "gain_ch1")
         _txt(self._txt_gain_ch2, "gain_ch2")
         _txt(self._txt_voltage,  "voltage")
@@ -849,15 +1065,14 @@ class PulserGUI(QMainWindow):
         _idx(self._cmb_bits,     "bits_index")
         if "relay" in d:
             self._btn_relay.setChecked(bool(d["relay"]))
-
-        # Block 2
+        if "reclen" in d:
+            self._txt_reclen.setText(str(d["reclen"]))
+            self._on_reclen_changed()
         _chk(self._chk_acq_ch1, "acq_ch1")
         _chk(self._chk_acq_ch2, "acq_ch2")
         _txt(self._txt_n_avg,    "n_avg")
         if "comment" in d:
             self._txt_comment.setPlainText(d["comment"])
-
-        # Block 3
         _idx(self._cmb_excitation,      "excitation_index")
         _txt(self._txt_gen_fs,          "gen_fs")
         _idx(self._cmb_pulse_param,     "pulse_param_index")
@@ -872,8 +1087,6 @@ class PulserGUI(QMainWindow):
         _txt(self._txt_burst_fo,        "burst_fo")
         _txt(self._txt_burst_cycles,    "burst_cycles")
         _idx(self._cmb_burst_polarity,  "burst_polarity_index")
-
-        # View state
         _chk(self._chk_ch1_vis, "vis_ch1")
         _chk(self._chk_ch2_vis, "vis_ch2")
         if "region" in d:
@@ -912,7 +1125,7 @@ class PulserGUI(QMainWindow):
 # ===========================================================================
 if __name__ == "__main__":
     app = QApplication(sys.argv)
-    app.setStyle("Fusion")   # consistent cross-platform look
+    app.setStyle("Fusion")
     win = PulserGUI()
     win.show()
     sys.exit(app.exec_())
