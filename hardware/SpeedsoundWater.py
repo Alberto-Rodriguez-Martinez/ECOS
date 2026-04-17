@@ -24,7 +24,7 @@ def get_Cw_from_arduino(N_avg=3, max_attempts=5, closePort=False, port='COM4'):
     - temp1, temp2: temperaturas de los sensores (°C)
     - Cw1, Cw2: velocidades del sonido calculadas (m/s)
     """
-    arduino = Arduino(baudrate=9600, port=port, N_avg=N_avg)
+    arduino = Arduino(baudrate=115200, port=port, N_avg=N_avg)
     
     # Intentos de lectura segura
     for attempt in range(max_attempts):

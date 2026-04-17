@@ -274,6 +274,16 @@ class PulserGUI(QMainWindow):
         self._plot_zoom.addItem(self._cursor_text_time)
         self._cursor_text_time.hide()
 
+        self._clip_text = pg.TextItem(
+            text=u'\u26a0 CLIPPING', color='white', anchor=(1, 0)
+        )
+        self._clip_text.setPos(self._reclen, 0.45)
+        self._clip_text.hide()
+        self._clip_text.setHtml(
+            '<div style="background-color:red; padding:3px;">\u26a0 CLIPPING</div>'
+        )
+        self._plot_zoom.addItem(self._clip_text)
+
         # ── Spectrum plot ─────────────────────────────────────────────────
         self._plot_spectrum = pg.PlotWidget(title="Spectrum")
         self._plot_spectrum.setLabel('left', 'Amplitude')
@@ -710,6 +720,15 @@ class PulserGUI(QMainWindow):
                 self._curve_zoom_ch2.setData(x_zoom, ch2[smin:smax]) \
                     if self._chk_ch2_vis.isChecked() \
                     else self._curve_zoom_ch2.setData([], [])
+
+            visible_ch1 = ch1[smin:smax] if self._chk_ch1_vis.isChecked() else np.array([])
+            visible_ch2 = ch2[smin:smax] if self._chk_ch2_vis.isChecked() else np.array([])
+            all_visible = np.concatenate([visible_ch1, visible_ch2])
+            if len(all_visible) > 0 and np.abs(all_visible).max() >= 0.45:
+                self._clip_text.setPos(rmax, 0.45)
+                self._clip_text.show()
+            else:
+                self._clip_text.hide()
 
         except Exception as e:
             print(f"[_update_plots] {e}")

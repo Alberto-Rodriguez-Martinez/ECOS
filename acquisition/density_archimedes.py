@@ -98,7 +98,6 @@ from matplotlib.widgets import Button, TextBox
 from datetime import datetime
 
 from SeDaq import SeDaqDLL
-from ACQ_ToolBox import GetAscan_Ch1, GetAscan_Ch2
 import GenCode_ToolBox as gc
 from ECOS_US_ToolBox import CalcToFAscanCosine_XCRFFT
 from SpeedsoundWater import water_temp2sos, get_Cw_from_arduino
@@ -127,7 +126,7 @@ GAIN_INIT    = 35      # Initial receiver gain [dB]
 # [3] HARDWARE INITIALISATION
 # ==============================================================================
 
-def _init_hardware(transducer_freq, channel, Smax):
+def _init_hardware(transducer_freq, channel, Smax, gain=35.0, voltage=None):
     """
     Connect to the SeDaq digitizer, upload the excitation waveform, and
     set the initial receiver gain.
@@ -144,6 +143,10 @@ def _init_hardware(transducer_freq, channel, Smax):
         Receiver channel to use (1 or 2).
     Smax : int
         Record length (number of samples to acquire).
+    gain : float
+        Receiver gain [dB]. Default: 35.0.
+    voltage : float or None
+        Excitation voltage [V]. If None, the hardware default is used.
 
     Returns
     -------
@@ -176,10 +179,13 @@ def _init_hardware(transducer_freq, channel, Smax):
     # Since we use only one channel here this is not an issue, but it is
     # good practice to always set gains in the order Ch1 → Ch2.
     if channel == 1:
-        SeDaq.SetGain1(GAIN_INIT)
+        SeDaq.SetGain1(gain)
     else:
-        SeDaq.SetGain2(GAIN_INIT)
-    print(f"  Channel       : {channel}   |   Initial gain: {GAIN_INIT} dB")
+        SeDaq.SetGain2(gain)
+    print(f"  Channel       : {channel}   |   Initial gain: {gain} dB")
+    if voltage is not None:
+        SeDaq.SetExtVoltage(int(voltage))
+        print(f"  Excitation voltage: {int(voltage)} V")
     print("SeDaq ready.\n")
 
     return SeDaq
@@ -275,10 +281,32 @@ def _get_ascan(SeDaq, channel, Smin, Smax, avg=1):
     ascan : ndarray, shape (Smax-Smin,)
         Normalised, averaged A-scan.
     """
-    if channel == 2:
-        return GetAscan_Ch2(Smin, Smax, AvgSamplesNumber=avg)
-    else:
-        return GetAscan_Ch1(Smin, Smax, AvgSamplesNumber=avg)
+    quant   = 1024   # 10-bit digitizer: 2^10 quantisation levels
+    acc     = np.zeros(Smax - Smin)
+    n_done  = 0
+
+    while n_done < avg:
+        SeDaq.GetAScan()
+
+        if channel == 2:
+            raw = np.array(list(SeDaq.DataADC2[Smin:Smax]), dtype=float)
+        else:
+            raw = np.array(list(SeDaq.DataADC1[Smin:Smax]), dtype=float)
+
+        # Normalise to [-0.5, +0.5] and remove DC offset
+        raw = (raw - quant / 2.0) / quant
+        raw = raw - np.mean(raw)
+
+        # Skip blank frames (occasional hardware glitch)
+        if np.all(raw == 0.0):
+            continue
+
+        acc   += raw
+        n_done += 1
+
+    ascan = acc / avg
+    ascan = ascan - np.mean(ascan)
+    return ascan
 
 # ==============================================================================
 # [6] LIVE A-SCAN GUI
@@ -344,6 +372,16 @@ def _live_acquire(SeDaq, channel, Smin, Smax, title):
     ax.set_title(title)
     ax.grid(True, alpha=0.3)
 
+    # ---- Clipping indicator --------------------------------------------------
+    clip_text = ax.text(
+        0.98, 0.95, u'\u26a0 CLIPPING',
+        transform=ax.transAxes,
+        ha='right', va='top',
+        color='white', fontweight='bold',
+        bbox=dict(boxstyle='round,pad=0.3', facecolor='red', edgecolor='none'),
+        visible=False,
+    )
+
     # ---- Gain TextBox --------------------------------------------------------
     # Positioned below the plot (axes coordinates [left, bottom, width, height])
     ax_tb = plt.axes([0.15, 0.08, 0.15, 0.06])
@@ -389,6 +427,9 @@ def _live_acquire(SeDaq, channel, Smin, Smax, title):
         # Auto-scale y-axis with 20% headroom so the signal fits neatly
         peak = max(np.abs(ascan_live).max(), 1e-6)   # avoid zero division
         ax.set_ylim(-peak * 1.2, peak * 1.2)
+
+        # Clipping indicator — show when signal approaches ±0.5 normalised limit
+        clip_text.set_visible(np.abs(ascan_live).max() >= 0.45)
 
         fig.canvas.draw()
         fig.canvas.flush_events()
@@ -439,7 +480,8 @@ def _calc_delta_tof(sW1, sW2):
 # ==============================================================================
 
 def calibrate_vessel(V_cal, temperature=None, transducer_freq=10,
-                     channel=2, Smin=0, Smax=None, N_cal=3, arduino_port='COM4'):
+                     channel=2, Smin=0, Smax=None, N_cal=3, arduino_port='COM4',
+                     gain=35.0, voltage=None):
     """
     Estimate the effective inner radius of the cylindrical vessel by
     submerging a calibration object of known volume and measuring the
@@ -476,6 +518,10 @@ def calibrate_vessel(V_cal, temperature=None, transducer_freq=10,
     arduino_port : str
         Serial port of the Arduino (e.g. 'COM3'). Used only when temperature
         is None.
+    gain : float
+        Receiver gain [dB]. Default: 35.0.
+    voltage : float or None
+        Excitation voltage [V]. If None, the hardware default is used.
 
     Returns
     -------
@@ -484,7 +530,8 @@ def calibrate_vessel(V_cal, temperature=None, transducer_freq=10,
     """
 
     # ---- Hardware init -------------------------------------------------------
-    SeDaq = _init_hardware(transducer_freq, channel, RecLen if Smax is None else Smax)
+    SeDaq = _init_hardware(transducer_freq, channel, RecLen if Smax is None else Smax,
+                           gain=gain, voltage=voltage)
     if Smax is None:
         Smax = SeDaq.RecLen   # use the record length just set
 
@@ -567,7 +614,7 @@ def calibrate_vessel(V_cal, temperature=None, transducer_freq=10,
 
 def measure_density(r_vessel, mass=None, temperature=None, transducer_freq=10,
                     channel=2, Smin=0, Smax=None, specimen_name=None,
-                    arduino_port='COM4'):
+                    arduino_port='COM4', gain=35.0, voltage=None):
     """
     Measure the density of a specimen using the Archimedes water-displacement
     method with ultrasonic TOF detection.
@@ -597,6 +644,10 @@ def measure_density(r_vessel, mass=None, temperature=None, transducer_freq=10,
         Serial port of the Arduino (e.g. 'COM4'). Used only when temperature
         is None. If the connection fails, the user is prompted to enter the
         temperature manually.
+    gain : float
+        Receiver gain [dB]. Default: 35.0.
+    voltage : float or None
+        Excitation voltage [V]. If None, the hardware default is used.
 
     Returns
     -------
@@ -617,7 +668,8 @@ def measure_density(r_vessel, mass=None, temperature=None, transducer_freq=10,
     print(f"Specimen: {specimen_name}\n")
 
     # ---- Hardware init -------------------------------------------------------
-    SeDaq = _init_hardware(transducer_freq, channel, RecLen if Smax is None else Smax)
+    SeDaq = _init_hardware(transducer_freq, channel, RecLen if Smax is None else Smax,
+                           gain=gain, voltage=voltage)
     if Smax is None:
         Smax = SeDaq.RecLen
 
@@ -741,35 +793,84 @@ def measure_density(r_vessel, mass=None, temperature=None, transducer_freq=10,
 # ==============================================================================
 
 if __name__ == "__main__":
+    import argparse
 
-    # ------------------------------------------------------------------
-    # OPTION A — Vessel radius is unknown: run calibration first.
-    # Use a calibration object whose volume you know (e.g. a metal cube
-    # measured with a graduated cylinder or computed from caliper dimensions).
-    # ------------------------------------------------------------------
-
-    # r = calibrate_vessel(
-    #     V_cal          = 12.5,    # [cm^3] known volume of calibration object
-    #     N_cal          = 3,       # number of repetitions to average
-    #     transducer_freq= 10,      # [MHz]
-    #     channel        = 2,
-    # )
-
-    # ------------------------------------------------------------------
-    # OPTION B — Vessel radius is already known (from a previous calibration
-    # or from direct measurement).
-    # ------------------------------------------------------------------
-
-    r = 9.85    # [cm] — replace with your calibrated or measured value
-
-    measure_density(
-        r_vessel        = r,            # [cm] inner radius of the vessel
-        mass            = None,         # [g] sample mass — set to None to skip density computation
-        temperature     = None,         # [°C] water temperature — None reads from Arduino
-        transducer_freq = 10,           # [MHz] transducer center frequency (5 or 10 MHz)
-        channel         = 2,            # acquisition channel (1 or 2)
-        specimen_name   = None,         # sample identifier — None prompts at runtime
-        arduino_port    = 'COM4',       # serial port of the Arduino temperature sensor
-        Smin            = 3000,            # [samples] start of acquisition window (default 0)
-        Smax            = 4000,         # [samples] end of acquisition window (None = full RecLen)        
+    parser = argparse.ArgumentParser(
+        prog='density_archimedes',
+        description='Archimedes ultrasonic density measurement — UMH ECOS',
     )
+    sub = parser.add_subparsers(dest='command', required=True)
+
+    # ---- Shared arguments (both subcommands) --------------------------------
+    def _add_shared(p):
+        p.add_argument('--freq',    type=int,   default=10,     metavar='MHz',
+                       help='Transducer centre frequency in MHz (5 or 10). Default: 10')
+        p.add_argument('--channel', type=int,   default=2,      metavar='CH',
+                       help='Acquisition channel (1 or 2). Default: 2')
+        p.add_argument('--port',    type=str,   default='COM4', metavar='PORT',
+                       help='Arduino serial port. Default: COM4')
+        p.add_argument('--smin',    type=int,   default=0,      metavar='S',
+                       help='First sample of acquisition window. Default: 0')
+        p.add_argument('--smax',    type=int,   default=None,   metavar='S',
+                       help='Last sample of acquisition window. Default: full RecLen')
+
+    # ---- calibrate ----------------------------------------------------------
+    p_cal = sub.add_parser('calibrate',
+                           help='Estimate vessel inner radius from a known-volume object')
+    p_cal.add_argument('--vcal', type=float, required=True, metavar='CM3',
+                       help='Known volume of the calibration object [cm^3]')
+    p_cal.add_argument('--ncal', type=int,   default=3,     metavar='N',
+                       help='Number of calibration repetitions to average. Default: 3')
+    p_cal.add_argument('--gain',    type=float, default=35.0, metavar='DB',
+                       help='Receiver gain Ch2 [dB] (default: 35)')
+    p_cal.add_argument('--voltage', type=float, default=None, metavar='V',
+                       help='Excitation voltage [V] (optional)')
+    _add_shared(p_cal)
+
+    # ---- measure ------------------------------------------------------------
+    p_meas = sub.add_parser('measure',
+                            help='Measure specimen density by water displacement')
+    p_meas.add_argument('--rvessel', type=float, required=True, metavar='CM',
+                        help='Inner radius of the vessel [cm]')
+    p_meas.add_argument('--mass',    type=float, default=None,  metavar='G',
+                        help='Specimen mass [g]. Omit to skip density computation')
+    p_meas.add_argument('--temp',    type=float, default=None,  metavar='C',
+                        help='Water temperature [°C]. Omit to read from Arduino')
+    p_meas.add_argument('--name',    type=str,   default=None,  metavar='LABEL',
+                        help='Specimen identifier. Omit to be prompted at runtime')
+    p_meas.add_argument('--gain',    type=float, default=35.0,  metavar='DB',
+                        help='Receiver gain Ch2 [dB] (default: 35)')
+    p_meas.add_argument('--voltage', type=float, default=None,  metavar='V',
+                        help='Excitation voltage [V] (optional)')
+    _add_shared(p_meas)
+
+    args = parser.parse_args()
+
+    if args.command == "calibrate":
+        r = calibrate_vessel(
+            V_cal           = args.vcal,
+            N_cal           = args.ncal,
+            transducer_freq = args.freq,
+            channel         = args.channel,
+            arduino_port    = args.port,
+            Smin            = args.smin,
+            Smax            = args.smax,
+            gain            = args.gain,
+            voltage         = args.voltage,
+        )
+        print(f"\nr_vessel calibrado = {r:.4f} cm")
+
+    elif args.command == "measure":
+        measure_density(
+            r_vessel        = args.rvessel,
+            mass            = args.mass,
+            temperature     = args.temp,
+            transducer_freq = args.freq,
+            channel         = args.channel,
+            arduino_port    = args.port,
+            Smin            = args.smin,
+            Smax            = args.smax,
+            specimen_name   = args.name,
+            gain            = args.gain,
+            voltage         = args.voltage,
+        )
