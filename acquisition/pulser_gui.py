@@ -840,7 +840,7 @@ class PulserGUI(QMainWindow):
 
     def _on_voltage_changed(self):
         try:
-            voltage = float(self._txt_voltage.text())
+            voltage = int(float(self._txt_voltage.text()))
             self._sedaq.SetExtVoltage(voltage)
         except ValueError:
             pass
