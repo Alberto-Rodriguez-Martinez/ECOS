@@ -47,11 +47,11 @@ import GenCode_ToolBox as gc
 # [2] EDITABLE CONSTANTS
 # ==============================================================================
 
-GAIN_CH1  = 80     # Receiver gain, channel 1 [dB]
-GAIN_CH2  = 30     # Receiver gain, channel 2 [dB]
+GAIN_CH1  = 65     # Receiver gain, channel 1 [dB]
+GAIN_CH2  = 40     # Receiver gain, channel 2 [dB]
 
-VOLTAGE   = 200    # Excitation voltage [V]  — passed as int to SetExtVoltage
-RECLEN    = 16384  # Acquisition record length [samples]  (16384 = 164 µs @ 100 MHz)
+VOLTAGE   = 71    # Excitation voltage [V]  — passed as int to SetExtVoltage
+RECLEN    = 30000  # Acquisition record length [samples]  (16384 = 164 µs @ 100 MHz)
 FREQ_MHZ  = 10     # Transducer centre frequency [MHz]
 
 PROG_GEN_CLK = 200e6   # Waveform generator internal clock [Hz] — do not change
@@ -86,7 +86,7 @@ sedaq.UpdateGenCode(GenCode)
 print(f"  UpdateGenCode()  →  {FREQ_MHZ} MHz bipolar pulse uploaded")
 
 sedaq.SetGain1(GAIN_CH1)
-print(f"  SetGain2({GAIN_CH1} dB)")
+print(f"  SetGain1({GAIN_CH1} dB)")
 
 sedaq.SetGain2(GAIN_CH2)
 print(f"  SetGain2({GAIN_CH2} dB)")
@@ -94,7 +94,12 @@ print(f"  SetGain2({GAIN_CH2} dB)")
 sedaq.SetExtVoltage(int(VOLTAGE))
 print(f"  SetExtVoltage({int(VOLTAGE)} V)")
 
-print("\nHardware ready.\n")
+#sedaq.SetRelay(1)   # 1 = OFF según protocolo KTU
+#print("  SetRelay(OFF)")
+#sedaq.SetRelay(0)   # 0 = ON según protocolo KTU
+#print("  SetRelay(ON)")
+#time.sleep(0.5)
+#print("\nHardware ready.\n")
 
 # ==============================================================================
 # [4] ACQUISITION
@@ -144,3 +149,6 @@ axes[1].grid(True, alpha=0.3)
 
 fig.tight_layout()
 plt.show()
+
+sedaq.Close()
+print("USB connection closed.")
