@@ -25,10 +25,9 @@ import datetime
 import argparse
 import time
 
-os.add_dll_directory(r"D:\ECOS\tools")
-
 _TOOLS_DIR_EARLY = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'tools')
 os.chdir(_TOOLS_DIR_EARLY)
+os.add_dll_directory(_TOOLS_DIR_EARLY)
 
 if sys.maxsize <= 2**32:
     _anaconda32_bin = r"C:\ProgramData\Anaconda32\Library\bin"
@@ -85,9 +84,10 @@ else:
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
-SEDAQ_DLL_PATH    = r"D:\ECOS\tools\SeDaqDLL.dll"
 
 DEFAULT_RECLEN    = 16384   # samples — default digitizer record length
+DEFAULT_GAIN_CH1  = 60
+DEFAULT_GAIN_CH2  = 20
 DEFAULT_ACQ_FS    = 100e6   # Hz — digitizer sampling frequency
 DEFAULT_GEN_FS    = 200e6   # Hz — generator (KTU pulser) clock frequency
 REALTIME_INTERVAL = 100     # ms — timer period ≈ 10 fps
@@ -161,7 +161,7 @@ class PulserGUI(QMainWindow):
         # ── Hardware connection ───────────────────────────────────────────
         if _HW_AVAILABLE:
             try:
-                self._sedaq = SeDaqDLL(SEDAQ_DLL_PATH)
+                self._sedaq = SeDaqDLL()  # DLL path resolved relative to SeDaq.py location
                 self._sedaq.SetRecLen(DEFAULT_RECLEN)
                 time.sleep(0.5)   # wait for firmware to stabilise after connection
                 self._demo = False
@@ -372,8 +372,8 @@ class PulserGUI(QMainWindow):
         box = QGroupBox("Pulser Control")
         form = QFormLayout(box)
 
-        self._txt_gain_ch1 = QLineEdit("1.0")
-        self._txt_gain_ch2 = QLineEdit("1.0")
+        self._txt_gain_ch1 = QLineEdit(str(DEFAULT_GAIN_CH1))
+        self._txt_gain_ch2 = QLineEdit(str(DEFAULT_GAIN_CH2))
         self._txt_voltage  = QLineEdit("100.0")
         self._txt_acq_fs   = QLineEdit("100e6")
 
@@ -811,7 +811,7 @@ class PulserGUI(QMainWindow):
     #  Relay toggle
     # =======================================================================
     def _on_relay_toggled(self, checked):
-        state = 1 if checked else 0
+        state = 0 if checked else 1  # TODO: verify hardware encoding (KTU protocol: ON=0, OFF=1 per SeDaq.pyc)
         self._btn_relay.setText(f"RELAY: {'ON' if checked else 'OFF'}")
         try:
             self._sedaq.SetRelay(state)
