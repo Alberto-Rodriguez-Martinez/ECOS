@@ -25,6 +25,9 @@ import datetime
 import argparse
 import time
 
+os.environ["QT_AUTO_SCREEN_SCALE_FACTOR"] = "1"
+os.environ["QT_SCALE_FACTOR"] = "1"
+
 _TOOLS_DIR_EARLY = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'tools')
 os.chdir(_TOOLS_DIR_EARLY)
 os.add_dll_directory(_TOOLS_DIR_EARLY)
@@ -164,6 +167,9 @@ class PulserGUI(QMainWindow):
                 self._sedaq = SeDaqDLL()  # DLL path resolved relative to SeDaq.py location
                 self._sedaq.SetRecLen(DEFAULT_RECLEN)
                 time.sleep(0.5)   # wait for firmware to stabilise after connection
+                self._sedaq.SetRelay(1)  # force OFF first
+                time.sleep(0.2)
+                self._sedaq.SetRelay(0)  # then ON — required by hardware quirk
                 self._demo = False
             except Exception as e:
                 QMessageBox.warning(
@@ -191,9 +197,16 @@ class PulserGUI(QMainWindow):
         splitter = QSplitter(Qt.Horizontal)
         splitter.addWidget(self._build_left_panel())
         splitter.addWidget(self._build_right_panel())
-        splitter.setStretchFactor(0, 7)   # left  70 %
-        splitter.setStretchFactor(1, 3)   # right 30 %
+        splitter.setSizes([1080, 180])
         main_layout.addWidget(splitter)
+
+        self._btn_relay.setChecked(True)   # relay was initialised ON in hardware init
+
+        self._sedaq.SetGain1(DEFAULT_GAIN_CH1)
+        self._sedaq.SetGain2(DEFAULT_GAIN_CH2)
+        self._sedaq.SetExtVoltage(int(float(self._txt_voltage.text())))
+
+        self._syncing = False
 
         # ── Real-time acquisition timer ───────────────────────────────────
         self._timer = QTimer()
@@ -207,6 +220,18 @@ class PulserGUI(QMainWindow):
         self._timer.stop()
         super().resizeEvent(event)
         self._timer.start(REALTIME_INTERVAL)
+
+    # =======================================================================
+    #  Window close
+    # =======================================================================
+    def closeEvent(self, event):
+        self._timer.stop()
+        if not self._demo:
+            try:
+                self._sedaq.Close()
+            except Exception:
+                pass
+        event.accept()
 
     # =======================================================================
     #  Menu bar
@@ -258,7 +283,6 @@ class PulserGUI(QMainWindow):
         # Fix Y range to ±0.5 — disable auto-scale and mouse Y interaction
         self._plot_zoom.enableAutoRange(axis='y', enable=False)
         self._plot_zoom.setYRange(-0.5, 0.5, padding=0)
-        self._plot_zoom.setLimits(xMin=0, xMax=self._reclen, yMin=-0.5, yMax=0.5)
         self._plot_zoom.getViewBox().setMouseEnabled(y=False)
         self._curve_zoom_ch1 = self._plot_zoom.plot(
             pen=pg.mkPen('c', width=1), name="Ch1"
@@ -270,12 +294,12 @@ class PulserGUI(QMainWindow):
         self._vline_time = pg.InfiniteLine(angle=90, movable=False, pen='w')
         self._vline_time.setVisible(False)
         self._plot_zoom.addItem(self._vline_time)
-        self._cursor_text_time = pg.TextItem(anchor=(0, 1), color='white')
+        self._cursor_text_time = pg.TextItem(anchor=(0, 1), color=(255, 255, 255))
         self._plot_zoom.addItem(self._cursor_text_time)
         self._cursor_text_time.hide()
 
         self._clip_text = pg.TextItem(
-            text=u'\u26a0 CLIPPING', color='white', anchor=(1, 0)
+            text=u'\u26a0 CLIPPING', color=(255, 255, 255), anchor=(1, 0)
         )
         self._clip_text.setPos(self._reclen, 0.45)
         self._clip_text.hide()
@@ -299,7 +323,7 @@ class PulserGUI(QMainWindow):
         self._vline_spec = pg.InfiniteLine(angle=90, movable=False, pen='w')
         self._vline_spec.setVisible(False)
         self._plot_spectrum.addItem(self._vline_spec)
-        self._cursor_text_spec = pg.TextItem(anchor=(0, 1), color='white')
+        self._cursor_text_spec = pg.TextItem(anchor=(0, 1), color=(255, 255, 255))
         self._plot_spectrum.addItem(self._cursor_text_spec)
         self._cursor_text_spec.hide()
         vb = self._plot_spectrum.getViewBox()
@@ -318,13 +342,11 @@ class PulserGUI(QMainWindow):
         self._plot_overview = pg.PlotWidget(title="Overview — full record")
         self._plot_overview.setLabel('bottom', 'Sample')
         self._plot_overview.setMaximumHeight(180)
+        self._plot_overview.getViewBox().enableAutoRange(axis='x', enable=False)
         # Fix axes: X = [0, RecLen], Y = [±0.5] — no mouse interaction
-        self._plot_overview.setXRange(0, self._reclen, padding=0)
+        self._plot_overview.setXRange(0, self._reclen - 1, padding=0)
         self._plot_overview.setYRange(SIGNAL_YMIN, SIGNAL_YMAX, padding=0)
-        self._plot_overview.setLimits(
-            xMin=0, xMax=self._reclen,
-            yMin=SIGNAL_YMIN, yMax=SIGNAL_YMAX
-        )
+        self._plot_overview.setLimits(xMin=0, xMax=self._reclen - 1, yMin=SIGNAL_YMIN, yMax=SIGNAL_YMAX)
         self._plot_overview.getViewBox().setMouseEnabled(x=False, y=False)
 
         self._curve_ov_ch1 = self._plot_overview.plot(pen=pg.mkPen('c', width=1))
@@ -360,8 +382,8 @@ class PulserGUI(QMainWindow):
         layout.setSpacing(8)
         layout.addWidget(self._build_block_pulser())
         layout.addWidget(self._build_block_acq())
-        layout.addWidget(self._build_block_spectrum())
         layout.addWidget(self._build_block_gencode())
+        layout.addWidget(self._build_block_spectrum())
         layout.addStretch()
         return scroll
 
@@ -458,7 +480,7 @@ class PulserGUI(QMainWindow):
         # Comment
         layout.addWidget(QLabel("Comment:"))
         self._txt_comment = QPlainTextEdit()
-        self._txt_comment.setMaximumHeight(60)
+        self._txt_comment.setMaximumHeight(40)
         self._txt_comment.setPlaceholderText("Free text note for this acquisition…")
         layout.addWidget(self._txt_comment)
         return box
@@ -625,6 +647,10 @@ class PulserGUI(QMainWindow):
         layout.addLayout(fs_row)
 
         self._stack = QStackedWidget()
+        self._stack.setSizePolicy(
+            self._stack.sizePolicy().horizontalPolicy(),
+            __import__('PyQt5.QtWidgets', fromlist=['QSizePolicy']).QSizePolicy.Minimum
+        )
         self._stack.addWidget(self._build_pulse_page())
         self._stack.addWidget(self._build_chirp_page())
         self._stack.addWidget(self._build_burst_page())
@@ -711,7 +737,6 @@ class PulserGUI(QMainWindow):
                 else self._curve_ov_ch1.setData([], [])
             self._curve_ov_ch2.setData(x_full, ch2) if self._chk_ch2_vis.isChecked() \
                 else self._curve_ov_ch2.setData([], [])
-
             # Zoom curves
             if smax > smin:
                 self._curve_zoom_ch1.setData(x_zoom, ch1[smin:smax]) \
@@ -748,18 +773,21 @@ class PulserGUI(QMainWindow):
     #  Zoom / region synchronisation
     # =======================================================================
     def _on_region_changed(self):
+        if self._syncing:
+            return
+        self._syncing = True
         rmin, rmax = self._region.getRegion()
-        self._plot_zoom.blockSignals(True)
         self._plot_zoom.setXRange(rmin, rmax, padding=0)
-        self._plot_zoom.blockSignals(False)
+        self._syncing = False
 
     def _on_zoom_xrange_changed(self, _vb, x_range):
-        # Clip to valid range before syncing region
+        if self._syncing:
+            return
+        self._syncing = True
         xmin = max(0, x_range[0])
         xmax = min(self._reclen, x_range[1])
-        self._region.blockSignals(True)
         self._region.setRegion([xmin, xmax])
-        self._region.blockSignals(False)
+        self._syncing = False
 
     def _toggle_ch1_vis(self, checked):
         if not checked:
@@ -799,9 +827,8 @@ class PulserGUI(QMainWindow):
             print(f"[SetRecLen] {e}")
 
         # Update overview axis limits and region bounds
-        self._plot_overview.setXRange(0, reclen, padding=0)
-        self._plot_overview.setLimits(xMin=0, xMax=reclen)
-        self._plot_zoom.setLimits(xMin=0, xMax=self._reclen)
+        self._plot_overview.setXRange(0, reclen - 1, padding=0)
+        self._plot_overview.setLimits(xMin=0, xMax=reclen - 1)
         self._region.setBounds([0, reclen])
         # Clip current region to new bounds
         rmin, rmax = self._region.getRegion()
@@ -811,7 +838,7 @@ class PulserGUI(QMainWindow):
     #  Relay toggle
     # =======================================================================
     def _on_relay_toggled(self, checked):
-        state = 0 if checked else 1  # TODO: verify hardware encoding (KTU protocol: ON=0, OFF=1 per SeDaq.pyc)
+        state = 0 if checked else 1  # Hardware encoding: ON=0, OFF=1
         self._btn_relay.setText(f"RELAY: {'ON' if checked else 'OFF'}")
         try:
             self._sedaq.SetRelay(state)
@@ -824,6 +851,7 @@ class PulserGUI(QMainWindow):
         try:
             gain = float(self._txt_gain_ch1.text())
             self._sedaq.SetGain1(gain)
+            self._sedaq.SetGain2(float(self._txt_gain_ch2.text()))  # hardware bug: SetGain1 resets Gain2, must re-apply
         except ValueError:
             pass
         except Exception as e:
@@ -1143,6 +1171,8 @@ class PulserGUI(QMainWindow):
 #  Entry point
 # ===========================================================================
 if __name__ == "__main__":
+    QApplication.setAttribute(Qt.AA_EnableHighDpiScaling, True)
+    QApplication.setAttribute(Qt.AA_UseHighDpiPixmaps, True)
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
     win = PulserGUI()

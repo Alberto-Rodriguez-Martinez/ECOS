@@ -48,7 +48,7 @@ import GenCode_ToolBox as gc
 # ==============================================================================
 
 GAIN_CH1  = 65     # Receiver gain, channel 1 [dB]
-GAIN_CH2  = 40     # Receiver gain, channel 2 [dB]
+GAIN_CH2  = 35     # Receiver gain, channel 2 [dB]
 
 VOLTAGE   = 71    # Excitation voltage [V]  — passed as int to SetExtVoltage
 RECLEN    = 30000  # Acquisition record length [samples]  (16384 = 164 µs @ 100 MHz)
@@ -62,7 +62,7 @@ Fs           = 100e6   # ADC sampling frequency [Hz]           — do not change
 # ==============================================================================
 
 print("=" * 56)
-print("  SeDaq hardware test")
+print("  SeDaq haPrdware test")
 print(f"  FREQ={FREQ_MHZ} MHz  |  GAIN_CH1={GAIN_CH1} dB  "
       f"GAIN_CH2={GAIN_CH2} dB  |  VOLTAGE={VOLTAGE} V  |  RECLEN={RECLEN}")
 print("=" * 56)
@@ -94,12 +94,12 @@ print(f"  SetGain2({GAIN_CH2} dB)")
 sedaq.SetExtVoltage(int(VOLTAGE))
 print(f"  SetExtVoltage({int(VOLTAGE)} V)")
 
-#sedaq.SetRelay(1)   # 1 = OFF según protocolo KTU
-#print("  SetRelay(OFF)")
-#sedaq.SetRelay(0)   # 0 = ON según protocolo KTU
-#print("  SetRelay(ON)")
-#time.sleep(0.5)
-#print("\nHardware ready.\n")
+sedaq.SetRelay(1)   # 1 = OFF según protocolo KTU
+print("  SetRelay(OFF)")
+sedaq.SetRelay(0)   # 0 = ON según protocolo KTU
+print("  SetRelay(ON)")
+time.sleep(0.5)
+print("\nHardware ready.\n")
 
 # ==============================================================================
 # [4] ACQUISITION

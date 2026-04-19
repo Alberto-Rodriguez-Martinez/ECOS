@@ -163,6 +163,7 @@ class SeDaqDLL:
         self.SeDaqDLL_SetRelay(mode)
 
     def Close(self):
+        self.SetRelay(1)   # relay OFF — safe state before closing
         self.usb.UsbClose(c_byte(0))
 
 
