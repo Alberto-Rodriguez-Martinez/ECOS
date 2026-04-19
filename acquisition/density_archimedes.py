@@ -156,6 +156,9 @@ def _init_hardware(transducer_freq, channel, Smax, gain=35.0, voltage=None):
     print("Connecting to SeDaq digitizer...")
     SeDaq = SeDaqDLL()
     time.sleep(0.5)   # Allow firmware to stabilise after connection
+    SeDaq.SetRelay(1)  # force OFF first
+    time.sleep(0.2)
+    SeDaq.SetRelay(0)  # then ON — required by hardware quirk
 
     # Set how many samples the digitizer stores per trigger event
     SeDaq.SetRecLen(Smax)
