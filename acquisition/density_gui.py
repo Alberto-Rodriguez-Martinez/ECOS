@@ -89,8 +89,8 @@ else:
 # Constants
 # ---------------------------------------------------------------------------
 DEFAULT_RECLEN    = 16384
-DEFAULT_GAIN      = 35
-DEFAULT_VOLTAGE   = 100
+DEFAULT_GAIN      = 0
+DEFAULT_VOLTAGE   = 20
 DEFAULT_GEN_FS    = 200e6
 DEFAULT_ACQ_FS    = 100e6
 REALTIME_INTERVAL = 100      # ms
@@ -697,7 +697,16 @@ class DensityGUI(QMainWindow):
             return
         try:
             port = self._txt_arduino_port.text().strip()
-            T, cw = get_Cw_from_arduino(port=port)
+            T1, T2, Cw1, Cw2 = get_Cw_from_arduino(port=port)
+            if T1 is not None and T2 is not None:
+                T = (T1 + T2) / 2.0
+                cw = (Cw1 + Cw2) / 2.0
+            elif T1 is not None:
+                T, cw = T1, Cw1
+            elif T2 is not None:
+                T, cw = T2, Cw2
+            else:
+                raise ValueError("Could not read temperature from Arduino")
             self._T  = T
             self._cw = cw
             self._txt_temp_manual.setText(f"{T:.2f}")
