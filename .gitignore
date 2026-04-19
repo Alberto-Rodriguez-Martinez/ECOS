@@ -33,4 +33,5 @@ _archive/
 run32.bat
 test_out.txt
 tools/data_32/
+tools/RegRd.txt
 .claude/
