@@ -47,7 +47,14 @@ class Arduino:
 
 
 if __name__ == "__main__":
-    arduino = Arduino(port='COM4', baudrate=115200, N_avg=2)
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--port', default='COM4')
+    parser.add_argument('--baudrate', type=int, default=115200)
+    parser.add_argument('--navg', type=int, default=2)
+    args = parser.parse_args()
+
+    arduino = Arduino(port=args.port, baudrate=args.baudrate, N_avg=args.navg)
     T1, T2 = arduino.getTemperatures()
     print(f"Sensor1 = {T1:.2f} °C, Sensor2 = {T2:.2f} °C")
     arduino.close()
