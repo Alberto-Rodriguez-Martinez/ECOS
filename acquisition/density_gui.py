@@ -96,6 +96,8 @@ DEFAULT_ACQ_FS    = 100e6
 REALTIME_INTERVAL = 100      # ms
 AVG_N             = 20       # A-scans averaged per acquisition
 
+SESSION_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'density_gui_session.json')
+
 SIGNAL_YMIN = -0.5
 SIGNAL_YMAX =  0.5
 
@@ -201,16 +203,107 @@ class DensityGUI(QMainWindow):
 
         self._syncing = False
 
+        # ── Restore previous session ──────────────────────────────────────
+        if os.path.exists(SESSION_FILE):
+            try:
+                with open(SESSION_FILE) as f:
+                    self._restore_session(json.load(f))
+                # Apply restored hardware values
+                try:
+                    self._sedaq.SetGain2(int(self._txt_gain_ch2.text()))
+                except Exception:
+                    pass
+                try:
+                    self._sedaq.SetExtVoltage(int(self._txt_voltage.text()))
+                except Exception:
+                    pass
+                try:
+                    reclen = int(self._txt_reclen.text())
+                    self._reclen = reclen
+                    self._sedaq.SetRecLen(reclen)
+                except Exception:
+                    pass
+                self._generate_upload()
+            except Exception:
+                pass
+
         # ── Real-time acquisition timer ───────────────────────────────────
         self._timer = QTimer()
         self._timer.timeout.connect(self._update_plots)
         self._timer.start(REALTIME_INTERVAL)
 
     # =======================================================================
+    #  Session save / restore
+    # =======================================================================
+    def _collect_session(self):
+        rmin, rmax = self._region.getRegion()
+        return {
+            "gain_ch2":            self._txt_gain_ch2.text(),
+            "voltage":             self._txt_voltage.text(),
+            "reclen":              self._txt_reclen.text(),
+            "relay":               self._btn_relay.isChecked(),
+            "region":              [rmin, rmax],
+            "excitation_index":    self._cmb_excitation.currentIndex(),
+            "gen_fs":              self._txt_gen_fs.text(),
+            "pulse_param_index":   self._cmb_pulse_param.currentIndex(),
+            "pulse_paramval":      self._txt_pulse_paramval.text(),
+            "pulse_polarity_index": self._cmb_pulse_polarity.currentIndex(),
+            "chirp_fstart":        self._txt_chirp_fstart.text(),
+            "chirp_fend":          self._txt_chirp_fend.text(),
+            "chirp_dur":           self._txt_chirp_dur.text(),
+            "chirp_method_index":  self._cmb_chirp_method.currentIndex(),
+            "chirp_phase":         self._txt_chirp_phase.text(),
+            "chirp_polarity_index": self._cmb_chirp_polarity.currentIndex(),
+            "burst_fo":            self._txt_burst_fo.text(),
+            "burst_cycles":        self._txt_burst_cycles.text(),
+            "burst_polarity_index": self._cmb_burst_polarity.currentIndex(),
+            "arduino_port":        self._txt_arduino_port.text(),
+            "temp_manual":         self._txt_temp_manual.text(),
+            "r_vessel":            self._txt_r_vessel.text(),
+            "vcal":                self._txt_vcal.text(),
+            "ncal":                self._txt_ncal.text(),
+            "n_avg":               self._txt_n_avg.text(),
+        }
+
+    def _restore_session(self, d):
+        self._txt_gain_ch2.setText(d.get("gain_ch2", str(DEFAULT_GAIN)))
+        self._txt_voltage.setText(d.get("voltage", str(DEFAULT_VOLTAGE)))
+        self._txt_reclen.setText(d.get("reclen", str(DEFAULT_RECLEN)))
+        self._btn_relay.setChecked(d.get("relay", True))
+        region = d.get("region")
+        if region:
+            self._region.setRegion(region)
+        self._cmb_excitation.setCurrentIndex(d.get("excitation_index", 0))
+        self._txt_gen_fs.setText(d.get("gen_fs", "200e6"))
+        self._cmb_pulse_param.setCurrentIndex(d.get("pulse_param_index", 0))
+        self._txt_pulse_paramval.setText(d.get("pulse_paramval", "10e6"))
+        self._cmb_pulse_polarity.setCurrentIndex(d.get("pulse_polarity_index", 0))
+        self._txt_chirp_fstart.setText(d.get("chirp_fstart", "2e6"))
+        self._txt_chirp_fend.setText(d.get("chirp_fend", "15e6"))
+        self._txt_chirp_dur.setText(d.get("chirp_dur", "3e-6"))
+        self._cmb_chirp_method.setCurrentIndex(d.get("chirp_method_index", 0))
+        self._txt_chirp_phase.setText(d.get("chirp_phase", "270"))
+        self._cmb_chirp_polarity.setCurrentIndex(d.get("chirp_polarity_index", 0))
+        self._txt_burst_fo.setText(d.get("burst_fo", "10e6"))
+        self._txt_burst_cycles.setText(d.get("burst_cycles", "5"))
+        self._cmb_burst_polarity.setCurrentIndex(d.get("burst_polarity_index", 0))
+        self._txt_arduino_port.setText(d.get("arduino_port", "COM4"))
+        self._txt_temp_manual.setText(d.get("temp_manual", "20.0"))
+        self._txt_r_vessel.setText(d.get("r_vessel", ""))
+        self._txt_vcal.setText(d.get("vcal", ""))
+        self._txt_ncal.setText(d.get("ncal", "3"))
+        self._txt_n_avg.setText(d.get("n_avg", str(AVG_N)))
+
+    # =======================================================================
     #  Window close
     # =======================================================================
     def closeEvent(self, event):
         self._timer.stop()
+        try:
+            with open(SESSION_FILE, 'w') as f:
+                json.dump(self._collect_session(), f, indent=2)
+        except Exception:
+            pass
         if not self._demo:
             try:
                 self._sedaq.Close()
@@ -245,7 +338,8 @@ class DensityGUI(QMainWindow):
         self._plot_zoom.showGrid(x=True, y=True, alpha=0.3)
         self._plot_zoom.enableAutoRange(axis='y', enable=False)
         self._plot_zoom.setYRange(-0.5, 0.5, padding=0)
-        self._plot_zoom.getViewBox().setMouseEnabled(y=False)
+        self._plot_zoom.getViewBox().setMouseEnabled(x=False, y=False)
+        self._plot_zoom.enableAutoRange(axis='x', enable=False)
 
         self._curve_zoom_ch2 = self._plot_zoom.plot(
             pen=pg.mkPen('y', width=1), name="Ch2"
@@ -507,6 +601,14 @@ class DensityGUI(QMainWindow):
         self._btn_compute.setEnabled(False)
         self._btn_compute.clicked.connect(self._on_compute_save)
         layout.addWidget(self._btn_compute)
+
+        row = QHBoxLayout()
+        row.addWidget(QLabel("N avg:"))
+        self._txt_n_avg = QLineEdit(str(AVG_N))
+        self._txt_n_avg.setFixedWidth(60)
+        row.addWidget(self._txt_n_avg)
+        row.addStretch()
+        layout.addLayout(row)
 
         self._lbl_acq_status = QLabel("Status: waiting for sW1")
         layout.addWidget(self._lbl_acq_status)
@@ -800,14 +902,18 @@ class DensityGUI(QMainWindow):
         quant = BITS_OPTIONS[self._cmb_bits.currentText()]
         acc   = np.zeros(self._reclen)
         n     = 0
-        while n < AVG_N:
+        n_avg = int(self._txt_n_avg.text())
+        while n < n_avg:
             self._sedaq.GetAScan()
             sig = self._raw_to_float(self._sedaq.DataADC2, self._reclen, quant)
             if np.all(sig == 0.0):
                 continue
             acc += sig
             n   += 1
-        return acc / AVG_N
+        rmin, rmax = self._region.getRegion()
+        smin = max(0, int(rmin))
+        smax = min(self._reclen, int(rmax))
+        return (acc / n_avg)[smin:smax]
 
     # =======================================================================
     #  Acquisition buttons
@@ -871,8 +977,8 @@ class DensityGUI(QMainWindow):
 
     def _compute_delta_tof(self, sig, ref):
         if _HW_AVAILABLE:
-            tof_s, tof_r = CalcToFAscanCosine_XCRFFT(sig, ref)
-            return (tof_s - tof_r) / DEFAULT_ACQ_FS
+            delta_tof_samples, xcorr, aligned = CalcToFAscanCosine_XCRFFT(sig, ref)
+            return delta_tof_samples / DEFAULT_ACQ_FS
         else:
             return 1.5e-6   # demo: 1.5 µs
 
@@ -936,6 +1042,10 @@ class DensityGUI(QMainWindow):
                 self._sedaq.GetAScan()
                 acc += self._raw_to_float(self._sedaq.DataADC2, self._reclen, quant)
             sw1_cal = acc / n_cal
+            rmin, rmax = self._region.getRegion()
+            smin = max(0, int(rmin))
+            smax = min(self._reclen, int(rmax))
+            sw1_cal = sw1_cal[smin:smax]
         except Exception as e:
             QMessageBox.critical(self, "Calibration error", str(e))
             self._timer.start(REALTIME_INTERVAL)
@@ -959,6 +1069,10 @@ class DensityGUI(QMainWindow):
                 self._sedaq.GetAScan()
                 acc += self._raw_to_float(self._sedaq.DataADC2, self._reclen, quant)
             sw2_cal = acc / n_cal
+            rmin, rmax = self._region.getRegion()
+            smin = max(0, int(rmin))
+            smax = min(self._reclen, int(rmax))
+            sw2_cal = sw2_cal[smin:smax]
 
             delta_tof = self._compute_delta_tof(sw2_cal, sw1_cal)
             delta_h   = self._cw * delta_tof / 2.0 * 100.0   # cm

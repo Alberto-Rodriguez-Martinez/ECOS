@@ -1,0 +1,30 @@
+{
+  "gain_ch2": "40",
+  "voltage": "80",
+  "reclen": "16384",
+  "relay": true,
+  "region": [
+    2875.5052702666117,
+    5417.28598566319
+  ],
+  "excitation_index": 0,
+  "gen_fs": "200e6",
+  "pulse_param_index": 0,
+  "pulse_paramval": "10e6",
+  "pulse_polarity_index": 0,
+  "chirp_fstart": "2e6",
+  "chirp_fend": "15e6",
+  "chirp_dur": "3e-6",
+  "chirp_method_index": 0,
+  "chirp_phase": "270",
+  "chirp_polarity_index": 0,
+  "burst_fo": "10e6",
+  "burst_cycles": "5",
+  "burst_polarity_index": 0,
+  "arduino_port": "COM3",
+  "temp_manual": "24.93",
+  "r_vessel": "9.5556",
+  "vcal": "25",
+  "ncal": "3",
+  "n_avg": "20"
+}
