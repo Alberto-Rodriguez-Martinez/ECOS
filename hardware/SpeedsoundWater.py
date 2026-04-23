@@ -10,7 +10,7 @@ def water_temp2sos(T):
         2.574064370e4 * np.exp(-((T + 3.705052160e2) / (-1.601257116e2))**2)
     return c
 
-def get_Cw_from_arduino(N_avg=3, max_attempts=5, closePort=False, port='COM4'):
+def get_Cw_from_arduino(N_avg=3, max_attempts=5, closePort=False, port='COM4', baudrate=115200):
     """
     Lee las temperaturas del Arduino y calcula la velocidad del sonido en agua.
 
@@ -19,12 +19,13 @@ def get_Cw_from_arduino(N_avg=3, max_attempts=5, closePort=False, port='COM4'):
     - max_attempts: máximo de intentos si falla la lectura
     - closePort: cerrar el puerto serie al terminar
     - port: puerto COM del Arduino (por defecto 'COM4')
+    - baudrate: velocidad del puerto serie (por defecto 115200)
 
     Retorna:
     - temp1, temp2: temperaturas de los sensores (°C)
     - Cw1, Cw2: velocidades del sonido calculadas (m/s)
     """
-    arduino = Arduino(baudrate=115200, port=port, N_avg=N_avg)
+    arduino = Arduino(baudrate=baudrate, port=port, N_avg=N_avg)
     
     # Intentos de lectura segura
     for attempt in range(max_attempts):
@@ -51,9 +52,15 @@ def get_Cw_from_arduino(N_avg=3, max_attempts=5, closePort=False, port='COM4'):
 
     return temp1, temp2, Cw1, Cw2
 
-# ======= prueba local si ejecutas este archivo directamente =======
 if __name__ == "__main__":
-    temp1, temp2, Cw1, Cw2 = get_Cw_from_arduino(N_avg=3)
+    import argparse
+    parser = argparse.ArgumentParser(description="Lee temperatura del Arduino y calcula Cw en agua.")
+    parser.add_argument('--port',     default='COM4',   help='Puerto COM del Arduino (default: COM4)')
+    parser.add_argument('--baudrate', default=115200,   type=int, help='Baudrate (default: 115200)')
+    parser.add_argument('--navg',     default=3,        type=int, help='Número de lecturas promedio (default: 3)')
+    args = parser.parse_args()
+
+    temp1, temp2, Cw1, Cw2 = get_Cw_from_arduino(N_avg=args.navg, port=args.port, baudrate=args.baudrate)
     if temp1 is not None:
         print(f"Sensor 1: T={temp1:.2f} °C, Cw={Cw1:.2f} m/s")
         print(f"Sensor 2: T={temp2:.2f} °C, Cw={Cw2:.2f} m/s")
