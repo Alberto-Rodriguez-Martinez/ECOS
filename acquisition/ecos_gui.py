@@ -1235,3 +1235,236 @@ class EcosGUI(QMainWindow):
             c.hide()
         if not self._timer.isActive():
             self._timer.start(REALTIME_INTERVAL)
+
+    # ==========================================================================
+    #  [7] Results computation
+    # ==========================================================================
+    def _compute_results(self):
+        st = self._state
+        if None in (st.TT_Ascan_win, st.WP_Ascan_win, st.PE_Ascan_win, st.Cw_mean):
+            return
+        try:
+            if _HW_AVAILABLE:
+                Cl, L = LongVelocity_Thickness(
+                    st.PE_Ascan,
+                    st.TT_Ascan_win,
+                    st.WP_Ascan_win,
+                    st.PE_Ascan_win,
+                    DEFAULT_ACQ_FS,
+                    st.Cw_mean,
+                    UseHilbEnv=True,
+                )
+            else:
+                Cl, L = 1540.0, 0.010
+
+            self._Cl = Cl
+            self._L  = L
+
+            self._lbl_res_cw.setText(f"{st.Cw_mean:.2f}")
+            self._lbl_res_t1.setText(f"{st.T1:.2f}" if st.T1 is not None else "—")
+            self._lbl_res_t2.setText(f"{st.T2:.2f}" if st.T2 is not None else "—")
+            self._lbl_res_cl.setText(f"{Cl:.2f}")
+            self._lbl_res_d.setText(f"{L * 1e3:.3f}")
+            print(f"[ecos_gui] Cl = {Cl:.2f} m/s   d = {L * 1e3:.3f} mm")
+        except Exception as e:
+            QMessageBox.critical(self, "Computation error", str(e))
+
+    # ==========================================================================
+    #  Save button state
+    # ==========================================================================
+    def _update_save_button(self):
+        st    = self._state
+        ready = (st.WP_Ascan is not None and
+                 st.PE_Ascan is not None and
+                 st.TT_Ascan is not None and
+                 st.WP_Ascan_win is not None)
+        self._btn_save.setEnabled(ready)
+
+    # ==========================================================================
+    #  Experiment name auto-generation
+    # ==========================================================================
+    def _update_exp_name(self):
+        pva   = self._txt_pva_pct.text().strip()
+        add   = self._txt_additive_pct.text().strip()
+        sid   = self._txt_sample_id.text().strip()
+        cyc   = self._txt_cycles.text().strip()
+        letra = sid[-1].upper() if sid else "X"
+        pva   = pva.zfill(2) if pva.isdigit() else "XX"
+        add   = add.zfill(2) if add.isdigit() else "YY"
+        cyc   = cyc.zfill(3) if cyc.isdigit() else "NNN"
+        ts    = time.strftime("%Y%m%d_%H%M%S")
+        self._txt_exp_name.setText(f"PVA_{pva}_PG_{add}_{letra}_C{cyc}_US_{ts}")
+
+    # ==========================================================================
+    #  [8] Compute & Save
+    # ==========================================================================
+    def _on_compute_save(self):
+        if self._Cl is None:
+            QMessageBox.warning(self, "Save", "Apply window first to compute results.")
+            return
+
+        st = self._state
+        try:
+            win_len = self._get_win_len()
+        except Exception:
+            win_len = DEFAULT_WIN_LEN
+
+        specimen = {
+            "fecha_fabricacion":   self._txt_fab_date.text(),
+            "base":                "agua",
+            "porcentaje_pva":      self._txt_pva_pct.text(),
+            "aditivo1":            self._txt_additive.text(),
+            "porcentaje_aditivo1": self._txt_additive_pct.text(),
+            "ciclos":              self._txt_cycles.text(),
+            "pieza":               self._txt_sample_id.text(),
+            "otros":               self._txt_notes.text(),
+            "dopantes":            self._txt_dopants.text(),
+        }
+        equipment1 = {
+            "nombre":          "SEDAQ",
+            "transductor_pe":  "No enfocado 10MHz",
+            "transductor_tt":  "No enfocado 10MHz",
+            "params": {
+                "Gain_Ch1":        int(float(self._txt_gain_ch1.text())),
+                "Gain_Ch2":        int(float(self._txt_gain_ch2.text())),
+                "Voltaje":         int(float(self._txt_voltage.text())),
+                "Fp":              DEFAULT_FP,
+                "F_muestreo":      DEFAULT_ACQ_FS,
+                "AvgSamplesNum":   AVG_N,
+                "RecLen":          self._reclen,
+                "Smin":            st.Smin,
+                "Smax":            st.Smax,
+                "WindowLen":       win_len,
+            },
+        }
+        equipment2 = {
+            "nombre":  "Arduino",
+            "puerto":  self._txt_arduino_port.text(),
+        }
+        protocol = {
+            "description": "Ensayo ultrasónico longitudinal ECOS",
+            "notes":       self._txt_notes.text(),
+        }
+        results = {
+            "T1":      st.T1,
+            "T2":      st.T2,
+            "Cw1":     st.Cw1,
+            "Cw2":     st.Cw2,
+            "Cw_mean": st.Cw_mean,
+            "Cl":      self._Cl,
+            "d":       self._L,
+        }
+
+        exp_name = self._txt_exp_name.text().strip()
+        if not exp_name:
+            exp_name = "ecos_" + time.strftime("%Y%m%d_%H%M%S")
+
+        try:
+            if _HW_AVAILABLE:
+                exp_dir = save_experiment_raw_32(
+                    specimen=specimen,
+                    equipment1=equipment1,
+                    equipment2=equipment2,
+                    protocol=protocol,
+                    results=results,
+                    Signal_PE=st.PE_Ascan,
+                    Signal_TT=st.TT_Ascan,
+                    Signal_Ref=st.WP_Ascan,
+                    base_dir="data_32",
+                )
+                print(f"[ecos_gui] Saved to: {exp_dir}")
+                self._lbl_save_status.setText(f"Saved: {os.path.basename(exp_dir)}")
+                QMessageBox.information(self, "Saved",
+                                        f"Experiment saved to:\n  {exp_dir}")
+            else:
+                print(f"[ecos_gui] Demo — would save as: {exp_name}")
+                self._lbl_save_status.setText(f"Demo: {exp_name}")
+        except Exception as e:
+            QMessageBox.critical(self, "Save error", str(e))
+
+    # ==========================================================================
+    #  Session collect / restore
+    # ==========================================================================
+    def _collect_session(self):
+        rmin, rmax = self._region.getRegion()
+        return {
+            "gain_ch1":              self._txt_gain_ch1.text(),
+            "gain_ch2":              self._txt_gain_ch2.text(),
+            "voltage":               self._txt_voltage.text(),
+            "reclen":                self._txt_reclen.text(),
+            "relay":                 self._btn_relay.isChecked(),
+            "region":                [rmin, rmax],
+            "excitation_index":      self._cmb_excitation.currentIndex(),
+            "gen_fs":                self._txt_gen_fs.text(),
+            "pulse_param_index":     self._cmb_pulse_param.currentIndex(),
+            "pulse_paramval":        self._txt_pulse_paramval.text(),
+            "pulse_polarity_index":  self._cmb_pulse_polarity.currentIndex(),
+            "chirp_fstart":          self._txt_chirp_fstart.text(),
+            "chirp_fend":            self._txt_chirp_fend.text(),
+            "chirp_dur":             self._txt_chirp_dur.text(),
+            "chirp_method_index":    self._cmb_chirp_method.currentIndex(),
+            "chirp_phase":           self._txt_chirp_phase.text(),
+            "chirp_polarity_index":  self._cmb_chirp_polarity.currentIndex(),
+            "burst_fo":              self._txt_burst_fo.text(),
+            "burst_cycles":          self._txt_burst_cycles.text(),
+            "burst_polarity_index":  self._cmb_burst_polarity.currentIndex(),
+            "arduino_port":          self._txt_arduino_port.text(),
+            "win_len":               self._txt_win_len.text(),
+            "sample_id":             self._txt_sample_id.text(),
+            "pva_pct":               self._txt_pva_pct.text(),
+            "additive":              self._txt_additive.text(),
+            "additive_pct":          self._txt_additive_pct.text(),
+            "cycles":                self._txt_cycles.text(),
+            "fab_date":              self._txt_fab_date.text(),
+            "dopants":               self._txt_dopants.text(),
+            "notes":                 self._txt_notes.text(),
+            "exp_name":              self._txt_exp_name.text(),
+        }
+
+    def _restore_session(self, d):
+        self._txt_gain_ch1.setText(d.get("gain_ch1", str(DEFAULT_GAIN_CH1)))
+        self._txt_gain_ch2.setText(d.get("gain_ch2", str(DEFAULT_GAIN_CH2)))
+        self._txt_voltage.setText(d.get("voltage",   str(DEFAULT_VOLTAGE)))
+        self._txt_reclen.setText(d.get("reclen",      str(DEFAULT_RECLEN)))
+        self._btn_relay.setChecked(d.get("relay", True))
+        region = d.get("region")
+        if region:
+            self._region.setRegion(region)
+        self._cmb_excitation.setCurrentIndex(d.get("excitation_index", 0))
+        self._txt_gen_fs.setText(d.get("gen_fs", str(DEFAULT_GEN_FS)))
+        self._cmb_pulse_param.setCurrentIndex(d.get("pulse_param_index", 0))
+        self._txt_pulse_paramval.setText(d.get("pulse_paramval", str(DEFAULT_FP)))
+        self._cmb_pulse_polarity.setCurrentIndex(d.get("pulse_polarity_index", 0))
+        self._txt_chirp_fstart.setText(d.get("chirp_fstart", "2e6"))
+        self._txt_chirp_fend.setText(d.get("chirp_fend",     "15e6"))
+        self._txt_chirp_dur.setText(d.get("chirp_dur",       "3e-6"))
+        self._cmb_chirp_method.setCurrentIndex(d.get("chirp_method_index", 0))
+        self._txt_chirp_phase.setText(d.get("chirp_phase",   "270"))
+        self._cmb_chirp_polarity.setCurrentIndex(d.get("chirp_polarity_index", 0))
+        self._txt_burst_fo.setText(d.get("burst_fo",         "10e6"))
+        self._txt_burst_cycles.setText(d.get("burst_cycles", "5"))
+        self._cmb_burst_polarity.setCurrentIndex(d.get("burst_polarity_index", 0))
+        self._txt_arduino_port.setText(d.get("arduino_port", DEFAULT_COM))
+        self._txt_win_len.setText(d.get("win_len",            str(DEFAULT_WIN_LEN)))
+        self._txt_sample_id.setText(d.get("sample_id",        ""))
+        self._txt_pva_pct.setText(d.get("pva_pct",            ""))
+        self._txt_additive.setText(d.get("additive",          ""))
+        self._txt_additive_pct.setText(d.get("additive_pct",  ""))
+        self._txt_cycles.setText(d.get("cycles",              ""))
+        self._txt_fab_date.setText(d.get("fab_date",          ""))
+        self._txt_dopants.setText(d.get("dopants",            ""))
+        self._txt_notes.setText(d.get("notes",                ""))
+        self._txt_exp_name.setText(d.get("exp_name",          ""))
+
+
+# ==============================================================================
+# [9] ENTRY POINT
+# ==============================================================================
+if __name__ == "__main__":
+    QApplication.setAttribute(Qt.AA_EnableHighDpiScaling, True)
+    QApplication.setAttribute(Qt.AA_UseHighDpiPixmaps, True)
+    app = QApplication(sys.argv)
+    app.setStyle("Fusion")
+    win = EcosGUI()
+    win.show()
+    sys.exit(app.exec_())
