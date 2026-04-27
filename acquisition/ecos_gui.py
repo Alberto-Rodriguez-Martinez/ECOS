@@ -641,6 +641,14 @@ class EcosGUI(QMainWindow):
         lbl_note.setStyleSheet("color: gray; font-style: italic; font-size: 10px;")
         layout.addWidget(lbl_note)
 
+        avg_row = QHBoxLayout()
+        avg_row.addWidget(QLabel("Averages (N):"))
+        self._txt_avg_n = QLineEdit(str(AVG_N))
+        self._txt_avg_n.setFixedWidth(60)
+        avg_row.addWidget(self._txt_avg_n)
+        avg_row.addStretch()
+        layout.addLayout(avg_row)
+
         self._lbl_acq_status = QLabel("Status: no signals acquired")
         layout.addWidget(self._lbl_acq_status)
         return box
@@ -1092,12 +1100,19 @@ class EcosGUI(QMainWindow):
         rmin, rmax = self._region.getRegion()
         return max(0, int(rmin)), min(self._reclen, int(rmax))
 
+    def _get_avg_n(self):
+        try:
+            return max(1, int(self._txt_avg_n.text()))
+        except ValueError:
+            return AVG_N
+
     def _acquire_ch_avg(self, channel, smin, smax):
-        """Average AVG_N A-scans from channel 1 or 2 and return the windowed slice."""
+        """Average N A-scans from channel 1 or 2 and return the windowed slice."""
+        avg_n = self._get_avg_n()
         quant = 1024
         acc   = np.zeros(self._reclen)
         n     = 0
-        while n < AVG_N:
+        while n < avg_n:
             self._sedaq.GetAScan()
             if channel == 1:
                 sig = self._raw_to_float(self._sedaq.DataADC1, self._reclen, quant)
@@ -1106,7 +1121,7 @@ class EcosGUI(QMainWindow):
             if not np.all(sig == 0.0):
                 acc += sig
                 n   += 1
-        return (acc / AVG_N)[smin:smax]
+        return (acc / avg_n)[smin:smax]
 
     # ==========================================================================
     #  Acquisition buttons
@@ -1333,7 +1348,7 @@ class EcosGUI(QMainWindow):
                 "Voltaje":         int(float(self._txt_voltage.text())),
                 "Fp":              DEFAULT_FP,
                 "F_muestreo":      DEFAULT_ACQ_FS,
-                "AvgSamplesNum":   AVG_N,
+                "AvgSamplesNum":   self._get_avg_n(),
                 "RecLen":          self._reclen,
                 "Smin":            st.Smin,
                 "Smax":            st.Smax,
@@ -1363,6 +1378,13 @@ class EcosGUI(QMainWindow):
         if not exp_name:
             exp_name = "ecos_" + time.strftime("%Y%m%d_%H%M%S")
 
+        save_dir = QFileDialog.getExistingDirectory(
+            self, "Choose save folder",
+            os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'data')
+        )
+        if not save_dir:
+            return
+
         try:
             if _HW_AVAILABLE:
                 exp_dir = save_experiment_raw_32(
@@ -1374,14 +1396,14 @@ class EcosGUI(QMainWindow):
                     Signal_PE=st.PE_Ascan,
                     Signal_TT=st.TT_Ascan,
                     Signal_Ref=st.WP_Ascan,
-                    base_dir="data_32",
+                    base_dir=save_dir,
                 )
                 print(f"[ecos_gui] Saved to: {exp_dir}")
                 self._lbl_save_status.setText(f"Saved: {os.path.basename(exp_dir)}")
                 QMessageBox.information(self, "Saved",
                                         f"Experiment saved to:\n  {exp_dir}")
             else:
-                print(f"[ecos_gui] Demo — would save as: {exp_name}")
+                print(f"[ecos_gui] Demo — would save to: {save_dir}/{exp_name}")
                 self._lbl_save_status.setText(f"Demo: {exp_name}")
         except Exception as e:
             QMessageBox.critical(self, "Save error", str(e))
@@ -1413,6 +1435,7 @@ class EcosGUI(QMainWindow):
             "burst_cycles":          self._txt_burst_cycles.text(),
             "burst_polarity_index":  self._cmb_burst_polarity.currentIndex(),
             "arduino_port":          self._txt_arduino_port.text(),
+            "avg_n":                 self._txt_avg_n.text(),
             "win_len":               self._txt_win_len.text(),
             "sample_id":             self._txt_sample_id.text(),
             "pva_pct":               self._txt_pva_pct.text(),
@@ -1449,6 +1472,7 @@ class EcosGUI(QMainWindow):
         self._txt_burst_cycles.setText(d.get("burst_cycles", "5"))
         self._cmb_burst_polarity.setCurrentIndex(d.get("burst_polarity_index", 0))
         self._txt_arduino_port.setText(d.get("arduino_port", DEFAULT_COM))
+        self._txt_avg_n.setText(d.get("avg_n",               str(AVG_N)))
         self._txt_win_len.setText(d.get("win_len",            str(DEFAULT_WIN_LEN)))
         self._txt_sample_id.setText(d.get("sample_id",        ""))
         self._txt_pva_pct.setText(d.get("pva_pct",            ""))
