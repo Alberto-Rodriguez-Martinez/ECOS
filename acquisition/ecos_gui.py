@@ -738,3 +738,500 @@ class EcosGUI(QMainWindow):
         self._lbl_save_status = QLabel("")
         layout.addWidget(self._lbl_save_status)
         return box
+
+    # ==========================================================================
+    #  [6] Unit conversion helpers
+    # ==========================================================================
+    def _samples_to_unit(self, n):
+        cw = self._state.Cw_mean or 1480.0
+        if self._unit == 'mus':
+            return np.asarray(n, dtype=float) / DEFAULT_ACQ_FS * 1e6
+        elif self._unit == 'mm':
+            return np.asarray(n, dtype=float) / DEFAULT_ACQ_FS * cw / 2.0 * 1e3
+        return np.asarray(n, dtype=float)
+
+    def _unit_to_samples(self, val):
+        cw = self._state.Cw_mean or 1480.0
+        if self._unit == 'mus':
+            return int(round(float(val) * 1e-6 * DEFAULT_ACQ_FS))
+        elif self._unit == 'mm':
+            return int(round(float(val) * 2.0 / (cw * 1e-3) * DEFAULT_ACQ_FS))
+        return int(round(float(val)))
+
+    def _unit_label(self):
+        return {'samples': 'Sample', 'mus': 'Time [µs]', 'mm': 'Distance [mm]'}[self._unit]
+
+    def _on_unit_changed(self, unit):
+        self._unit = unit
+        self._plot_zoom.setLabel('bottom', self._unit_label())
+        self._plot_ov.setLabel('bottom', self._unit_label())
+
+    # ==========================================================================
+    #  Real-time plot update
+    # ==========================================================================
+    def _update_plots(self):
+        if not self._running or self._inspection_mode:
+            return
+        try:
+            quant = 1024
+            self._sedaq.GetAScan()
+            ch1 = self._raw_to_float(self._sedaq.DataADC1, self._reclen, quant)
+            ch2 = self._raw_to_float(self._sedaq.DataADC2, self._reclen, quant)
+
+            rmin, rmax = self._region.getRegion()
+            smin = max(0, int(rmin))
+            smax = min(self._reclen, int(rmax))
+
+            x_full = self._samples_to_unit(np.arange(self._reclen))
+            x_zoom = self._samples_to_unit(np.arange(smin, smax))
+
+            if self._chk_ch1.isChecked():
+                self._curve_ov_ch1.setData(x_full, ch1)
+                if smax > smin:
+                    self._curve_zoom_ch1.setData(x_zoom, ch1[smin:smax])
+            else:
+                self._curve_ov_ch1.setData([], [])
+                self._curve_zoom_ch1.setData([], [])
+
+            if self._chk_ch2.isChecked():
+                self._curve_ov_ch2.setData(x_full, ch2)
+                if smax > smin:
+                    self._curve_zoom_ch2.setData(x_zoom, ch2[smin:smax])
+            else:
+                self._curve_ov_ch2.setData([], [])
+                self._curve_zoom_ch2.setData([], [])
+
+            if smax > smin:
+                self._plot_zoom.setXRange(
+                    self._samples_to_unit(smin),
+                    self._samples_to_unit(smax), padding=0
+                )
+        except Exception as e:
+            print(f"[_update_plots] {e}")
+
+    @staticmethod
+    def _raw_to_float(buf, reclen, quant):
+        arr = np.array(list(buf[:reclen]), dtype=float)
+        arr = (arr - quant / 2.0) / quant
+        arr -= arr.mean()
+        return arr
+
+    # ==========================================================================
+    #  Region / zoom synchronisation
+    # ==========================================================================
+    def _on_region_changed(self):
+        rmin, rmax = self._region.getRegion()
+        smin = max(0, int(rmin))
+        smax = min(self._reclen, int(rmax))
+        self._txt_smin.setText(str(smin))
+        self._txt_smax.setText(str(smax))
+        if not self._syncing:
+            self._syncing = True
+            self._plot_zoom.setXRange(
+                self._samples_to_unit(smin), self._samples_to_unit(smax), padding=0
+            )
+            self._syncing = False
+
+    def _on_zoom_xrange_changed(self, _vb, x_range):
+        if self._syncing or self._inspection_mode:
+            return
+        self._syncing = True
+        smin = max(0, self._unit_to_samples(x_range[0]))
+        smax = min(self._reclen, self._unit_to_samples(x_range[1]))
+        self._region.setRegion([smin, smax])
+        self._syncing = False
+
+    def _on_smin_smax_edited(self):
+        try:
+            smin = max(0, int(self._txt_smin.text()))
+            smax = min(self._reclen, int(self._txt_smax.text()))
+            self._region.setRegion([smin, smax])
+        except ValueError:
+            pass
+
+    def _toggle_ch1_vis(self, checked):
+        if not checked:
+            self._curve_zoom_ch1.setData([], [])
+            self._curve_ov_ch1.setData([], [])
+
+    def _toggle_ch2_vis(self, checked):
+        if not checked:
+            self._curve_zoom_ch2.setData([], [])
+            self._curve_ov_ch2.setData([], [])
+
+    # ==========================================================================
+    #  Hover cursor
+    # ==========================================================================
+    def _on_mouse_moved(self, pos):
+        vb = self._plot_zoom.getViewBox()
+        if not self._plot_zoom.sceneBoundingRect().contains(pos):
+            self._vline_cursor.setVisible(False)
+            self._cursor_label.hide()
+            return
+        mp  = vb.mapSceneToView(pos)
+        x   = mp.x()
+        self._vline_cursor.setPos(x)
+        self._vline_cursor.setVisible(True)
+
+        xs, ys = self._curve_zoom_ch2.getData()
+        if xs is None or len(xs) == 0:
+            xs, ys = self._curve_zoom_ch1.getData()
+        val = "---"
+        if xs is not None and len(xs) > 0:
+            i   = int(np.clip(np.searchsorted(xs, x), 0, len(ys) - 1))
+            val = f"{ys[i]:.4f}"
+
+        coord = {'samples': f"s = {int(x)}",
+                 'mus':     f"t = {x:.2f} µs",
+                 'mm':      f"d = {x:.2f} mm"}[self._unit]
+        self._cursor_label.setPos(x, mp.y())
+        self._cursor_label.setText(f"{coord}\nAmp: {val}")
+        self._cursor_label.show()
+
+    # ==========================================================================
+    #  RecLen change
+    # ==========================================================================
+    def _on_reclen_changed(self):
+        try:
+            reclen = int(self._txt_reclen.text())
+            if reclen <= 0:
+                raise ValueError("RecLen must be positive")
+        except ValueError as e:
+            QMessageBox.warning(self, "Input error", str(e))
+            self._txt_reclen.setText(str(self._reclen))
+            return
+        self._reclen = reclen
+        try:
+            self._sedaq.SetRecLen(reclen)
+        except Exception as e:
+            print(f"[SetRecLen] {e}")
+        self._plot_ov.setXRange(0, reclen - 1, padding=0)
+        self._plot_ov.setLimits(xMin=0, xMax=reclen - 1)
+        self._region.setBounds([0, reclen])
+        rmin, rmax = self._region.getRegion()
+        self._region.setRegion([max(0, rmin), min(reclen, rmax)])
+
+    # ==========================================================================
+    #  Relay
+    # ==========================================================================
+    def _on_relay_toggled(self, checked):
+        self._btn_relay.setText(f"RELAY: {'ON' if checked else 'OFF'}")
+        try:
+            self._sedaq.SetRelay(0 if checked else 1)
+        except Exception as e:
+            print(f"[Relay] {e}")
+
+    # ==========================================================================
+    #  Gain / voltage
+    # ==========================================================================
+    def _on_gain_changed(self):
+        try:
+            g1 = int(float(self._txt_gain_ch1.text()))
+            g2 = int(float(self._txt_gain_ch2.text()))
+            # FIRMWARE BUG: Ch1 must always be set before Ch2
+            self._sedaq.SetGain1(g1)
+            self._sedaq.SetGain2(g2)
+            self._state.Gain_Ch1 = g1
+            self._state.Gain_Ch2 = g2
+        except Exception as e:
+            print(f"[Gain] {e}")
+
+    def _on_voltage_changed(self):
+        try:
+            self._sedaq.SetExtVoltage(int(float(self._txt_voltage.text())))
+        except Exception as e:
+            print(f"[Voltage] {e}")
+
+    # ==========================================================================
+    #  Excitation / GenCode
+    # ==========================================================================
+    def _generate_upload(self):
+        if not _HW_AVAILABLE:
+            self._sedaq.UpdateGenCode([0] * 64)
+            return
+        try:
+            exc    = self._cmb_excitation.currentText()
+            gen_fs = float(self._txt_gen_fs.text())
+            params = self._collect_excitation_params()
+            if exc == "Pulse":
+                gencode = MakeGenCode(
+                    Excitation='Pulse',
+                    Param=params["param"],
+                    ParamVal=params["paramval"],
+                    SignalPolarity=params["polarity"],
+                    Fs=gen_fs,
+                )
+            elif exc == "Chirp":
+                gencode = MakeGenCode(
+                    Excitation='Chirp',
+                    ParamVal=[params["fstart"], params["fend"],
+                               params["duration"], params["method"], params["phase"]],
+                    SignalPolarity=params["polarity"],
+                    Fs=gen_fs,
+                )
+            else:
+                gencode = MakeGenCode(
+                    Excitation='Burst',
+                    ParamVal=[params["fo"], params["nocycles"]],
+                    SignalPolarity=params["polarity"],
+                    Fs=gen_fs,
+                )
+            self._sedaq.UpdateGenCode(gencode)
+            QMessageBox.information(self, "GenCode", "Waveform generated and uploaded.")
+        except Exception as e:
+            QMessageBox.critical(self, "GenCode error", str(e))
+
+    def _collect_excitation_params(self):
+        exc = self._cmb_excitation.currentText()
+
+        def _pol(cmb):
+            return int(cmb.currentText().split()[0])
+
+        if exc == "Pulse":
+            return {
+                "param":    self._cmb_pulse_param.currentText(),
+                "paramval": float(self._txt_pulse_paramval.text()),
+                "polarity": _pol(self._cmb_pulse_polarity),
+            }
+        elif exc == "Chirp":
+            return {
+                "fstart":   float(self._txt_chirp_fstart.text()),
+                "fend":     float(self._txt_chirp_fend.text()),
+                "duration": float(self._txt_chirp_dur.text()),
+                "method":   self._cmb_chirp_method.currentText(),
+                "phase":    float(self._txt_chirp_phase.text()),
+                "polarity": _pol(self._cmb_chirp_polarity),
+            }
+        else:
+            return {
+                "fo":       float(self._txt_burst_fo.text()),
+                "nocycles": int(self._txt_burst_cycles.text()),
+                "polarity": _pol(self._cmb_burst_polarity),
+            }
+
+    # ==========================================================================
+    #  Temperature
+    # ==========================================================================
+    def _on_read_arduino(self):
+        self._read_temperature()
+
+    def _read_temperature(self):
+        """Read temperature from Arduino. On failure, shows manual-entry dialog."""
+        if not _HW_AVAILABLE:
+            T = 20.0
+            cw = self._approx_cw(T)
+            self._state.T1 = self._state.T2 = T
+            self._state.Cw1 = self._state.Cw2 = self._state.Cw_mean = cw
+            self._update_temp_label()
+            return True
+
+        port = self._txt_arduino_port.text().strip()
+        try:
+            arduino = Arduino(port=port, baudrate=115200, N_avg=3)
+            T1, T2  = arduino.getTemperatures()
+            arduino.close()
+            if T1 is None and T2 is None:
+                raise ValueError("No temperature data received from Arduino")
+            T1 = T1 if T1 is not None else T2
+            T2 = T2 if T2 is not None else T1
+            Cw1 = water_temp2sos(T1)
+            Cw2 = water_temp2sos(T2)
+            self._state.T1, self._state.T2   = T1, T2
+            self._state.Cw1, self._state.Cw2 = Cw1, Cw2
+            self._state.Cw_mean = (Cw1 + Cw2) / 2.0
+            self._update_temp_label()
+            return True
+        except Exception as e:
+            print(f"[Arduino] {e}")
+            return self._ask_manual_temperature()
+
+    def _ask_manual_temperature(self):
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Temperature — Manual Entry")
+        layout = QVBoxLayout(dlg)
+        layout.addWidget(QLabel(
+            "Arduino did not respond (serial error or timeout).\n"
+            "Enter water temperature manually [°C]:"
+        ))
+        txt = QLineEdit("20.0")
+        layout.addWidget(txt)
+        btns = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        btns.accepted.connect(dlg.accept)
+        btns.rejected.connect(dlg.reject)
+        layout.addWidget(btns)
+        if dlg.exec_() != QDialog.Accepted:
+            return False
+        try:
+            T = float(txt.text())
+        except ValueError:
+            T = 20.0
+        cw = self._approx_cw(T)
+        self._state.T1 = self._state.T2 = T
+        self._state.Cw1 = self._state.Cw2 = self._state.Cw_mean = cw
+        self._lbl_temp.setText(f"Manual: T = {T:.1f} °C   Cw = {cw:.1f} m/s")
+        return True
+
+    def _update_temp_label(self):
+        s = self._state
+        if s.T1 is None:
+            self._lbl_temp.setText("T1: — °C   T2: — °C   Cw1: — m/s   Cw2: — m/s")
+        else:
+            self._lbl_temp.setText(
+                f"T1: {s.T1:.2f} °C   T2: {s.T2:.2f} °C   "
+                f"Cw1: {s.Cw1:.1f} m/s   Cw2: {s.Cw2:.1f} m/s"
+            )
+
+    @staticmethod
+    def _approx_cw(T):
+        return 1402.7 + 4.88 * T - 0.0482 * T ** 2
+
+    # ==========================================================================
+    #  Averaged acquisition helpers
+    # ==========================================================================
+    def _get_smin_smax(self):
+        rmin, rmax = self._region.getRegion()
+        return max(0, int(rmin)), min(self._reclen, int(rmax))
+
+    def _acquire_ch_avg(self, channel, smin, smax):
+        """Average AVG_N A-scans from channel 1 or 2 and return the windowed slice."""
+        quant = 1024
+        acc   = np.zeros(self._reclen)
+        n     = 0
+        while n < AVG_N:
+            self._sedaq.GetAScan()
+            if channel == 1:
+                sig = self._raw_to_float(self._sedaq.DataADC1, self._reclen, quant)
+            else:
+                sig = self._raw_to_float(self._sedaq.DataADC2, self._reclen, quant)
+            if not np.all(sig == 0.0):
+                acc += sig
+                n   += 1
+        return (acc / AVG_N)[smin:smax]
+
+    # ==========================================================================
+    #  Acquisition buttons
+    # ==========================================================================
+    def _on_acquire_pett(self):
+        self._timer.stop()
+        try:
+            if not self._read_temperature():
+                return
+            smin, smax = self._get_smin_smax()
+            self._state.PE_Ascan = self._acquire_ch_avg(2, smin, smax)
+            self._state.TT_Ascan = self._acquire_ch_avg(1, smin, smax)
+            self._state.Smin, self._state.Smax = smin, smax
+            self._lbl_acq_status.setText("s_PE + s_TT acquired ✓")
+            self._update_save_button()
+        except Exception as e:
+            QMessageBox.critical(self, "Acquisition error", str(e))
+        finally:
+            self._timer.start(REALTIME_INTERVAL)
+
+    def _on_acquire_wp(self):
+        self._timer.stop()
+        try:
+            if not self._read_temperature():
+                return
+            smin, smax = self._get_smin_smax()
+            self._state.WP_Ascan = self._acquire_ch_avg(1, smin, smax)
+            self._state.Smin, self._state.Smax = smin, smax
+            self._lbl_acq_status.setText("s_W acquired ✓")
+            self._update_save_button()
+        except Exception as e:
+            QMessageBox.critical(self, "Acquisition error", str(e))
+        finally:
+            self._timer.start(REALTIME_INTERVAL)
+
+    # ==========================================================================
+    #  Windowing
+    # ==========================================================================
+    def _get_win_len(self):
+        try:
+            return max(1, int(self._txt_win_len.text()))
+        except ValueError:
+            return DEFAULT_WIN_LEN
+
+    def _make_window(self, sig, win_len):
+        """Return a Tukey window centered on the envelope peak of sig."""
+        if _HW_AVAILABLE:
+            env   = Envelope(sig)
+            peak  = int(np.argmax(env))
+            delay = peak - win_len // 2
+            win   = MakeWindow('Tukey', WinLen=win_len, param1=0.2, param2=1,
+                                Span=len(sig), Delay=delay)
+        else:
+            n     = len(sig)
+            peak  = n // 2
+            delay = peak - win_len // 2
+            win   = np.zeros(n)
+            start, end = max(0, delay), min(n, delay + win_len)
+            win[start:end] = 1.0
+        return win
+
+    def _on_preview_window(self):
+        st = self._state
+        if None in (st.WP_Ascan, st.TT_Ascan, st.PE_Ascan):
+            QMessageBox.warning(self, "Preview window",
+                                "Acquire WP, PE, and TT signals first.")
+            return
+
+        self._timer.stop()
+        self._inspection_mode = True
+        self._plot_zoom.setTitle("Inspection mode — windowing preview  (not live)")
+
+        win_len = self._get_win_len()
+        n_samp  = len(st.TT_Ascan)
+        x       = np.arange(n_samp, dtype=float)
+
+        # Hide live curves
+        self._curve_zoom_ch1.setData([], [])
+        self._curve_zoom_ch2.setData([], [])
+
+        # Show normalised WP, TT, PE
+        for sig, curve in (
+            (st.WP_Ascan, self._curve_insp_wp),
+            (st.TT_Ascan, self._curve_insp_tt),
+            (st.PE_Ascan, self._curve_insp_pe),
+        ):
+            norm = sig / (np.max(np.abs(sig)) + 1e-12)
+            curve.setData(x, norm)
+            curve.show()
+
+        # Window overlay on TT (reference channel)
+        win      = self._make_window(st.TT_Ascan, win_len)
+        win_norm = win / (np.max(win) + 1e-12)
+        self._curve_insp_win.setData(x, win_norm)
+        self._curve_insp_win.show()
+
+        self._plot_zoom.setXRange(0, n_samp - 1, padding=0.02)
+
+    def _on_apply_window(self):
+        st = self._state
+        if None in (st.WP_Ascan, st.TT_Ascan, st.PE_Ascan):
+            QMessageBox.warning(self, "Apply window",
+                                "Acquire WP, PE, and TT signals first.")
+            return
+
+        win_len = self._get_win_len()
+        for attr_raw, attr_win in (
+            ('TT_Ascan', 'TT_Ascan_win'),
+            ('PE_Ascan', 'PE_Ascan_win'),
+            ('WP_Ascan', 'WP_Ascan_win'),
+        ):
+            sig = getattr(st, attr_raw)
+            win = self._make_window(sig, win_len)
+            setattr(st, attr_win, sig * win)
+
+        print(f"[ecos_gui] Window applied — length: {win_len} samples.")
+        self._compute_results()
+        self._update_save_button()
+
+    def _on_back_to_live(self):
+        self._inspection_mode = False
+        self._plot_zoom.setTitle("Live A-scan — zoom region")
+        for c in (self._curve_insp_wp, self._curve_insp_tt,
+                  self._curve_insp_pe, self._curve_insp_win):
+            c.setData([], [])
+            c.hide()
+        if not self._timer.isActive():
+            self._timer.start(REALTIME_INTERVAL)
