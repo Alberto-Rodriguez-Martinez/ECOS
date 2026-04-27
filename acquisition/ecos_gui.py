@@ -660,13 +660,10 @@ class EcosGUI(QMainWindow):
         btn_row = QHBoxLayout()
         self._btn_preview = QPushButton("Preview window")
         self._btn_apply   = QPushButton("Apply window")
-        self._btn_live    = QPushButton("Back to live")
         self._btn_preview.clicked.connect(self._on_preview_window)
         self._btn_apply.clicked.connect(self._on_apply_window)
-        self._btn_live.clicked.connect(self._on_back_to_live)
         btn_row.addWidget(self._btn_preview)
         btn_row.addWidget(self._btn_apply)
-        btn_row.addWidget(self._btn_live)
         layout.addLayout(btn_row)
         return box
 
@@ -1272,7 +1269,6 @@ class EcosGUI(QMainWindow):
             self._lbl_res_t2.setText(f"{st.T2:.2f}" if st.T2 is not None else "—")
             self._lbl_res_cl.setText(f"{Cl:.2f}")
             self._lbl_res_d.setText(f"{L * 1e3:.3f}")
-            print(f"[ecos_gui] Cl = {Cl:.2f} m/s   d = {L * 1e3:.3f} mm")
         except Exception as e:
             QMessageBox.critical(self, "Computation error", str(e))
 
@@ -1341,6 +1337,7 @@ class EcosGUI(QMainWindow):
                 "RecLen":          self._reclen,
                 "Smin":            st.Smin,
                 "Smax":            st.Smax,
+                "Slen":            st.Smax - st.Smin,
                 "WindowLen":       win_len,
             },
         }
