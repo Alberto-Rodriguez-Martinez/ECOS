@@ -1,16 +1,17 @@
 {
-  "gain_ch2": "40",
-  "voltage": "80",
+  "gain_ch1": "67",
+  "gain_ch2": "35",
+  "voltage": "50",
   "reclen": "16384",
-  "relay": false,
+  "relay": true,
   "region": [
-    2875.5052702666117,
-    5417.28598566319
+    4463,
+    8559
   ],
   "excitation_index": 0,
   "gen_fs": "200e6",
   "pulse_param_index": 0,
-  "pulse_paramval": "10e6",
+  "pulse_paramval": "5e6",
   "pulse_polarity_index": 0,
   "chirp_fstart": "2e6",
   "chirp_fend": "15e6",
@@ -22,9 +23,15 @@
   "burst_cycles": "5",
   "burst_polarity_index": 0,
   "arduino_port": "COM3",
-  "temp_manual": "23.17",
-  "r_vessel": "9.43",
-  "vcal": "25",
-  "ncal": "100",
-  "n_avg": "20"
+  "avg_n": "20",
+  "win_len": "300",
+  "sample_id": "A",
+  "pva_pct": "10",
+  "additive": "PG",
+  "additive_pct": "10",
+  "cycles": "3",
+  "fab_date": "09/06/2026",
+  "dopants": "none",
+  "notes": "none",
+  "exp_name": "PVA_10_PG_10_A_C003_US_20260427_160934"
 }

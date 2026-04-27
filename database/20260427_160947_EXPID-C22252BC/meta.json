@@ -1,0 +1,49 @@
+{
+  "schema_version": "raw-32-1.0",
+  "experiment": {
+    "id": "EXPID-C22252BC",
+    "timestamp_start": "2026-04-27T16:09:47.983974",
+    "timestamp_end": "2026-04-27T16:09:47.983974",
+    "operator": "Sebas"
+  },
+  "specimen": {
+    "fecha_fabricacion": "09/06/2026",
+    "base": "agua",
+    "porcentaje_pva": "10",
+    "aditivo1": "PG",
+    "porcentaje_aditivo1": "10",
+    "ciclos": "3",
+    "pieza": "A",
+    "otros": "none",
+    "dopantes": "none"
+  },
+  "protocol": {
+    "description": "Ensayo ultrasónico longitudinal ECOS",
+    "notes": "none"
+  },
+  "equipment": {
+    "device_1_ultrasound": {
+      "nombre": "SEDAQ",
+      "transductor_pe": "No enfocado 10MHz",
+      "transductor_tt": "No enfocado 10MHz",
+      "params": {
+        "Gain_Ch1": 67,
+        "Gain_Ch2": 35,
+        "Voltaje": 50,
+        "Fp": 5000000.0,
+        "F_muestreo": 100000000.0,
+        "AvgSamplesNum": 20,
+        "RecLen": 16384,
+        "Smin": 4463,
+        "Smax": 8559,
+        "Slen": 4096,
+        "WindowLen": 300
+      }
+    },
+    "device_2_aux": {
+      "nombre": "Arduino",
+      "puerto": "COM3"
+    }
+  },
+  "notes": ""
+}

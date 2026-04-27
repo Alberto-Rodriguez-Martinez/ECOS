@@ -79,7 +79,7 @@ from BD_Experimentos_PVA import (
 
 # --- Hardware paths ---
 RUTA_DLL = r"D:\ECOS\tools\SeDaqDLL.dll"
-ARDUINO_PORT   = 'COM4'
+ARDUINO_PORT   = 'COM3'
 ARDUINO_BAUD   = 115200
 
 # --- Signal generation ---
