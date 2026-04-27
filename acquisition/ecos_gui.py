@@ -59,6 +59,9 @@ sys.path.insert(0, _TOOLS_DIR)
 sys.path.insert(0, _HW_DIR)
 sys.path.insert(0, _DB_DIR)
 
+import warnings
+warnings.filterwarnings("ignore", category=RuntimeWarning)
+
 # ==============================================================================
 # [2] CONFIG
 # ==============================================================================
@@ -1170,44 +1173,47 @@ class EcosGUI(QMainWindow):
 
     def _on_preview_window(self):
         st = self._state
-        if None in (st.WP_Ascan, st.TT_Ascan, st.PE_Ascan):
+        if any(x is None for x in (st.WP_Ascan, st.TT_Ascan, st.PE_Ascan)):
             QMessageBox.warning(self, "Preview window",
                                 "Acquire WP, PE, and TT signals first.")
             return
 
-        self._timer.stop()
-        self._inspection_mode = True
-        self._plot_zoom.setTitle("Inspection mode — windowing preview  (not live)")
+        import matplotlib.pyplot as plt
 
         win_len = self._get_win_len()
-        n_samp  = len(st.TT_Ascan)
-        x       = np.arange(n_samp, dtype=float)
+        self._timer.stop()
+        try:
+            fig, axes = plt.subplots(3, 1, figsize=(10, 7), sharex=False)
+            fig.suptitle("Windowing preview — close to continue", fontsize=11)
 
-        # Hide live curves
-        self._curve_zoom_ch1.setData([], [])
-        self._curve_zoom_ch2.setData([], [])
+            for ax, sig, label in zip(
+                axes,
+                [st.WP_Ascan, st.TT_Ascan, st.PE_Ascan],
+                ["s_W  (WaterPath, Ch1)",
+                 "s_TT  (Through-transmission, Ch1)",
+                 "s_PE  (Pulse-echo, Ch2)"],
+            ):
+                win   = self._make_window(sig, win_len)
+                t     = np.arange(len(sig))
+                norm  = np.max(np.abs(sig)) or 1.0
+                ax.plot(t, sig / norm, label="Signal (normalised)",
+                        color='steelblue', lw=1)
+                ax.plot(t, win / (np.max(win) or 1.0), label="Tukey window",
+                        color='orange', lw=1.5, linestyle='--')
+                ax.set_title(label, fontsize=9)
+                ax.legend(fontsize=8)
+                ax.set_xlabel("Samples")
+                ax.set_ylabel("Amplitude")
+                ax.grid(True, alpha=0.3)
 
-        # Show normalised WP, TT, PE
-        for sig, curve in (
-            (st.WP_Ascan, self._curve_insp_wp),
-            (st.TT_Ascan, self._curve_insp_tt),
-            (st.PE_Ascan, self._curve_insp_pe),
-        ):
-            norm = sig / (np.max(np.abs(sig)) + 1e-12)
-            curve.setData(x, norm)
-            curve.show()
-
-        # Window overlay on TT (reference channel)
-        win      = self._make_window(st.TT_Ascan, win_len)
-        win_norm = win / (np.max(win) + 1e-12)
-        self._curve_insp_win.setData(x, win_norm)
-        self._curve_insp_win.show()
-
-        self._plot_zoom.setXRange(0, n_samp - 1, padding=0.02)
+            plt.tight_layout()
+            plt.show(block=True)
+        finally:
+            self._timer.start(REALTIME_INTERVAL)
 
     def _on_apply_window(self):
         st = self._state
-        if None in (st.WP_Ascan, st.TT_Ascan, st.PE_Ascan):
+        if any(x is None for x in (st.WP_Ascan, st.TT_Ascan, st.PE_Ascan)):
             QMessageBox.warning(self, "Apply window",
                                 "Acquire WP, PE, and TT signals first.")
             return
@@ -1241,7 +1247,8 @@ class EcosGUI(QMainWindow):
     # ==========================================================================
     def _compute_results(self):
         st = self._state
-        if None in (st.TT_Ascan_win, st.WP_Ascan_win, st.PE_Ascan_win, st.Cw_mean):
+        if any(x is None for x in (st.TT_Ascan_win, st.WP_Ascan_win,
+                                       st.PE_Ascan_win, st.Cw_mean)):
             return
         try:
             if _HW_AVAILABLE:
