@@ -108,6 +108,8 @@ BITS_OPTIONS = {
     "12 bit": 4096,
 }
 
+DATA_DIR = r"D:\ECOS\data"
+
 SESSION_FILE = os.path.join(
     os.path.dirname(os.path.abspath(__file__)), 'ecos_gui_session.json'
 )
@@ -1377,9 +1379,9 @@ class EcosGUI(QMainWindow):
         if not exp_name:
             exp_name = "ecos_" + time.strftime("%Y%m%d_%H%M%S")
 
+        _start = DATA_DIR if os.path.isdir(DATA_DIR) else os.path.expanduser("~")
         save_dir = QFileDialog.getExistingDirectory(
-            self, "Choose save folder",
-            os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'data')
+            self, "Choose save folder", _start
         )
         if not save_dir:
             return
