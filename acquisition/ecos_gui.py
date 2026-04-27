@@ -1240,7 +1240,6 @@ class EcosGUI(QMainWindow):
             win = self._make_window(sig, win_len)
             setattr(st, attr_win, sig * win)
 
-        print(f"[ecos_gui] Window applied — length: {win_len} samples.")
         self._compute_results()
         self._update_save_button()
 
@@ -1398,12 +1397,10 @@ class EcosGUI(QMainWindow):
                     Signal_Ref=st.WP_Ascan,
                     base_dir=save_dir,
                 )
-                print(f"[ecos_gui] Saved to: {exp_dir}")
                 self._lbl_save_status.setText(f"Saved: {os.path.basename(exp_dir)}")
                 QMessageBox.information(self, "Saved",
                                         f"Experiment saved to:\n  {exp_dir}")
             else:
-                print(f"[ecos_gui] Demo — would save to: {save_dir}/{exp_name}")
                 self._lbl_save_status.setText(f"Demo: {exp_name}")
         except Exception as e:
             QMessageBox.critical(self, "Save error", str(e))
