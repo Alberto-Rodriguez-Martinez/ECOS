@@ -30,7 +30,8 @@ def save_experiment_raw_32(
     Signal_PE,       # np.ndarray (longitud Slen)
     Signal_TT,       # np.ndarray (longitud Slen)
     Signal_Ref,      # np.ndarray (longitud Slen)
-    base_dir="data_32"
+    base_dir="data_32",
+    exp_name=None    # si se proporciona, el directorio del experimento será base_dir/exp_name
 ):
     # Validaciones mínimas
     params = equipment1.get("params", {})
@@ -43,7 +44,7 @@ def save_experiment_raw_32(
 
     exp_id = "EXPID-" + uuid.uuid4().hex[:8].upper()
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    d = Path(base_dir) / f"{ts}_{exp_id}"
+    d = Path(base_dir) / exp_name if exp_name else Path(base_dir) / f"{ts}_{exp_id}"
     (d / "signals").mkdir(parents=True, exist_ok=True)
 
     meta = {

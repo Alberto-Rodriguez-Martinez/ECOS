@@ -621,9 +621,8 @@ class DensityGUI(QMainWindow):
         self._txt_notes        = QLineEdit("")
 
         for w in (self._txt_sample_id, self._txt_pva_pct,
-                  self._txt_additive, self._txt_additive_pct,
-                  self._txt_cycles):
-            w.editingFinished.connect(self._refresh_filename)
+                  self._txt_additive_pct, self._txt_cycles):
+            w.textChanged.connect(self._refresh_filename)
 
         form.addRow("Sample ID:",              self._txt_sample_id)
         form.addRow("PVA [%]:",               self._txt_pva_pct)
@@ -638,28 +637,26 @@ class DensityGUI(QMainWindow):
         self._txt_save_filename = QLineEdit("")
         btn_refresh = QPushButton("\u21ba")
         btn_refresh.setFixedWidth(28)
-        btn_refresh.setToolTip("Regenerate filename from fields")
+        btn_refresh.setToolTip("Regenerate experiment name from fields")
         btn_refresh.clicked.connect(self._refresh_filename)
         fname_row.addWidget(self._txt_save_filename)
         fname_row.addWidget(btn_refresh)
-        form.addRow("Filename:", fname_row)
+        form.addRow("Experiment name:", fname_row)
 
         self._refresh_filename()
         return box
 
     def _refresh_filename(self):
-        pva     = self._txt_pva_pct.text().strip()      or "XX"
-        add     = self._txt_additive.text().strip()     or "ADD"
-        add_pct = self._txt_additive_pct.text().strip() or "YY"
-        letra   = self._txt_sample_id.text().strip()    or "X"
-        try:
-            cyc = f"{int(self._txt_cycles.text().strip()):03d}"
-        except (ValueError, AttributeError):
-            cyc = "NNN"
-        ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        self._txt_save_filename.setText(
-            f"PVA_{pva}_{add}_{add_pct}_{letra}_C{cyc}_DENS_{ts}"
-        )
+        pva   = self._txt_pva_pct.text().strip()
+        add   = self._txt_additive_pct.text().strip()
+        sid   = self._txt_sample_id.text().strip()
+        cyc   = self._txt_cycles.text().strip()
+        letra = sid[-1].upper() if sid else "X"
+        pva   = pva.zfill(2) if pva.isdigit() else "XX"
+        add   = add.zfill(2) if add.isdigit() else "YY"
+        cyc   = cyc.zfill(3) if cyc.isdigit() else "NNN"
+        ts    = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        self._txt_save_filename.setText(f"PVA_{pva}_PG_{add}_{letra}_C{cyc}_DENS_{ts}")
 
     # =======================================================================
     #  Block 6 — Acquisition
@@ -1071,9 +1068,11 @@ class DensityGUI(QMainWindow):
         if not save_dir:
             return
 
-        base_name = self._txt_save_filename.text().strip() \
+        from pathlib import Path
+        exp_name = self._txt_save_filename.text().strip() \
             or f"density_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}"
-        base = os.path.join(save_dir, base_name)
+        exp_dir = Path(save_dir) / exp_name
+        exp_dir.mkdir(parents=True, exist_ok=True)
 
         result = {
             "datetime":      datetime.datetime.now().isoformat(),
@@ -1096,13 +1095,13 @@ class DensityGUI(QMainWindow):
             "reclen":        self._reclen,
             "avg_n":         int(self._txt_n_avg.text()),
         }
-        with open(base + ".json", "w") as f:
+        with open(str(exp_dir / "density.json"), "w") as f:
             json.dump(result, f, indent=2)
         if self._sW1 is not None:
-            np.save(base + "_sW1.npy", self._sW1)
+            np.save(str(exp_dir / "sW1.npy"), self._sW1)
         if self._sW2 is not None:
-            np.save(base + "_sW2.npy", self._sW2)
-        QMessageBox.information(self, "Saved", f"Results saved to:\n  {base}.json")
+            np.save(str(exp_dir / "sW2.npy"), self._sW2)
+        QMessageBox.information(self, "Saved", f"Results saved to:\n  {exp_dir}")
 
     # =======================================================================
     #  Calibration workflow

@@ -1398,6 +1398,7 @@ class EcosGUI(QMainWindow):
                     Signal_TT=st.TT_Ascan,
                     Signal_Ref=st.WP_Ascan,
                     base_dir=save_dir,
+                    exp_name=self._txt_exp_name.text().strip() or None,
                 )
                 self._lbl_save_status.setText(f"Saved: {os.path.basename(exp_dir)}")
                 QMessageBox.information(self, "Saved",
