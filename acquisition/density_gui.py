@@ -48,7 +48,7 @@ from PyQt5.QtWidgets import (
     QGroupBox, QLabel, QLineEdit, QComboBox,
     QCheckBox, QPushButton,
     QStackedWidget, QMessageBox,
-    QSplitter, QScrollArea,
+    QSplitter, QScrollArea, QFileDialog,
 )
 from PyQt5.QtCore import QTimer, Qt
 
@@ -95,6 +95,9 @@ DEFAULT_GEN_FS    = 200e6
 DEFAULT_ACQ_FS    = 100e6
 REALTIME_INTERVAL = 100      # ms
 AVG_N             = 20       # A-scans averaged per acquisition
+
+_DB_DIR      = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'database')
+DATA_DIR     = r"D:\ECOS\data"
 
 SESSION_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'density_gui_session.json')
 
@@ -260,9 +263,19 @@ class DensityGUI(QMainWindow):
             "arduino_port":        self._txt_arduino_port.text(),
             "temp_manual":         self._txt_temp_manual.text(),
             "r_vessel":            self._txt_r_vessel.text(),
+            "mass":                self._txt_mass.text(),
             "vcal":                self._txt_vcal.text(),
             "ncal":                self._txt_ncal.text(),
             "n_avg":               self._txt_n_avg.text(),
+            "sample_id":           self._txt_sample_id.text(),
+            "pva_pct":             self._txt_pva_pct.text(),
+            "additive":            self._txt_additive.text(),
+            "additive_pct":        self._txt_additive_pct.text(),
+            "cycles":              self._txt_cycles.text(),
+            "fab_date":            self._txt_fab_date.text(),
+            "dopants":             self._txt_dopants.text(),
+            "notes":               self._txt_notes.text(),
+            "save_filename":       self._txt_save_filename.text(),
         }
 
     def _restore_session(self, d):
@@ -290,9 +303,20 @@ class DensityGUI(QMainWindow):
         self._txt_arduino_port.setText(d.get("arduino_port", "COM4"))
         self._txt_temp_manual.setText(d.get("temp_manual", "20.0"))
         self._txt_r_vessel.setText(d.get("r_vessel", ""))
+        self._txt_mass.setText(d.get("mass", ""))
         self._txt_vcal.setText(d.get("vcal", ""))
         self._txt_ncal.setText(d.get("ncal", "3"))
         self._txt_n_avg.setText(d.get("n_avg", str(AVG_N)))
+        self._txt_sample_id.setText(d.get("sample_id", ""))
+        self._txt_pva_pct.setText(d.get("pva_pct", ""))
+        self._txt_additive.setText(d.get("additive", "PG"))
+        self._txt_additive_pct.setText(d.get("additive_pct", ""))
+        self._txt_cycles.setText(d.get("cycles", ""))
+        self._txt_fab_date.setText(d.get("fab_date", ""))
+        self._txt_dopants.setText(d.get("dopants", ""))
+        self._txt_notes.setText(d.get("notes", ""))
+        if d.get("save_filename"):
+            self._txt_save_filename.setText(d["save_filename"])
 
     # =======================================================================
     #  Window close
@@ -408,6 +432,7 @@ class DensityGUI(QMainWindow):
         layout.addWidget(self._build_block_temperature())
         layout.addWidget(self._build_block_calibration())
         layout.addWidget(self._build_block_vessel())
+        layout.addWidget(self._build_block_sample_descriptor())
         layout.addWidget(self._build_block_acquisition())
         layout.addWidget(self._build_block_results())
         layout.addStretch()
@@ -572,17 +597,72 @@ class DensityGUI(QMainWindow):
         box = QGroupBox("Vessel & Sample")
         form = QFormLayout(box)
 
-        self._txt_r_vessel    = QLineEdit("")
-        self._txt_mass        = QLineEdit("")
-        self._txt_specimen    = QLineEdit("")
+        self._txt_r_vessel = QLineEdit("")
+        self._txt_mass     = QLineEdit("")
 
-        form.addRow("r_vessel (cm):",  self._txt_r_vessel)
-        form.addRow("Mass (g):",       self._txt_mass)
-        form.addRow("Specimen name:",  self._txt_specimen)
+        form.addRow("r_vessel (cm):", self._txt_r_vessel)
+        form.addRow("Mass (g):",      self._txt_mass)
         return box
 
     # =======================================================================
-    #  Block 5 — Acquisition
+    #  Block 5 — Sample Descriptor
+    # =======================================================================
+    def _build_block_sample_descriptor(self):
+        box = QGroupBox("Sample Descriptor")
+        form = QFormLayout(box)
+
+        self._txt_sample_id    = QLineEdit("")
+        self._txt_pva_pct      = QLineEdit("")
+        self._txt_additive     = QLineEdit("PG")
+        self._txt_additive_pct = QLineEdit("")
+        self._txt_cycles       = QLineEdit("")
+        self._txt_fab_date     = QLineEdit("")
+        self._txt_dopants      = QLineEdit("")
+        self._txt_notes        = QLineEdit("")
+
+        for w in (self._txt_sample_id, self._txt_pva_pct,
+                  self._txt_additive, self._txt_additive_pct,
+                  self._txt_cycles):
+            w.editingFinished.connect(self._refresh_filename)
+
+        form.addRow("Sample ID:",              self._txt_sample_id)
+        form.addRow("PVA [%]:",               self._txt_pva_pct)
+        form.addRow("Additive:",              self._txt_additive)
+        form.addRow("Additive [%]:",          self._txt_additive_pct)
+        form.addRow("Cycles:",                self._txt_cycles)
+        form.addRow("Fab. date (DD/MM/YYYY):", self._txt_fab_date)
+        form.addRow("Dopants:",               self._txt_dopants)
+        form.addRow("Notes:",                 self._txt_notes)
+
+        fname_row = QHBoxLayout()
+        self._txt_save_filename = QLineEdit("")
+        btn_refresh = QPushButton("\u21ba")
+        btn_refresh.setFixedWidth(28)
+        btn_refresh.setToolTip("Regenerate filename from fields")
+        btn_refresh.clicked.connect(self._refresh_filename)
+        fname_row.addWidget(self._txt_save_filename)
+        fname_row.addWidget(btn_refresh)
+        form.addRow("Filename:", fname_row)
+
+        self._refresh_filename()
+        return box
+
+    def _refresh_filename(self):
+        pva     = self._txt_pva_pct.text().strip()      or "XX"
+        add     = self._txt_additive.text().strip()     or "ADD"
+        add_pct = self._txt_additive_pct.text().strip() or "YY"
+        letra   = self._txt_sample_id.text().strip()    or "X"
+        try:
+            cyc = f"{int(self._txt_cycles.text().strip()):03d}"
+        except (ValueError, AttributeError):
+            cyc = "NNN"
+        ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        self._txt_save_filename.setText(
+            f"PVA_{pva}_{add}_{add_pct}_{letra}_C{cyc}_DENS_{ts}"
+        )
+
+    # =======================================================================
+    #  Block 6 — Acquisition
     # =======================================================================
     def _build_block_acquisition(self):
         box = QGroupBox("Acquisition")
@@ -615,7 +695,7 @@ class DensityGUI(QMainWindow):
         return box
 
     # =======================================================================
-    #  Block 6 — Results
+    #  Block 7 — Results
     # =======================================================================
     def _build_block_results(self):
         box = QGroupBox("Results")
@@ -983,25 +1063,38 @@ class DensityGUI(QMainWindow):
             return 1.5e-6   # demo: 1.5 µs
 
     def _save_results(self, delta_tof, delta_h, v_disp, density):
-        data_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'data')
-        os.makedirs(data_dir, exist_ok=True)
-        ts   = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        name = self._txt_specimen.text().strip() or "specimen"
-        base = os.path.join(data_dir, f"density_{name}_{ts}")
+        self._refresh_filename()
+
+        _start = DATA_DIR if os.path.isdir(DATA_DIR) \
+            else (_DB_DIR if os.path.isdir(_DB_DIR) else os.path.expanduser("~"))
+        save_dir = QFileDialog.getExistingDirectory(self, "Choose save folder", _start)
+        if not save_dir:
+            return
+
+        base_name = self._txt_save_filename.text().strip() \
+            or f"density_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        base = os.path.join(save_dir, base_name)
 
         result = {
-            "datetime":    datetime.datetime.now().isoformat(),
-            "specimen":    name,
-            "T_C":         self._T,
-            "cw_ms":       self._cw,
-            "r_vessel_cm": self._txt_r_vessel.text(),
-            "mass_g":      self._txt_mass.text(),
-            "delta_tof_s": delta_tof,
-            "delta_h_cm":  delta_h,
-            "V_disp_cm3":  v_disp,
-            "density_gcm3": density,
-            "reclen":      self._reclen,
-            "avg_n":       AVG_N,
+            "datetime":      datetime.datetime.now().isoformat(),
+            "sample_id":     self._txt_sample_id.text().strip(),
+            "pva_pct":       self._txt_pva_pct.text().strip(),
+            "additive":      self._txt_additive.text().strip(),
+            "additive_pct":  self._txt_additive_pct.text().strip(),
+            "cycles":        self._txt_cycles.text().strip(),
+            "fab_date":      self._txt_fab_date.text().strip(),
+            "dopants":       self._txt_dopants.text().strip(),
+            "notes":         self._txt_notes.text().strip(),
+            "T_C":           self._T,
+            "cw_ms":         self._cw,
+            "r_vessel_cm":   self._txt_r_vessel.text(),
+            "mass_g":        self._txt_mass.text(),
+            "delta_tof_s":   delta_tof,
+            "delta_h_cm":    delta_h,
+            "V_disp_cm3":    v_disp,
+            "density_gcm3":  density,
+            "reclen":        self._reclen,
+            "avg_n":         int(self._txt_n_avg.text()),
         }
         with open(base + ".json", "w") as f:
             json.dump(result, f, indent=2)
