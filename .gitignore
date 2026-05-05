@@ -39,3 +39,5 @@ tools/RegRd.txt
 # Datos experimentales (database)
 database/PVA_*
 database/*_EXPID-*
+
+analysis/catalog.csv
