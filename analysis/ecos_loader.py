@@ -421,8 +421,8 @@ def build_catalog(base_dir: str | Path) -> pd.DataFrame:
 
     # --- Computed columns ---
     if "DENS_density_gcm3" in merged.columns and "US_Cl" in merged.columns:
-        merged["Z"] = merged["DENS_density_gcm3"] * 1000.0 * merged["US_Cl"]
-        merged["M"] = merged["DENS_density_gcm3"] * 1000.0 * merged["US_Cl"] ** 2
+        merged["Z"]     = (merged["DENS_density_gcm3"] * 1000.0 * merged["US_Cl"]).round(0)
+        merged["M_GPa"] = (merged["DENS_density_gcm3"] * 1000.0 * merged["US_Cl"] ** 2 / 1e9).round(4)
 
     # --- Sort ---
     sort_cols = [c for c in ["pva_pct", "pg_pct", "cycle", "piece"] if c in merged.columns]
@@ -435,30 +435,112 @@ def build_catalog(base_dir: str | Path) -> pd.DataFrame:
 # [7] Export catalog
 # ---------------------------------------------------------------------------
 
-def export_catalog(df: pd.DataFrame, path: str | Path, fmt: str = "csv") -> None:
-    """Export a catalog DataFrame to CSV or XLSX.
+def export_catalog(df: pd.DataFrame, path: str | Path) -> None:
+    """Export catalog DataFrame to both CSV and XLSX.
 
-    fmt="csv"  — semicolon-separated, UTF-8
-    fmt="xlsx" — single sheet named 'Catalog'
+    path is treated as a stem (extension stripped if present).
+    Produces <stem>.csv (semicolon-separated, comma decimal, UTF-8)
+    and <stem>.xlsx (numeric types preserved, no locale issue).
     """
-    path = Path(path)
-    if fmt == "csv":
-        df.to_csv(path, sep=";", encoding="utf-8", index=False)
-    elif fmt == "xlsx":
-        df.to_excel(path, sheet_name="Catalog", index=False)
-    else:
-        raise ValueError(f"Unsupported format: {fmt!r}. Use 'csv' or 'xlsx'.")
-    print(f"[export_catalog] saved {len(df)} rows → {path}")
+    stem = Path(path).with_suffix("")
+    csv_path  = stem.with_suffix(".csv")
+    xlsx_path = stem.with_suffix(".xlsx")
+
+    df.to_csv(csv_path, sep=";", decimal=",", encoding="utf-8", index=False)
+    print(f"[export_catalog] saved {len(df)} rows → {csv_path}")
+
+    df.to_excel(xlsx_path, sheet_name="Catalog", index=False)
+    print(f"[export_catalog] saved {len(df)} rows → {xlsx_path}")
 
 
 # ---------------------------------------------------------------------------
-# [8] __main__
+# [8] Consistency check — folder name vs JSON metadata
+# ---------------------------------------------------------------------------
+
+def check_consistency(base_dir: str | Path) -> list[str]:
+    """Check that each experiment folder name matches its JSON metadata.
+
+    Parses pva, pg, piece, cycle from the folder name and compares against
+    the corresponding fields in meta.json (US) or density.json (DENS).
+    Returns a list of warning strings for every mismatch found.
+    """
+    base_dir = Path(base_dir)
+    issues: list[str] = []
+
+    try:
+        entries = sorted(os.listdir(base_dir))
+    except FileNotFoundError:
+        return issues
+
+    for name in entries:
+        parsed = parse_folder_name(name)
+        if parsed is None:
+            continue
+
+        folder   = base_dir / name
+        exp_type = parsed["exp_type"]
+
+        try:
+            if exp_type == "US":
+                with (folder / "meta.json").open(encoding="utf-8") as f:
+                    data = json.load(f)
+                specimen = data.get("specimen", {})
+                json_vals = {
+                    "pva":   specimen.get("porcentaje_pva", ""),
+                    "pg":    specimen.get("porcentaje_aditivo1", ""),
+                    "piece": specimen.get("pieza", ""),
+                    "cycle": specimen.get("ciclos", ""),
+                }
+            else:
+                with (folder / "density.json").open(encoding="utf-8") as f:
+                    data = json.load(f)
+                json_vals = {
+                    "pva":   data.get("pva_pct", ""),
+                    "pg":    data.get("additive_pct", ""),
+                    "piece": data.get("sample_id", ""),
+                    "cycle": data.get("cycles", ""),
+                }
+        except Exception as exc:
+            issues.append(f"{name}: could not load JSON ({exc})")
+            continue
+
+        folder_vals = {k: parsed[k] for k in ("pva", "pg", "piece", "cycle")}
+
+        for key in ("pva", "pg", "piece", "cycle"):
+            f_val = str(folder_vals[key]).strip()
+            j_val = str(json_vals[key]).strip()
+            try:
+                match = float(f_val) == float(j_val)
+            except (ValueError, TypeError):
+                match = f_val.upper() == j_val.upper()
+            if not match:
+                issues.append(
+                    f"{name}: {key} mismatch — folder={f_val!r}, JSON={j_val!r}"
+                )
+
+    return issues
+
+
+# ---------------------------------------------------------------------------
+# [9] __main__
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
     base_dir = Path(__file__).parent / ".." / "database"
 
     print(f"Scanning: {base_dir.resolve()}\n")
+
+    # 1. Consistency check
+    mismatches = check_consistency(base_dir)
+    if mismatches:
+        print(f"[check_consistency] {len(mismatches)} mismatch(es) found:")
+        for w in mismatches:
+            print(f"  WARNING: {w}")
+        print()
+    else:
+        print("[check_consistency] all folders consistent.\n")
+
+    # 2. Build catalog
     df = build_catalog(base_dir)
 
     if df.empty:
@@ -479,7 +561,8 @@ if __name__ == "__main__":
                 print(df[col].value_counts().to_string())
                 print()
 
-        out_path = Path(__file__).parent / "catalog.csv"
-        export_catalog(df, out_path, fmt="csv")
+        # 3. Export both csv and xlsx
+        out_stem = Path(__file__).parent / "catalog"
+        export_catalog(df, out_stem)
 
     print("Done.")

@@ -41,3 +41,4 @@ database/PVA_*
 database/*_EXPID-*
 
 analysis/catalog.csv
+analysis/catalog.xlsx
