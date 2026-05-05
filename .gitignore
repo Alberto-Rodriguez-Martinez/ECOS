@@ -35,3 +35,7 @@ test_out.txt
 tools/data_32/
 tools/RegRd.txt
 .claude/
+
+# Datos experimentales (database)
+database/PVA_*
+database/*_EXPID-*
