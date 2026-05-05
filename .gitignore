@@ -42,3 +42,4 @@ database/*_EXPID-*
 
 analysis/catalog.csv
 analysis/catalog.xlsx
+~$*
