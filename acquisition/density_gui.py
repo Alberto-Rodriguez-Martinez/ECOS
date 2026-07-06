@@ -97,7 +97,7 @@ REALTIME_INTERVAL = 100      # ms
 AVG_N             = 20       # A-scans averaged per acquisition
 
 _DB_DIR      = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'database')
-DATA_DIR     = r"D:\ECOS\data"
+DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'data')
 
 SESSION_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'density_gui_session.json')
 

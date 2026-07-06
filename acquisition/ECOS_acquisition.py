@@ -39,7 +39,12 @@ from pathlib import Path                         # Required for path verificatio
 
 # Must be set before importing SeDaq — ctypes resolves DLL dependencies
 # using the working directory at import time, not at instantiation time
-os.chdir(r"D:\ECOS\tools")
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+_TOOLS_DIR = os.path.join(_REPO_ROOT, "tools")
+_DB_DIR    = os.path.join(_REPO_ROOT, "database")
+_HW_DIR    = os.path.join(_REPO_ROOT, "hardware")
+
+os.chdir(_TOOLS_DIR)
 
 import numpy as np
 import matplotlib.pyplot as plt
@@ -49,12 +54,12 @@ from matplotlib.widgets import Slider, RadioButtons, Button, TextBox
 from matplotlib.animation import FuncAnimation
 
 # --- Project toolboxes (adjust paths to your installation) ---
-sys.path.insert(0, r"D:\ECOS\tools")
-sys.path.append(r"D:\ECOS\database")
-sys.path.append(r"D:\ECOS\hardware")
+sys.path.insert(0, _TOOLS_DIR)
+sys.path.append(_DB_DIR)
+sys.path.append(_HW_DIR)
 
 # Add tools directory to DLL search path (required for USB2.dll dependency)
-os.add_dll_directory(r"D:\ECOS\tools")
+os.add_dll_directory(_TOOLS_DIR)
 
 import SeDaq as SD
 import ACQ_ToolBox as ACQ
@@ -78,7 +83,7 @@ from BD_Experimentos_PVA import (
 # ==============================================================================
 
 # --- Hardware paths ---
-RUTA_DLL = r"D:\ECOS\tools\SeDaqDLL.dll"
+RUTA_DLL = os.path.join(_TOOLS_DIR, "SeDaqDLL.dll")
 ARDUINO_PORT   = 'COM3'
 ARDUINO_BAUD   = 115200
 

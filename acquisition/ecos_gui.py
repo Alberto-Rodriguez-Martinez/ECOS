@@ -108,7 +108,7 @@ BITS_OPTIONS = {
     "12 bit": 4096,
 }
 
-DATA_DIR = r"D:\ECOS\data"
+DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'data')
 
 SESSION_FILE = os.path.join(
     os.path.dirname(os.path.abspath(__file__)), 'ecos_gui_session.json'
