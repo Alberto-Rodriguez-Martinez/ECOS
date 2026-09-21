@@ -13,11 +13,13 @@ import decimal
 #%%
 class Scanner():
     '''Class for the control of the scanner via serial comm.'''
-    def __init__(self, port='COM4', baudrate=19200, timeout=0.1):
+    def __init__(self, port='COM4', baudrate=19200, timeout=0.1, move_timeout=120):
         
         # Open Serial communication
         self.ser = serial.Serial(port, baudrate, timeout=timeout)
         self.port = port
+        # FIX (2026-09): max time (s) to wait for the response of a blocking command (see write).
+        self.move_timeout = move_timeout
 
         # Steps in mm
         self.uStepX = 0.01
@@ -33,6 +35,10 @@ class Scanner():
 
         # Set default directions to: '+', '+', '-', '+'
         self.setDirections()
+
+        # FIX (2026-09): initialize ramping/random speed caches so the getters do not raise AttributeError.
+        self._XRampingSpeed = self._YRampingSpeed = self._ZRampingSpeed = self._RRampingSpeed = None
+        self._XRandomSpeed = self._YRandomSpeed = self._ZRandomSpeed = self._RRandomSpeed = None
 
         # Set default speedtypes to 'rectangular'
         self.setSpeedtypes()
@@ -124,17 +130,22 @@ class Scanner():
         '''
         if decimal.Decimal(str(value)) % decimal.Decimal(str(self.getuSteps(axis))) != 0:
             print(f'Warning: {value} is not multiple of {self.getuSteps(axis)}.')
-        return int(value / self.getuSteps(axis))
+        # FIX (2026-09): round instead of truncate (0.29/0.01 = 28.999... gave 28 steps).
+        return int(round(value / self.getuSteps(axis)))
     
     
     # ========= WRITE COMMAND =========
     def write(self, cmd):
+        # FIX (2026-09): docstring updated for the move_timeout and ConnectionError behavior.
         '''
         Send a command to the scanner via serial communication. The execution
         of code is blocked until the response is received. If the serial
         communication port was closed, it is opened. If a KeyboardInterrupt
         exception occurs, a stop command is sent ('SSF') and the exception is
-        raised. If any other exception occurs, the serial comm is closed.
+        raised. If no response is received within self.move_timeout seconds,
+        a stop command is sent ('SSF') and a TimeoutError is raised. If any
+        other exception occurs (or the port cannot be opened), the serial comm
+        is closed and a ConnectionError is raised.
 
         Parameters
         ----------
@@ -155,6 +166,8 @@ class Scanner():
         except Exception as e:
             print(f'Scanner {self.port}> error communicating...: {e}')
             self.ser.close()
+            # FIX (2026-09): raise instead of silently returning None when the port could not be opened.
+            raise ConnectionError(f'Scanner {self.port}> error communicating...: {e}') from e
 
         if self.ser.isOpen():
             try:
@@ -164,7 +177,13 @@ class Scanner():
                 time.sleep(0.1)
                 response = self.ser.read(10)
                 if cmd[:2] in ['SM', 'SL', 'SC', 'SD', 'SN', 'SA', 'SG']:
+                    t0 = time.time()
                     while response == b'':
+                        # FIX (2026-09): give up after move_timeout seconds instead of waiting forever.
+                        if time.time() - t0 > self.move_timeout:
+                            self.ser.write('SSF\r'.encode('utf-8'))
+                            print(f'Scanner {self.port}> no response to {cmd} after {self.move_timeout} s. Scanner stopped.')
+                            raise TimeoutError(f'Scanner {self.port}> no response to {cmd} after {self.move_timeout} s')
                         time.sleep(0.2)
                         response = self.ser.read(10)
                 return response
@@ -172,10 +191,15 @@ class Scanner():
                 self.ser.write('SSF\r'.encode('utf-8'))
                 print('Scanner successfully stopped.')
                 raise
+            except TimeoutError:
+                # FIX (2026-09): let the move timeout through; it is not a communication failure.
+                raise
             except Exception as e1:
                 self.ser.close()
                 print(f'Scanner {self.port}> error communicating...: {e1}')
                 print(f'Scanner {self.port}> Port closed')
+                # FIX (2026-09): raise instead of silently returning None after a communication error.
+                raise ConnectionError(f'Scanner {self.port}> error communicating...: {e1}') from e1
 
 
     # ========== READ COORDINATES ==========
@@ -551,7 +575,8 @@ class Scanner():
         if self.write(f'SDX{steps}')[:2] != b'OK':
             print(f'Could not move X axis relative coordinate by {value} mm.')
             return
-        self._X = value
+        # FIX (2026-09): value is a relative displacement, not the position; read the X property for the real one.
+        self._X = None
     
     def diffMoveY(self, value):
         '''
@@ -575,7 +600,8 @@ class Scanner():
         if self.write(f'SDY{steps}')[:2] != b'OK':
             print(f'Could not move Y axis relative coordinate by {value} mm.')
             return
-        self._Y = value
+        # FIX (2026-09): value is a relative displacement, not the position; read the Y property for the real one.
+        self._Y = None
     
     def diffMoveZ(self, value):
         '''
@@ -599,7 +625,8 @@ class Scanner():
         if self.write(f'SDZ{steps}')[:2] != b'OK':
             print(f'Could not move Z axis relative coordinate by {value} mm.')
             return
-        self._Z = value
+        # FIX (2026-09): value is a relative displacement, not the position; read the Z property for the real one.
+        self._Z = None
     
     def diffMoveR(self, value):
         '''
@@ -623,7 +650,8 @@ class Scanner():
         if self.write(f'SDR{steps}')[:2] != b'OK':
             print(f'Could not move R axis relative coordinate by {value} deg.')
             return
-        self._R = value
+        # FIX (2026-09): value is a relative displacement, not the position; read the R property for the real one.
+        self._R = None
     
     def diffMove(self, Xvalue, Yvalue, Zvalue, Rvalue):
         '''
@@ -709,7 +737,8 @@ class Scanner():
         if self.write(f'SNX{steps}')[:2] != b'OK':
             print(f'Could not move X axis relative coordinate by {value} mm.')
             return
-        self._X = value
+        # FIX (2026-09): value is a relative displacement, not the position; read the X property for the real one.
+        self._X = None
     
     def unlimitedDiffMoveY(self, value):
         '''
@@ -731,7 +760,8 @@ class Scanner():
         if self.write(f'SNY{steps}')[:2] != b'OK':
             print(f'Could not move Y axis relative coordinate by {value} mm.')
             return
-        self._Y = value
+        # FIX (2026-09): value is a relative displacement, not the position; read the Y property for the real one.
+        self._Y = None
     
     def unlimitedDiffMoveZ(self, value):
         '''
@@ -753,7 +783,8 @@ class Scanner():
         if self.write(f'SNZ{steps}')[:2] != b'OK':
             print(f'Could not move Z axis relative coordinate by {value} mm.')
             return
-        self._Z = value
+        # FIX (2026-09): value is a relative displacement, not the position; read the Z property for the real one.
+        self._Z = None
     
     def unlimitedDiffMoveR(self, value):
         '''
@@ -775,7 +806,8 @@ class Scanner():
         if self.write(f'SNR{steps}')[:2] != b'OK':
             print(f'Could not move R axis relative coordinate by {value} deg.')
             return
-        self._R = value
+        # FIX (2026-09): value is a relative displacement, not the position; read the R property for the real one.
+        self._R = None
     
     def unlimitedDiffMove(self, Xvalue, Yvalue, Zvalue, Rvalue):
         '''
@@ -1603,7 +1635,8 @@ class Scanner():
         if value < 1 or value > 65536:
             print('Speed out of range. Ignoring...')
             return
-        self.write('SRX{value}')
+        # FIX (2026-09): missing f prefix; the literal '{value}' was being sent.
+        self.write(f'SRX{value}')
         self._XRandomSpeed = value
     
     @YRandomSpeed.setter
@@ -1614,7 +1647,8 @@ class Scanner():
         if value < 1 or value > 65536:
             print('Speed out of range. Ignoring...')
             return
-        self.write('SRY{value}')
+        # FIX (2026-09): missing f prefix; the literal '{value}' was being sent.
+        self.write(f'SRY{value}')
         self._YRandomSpeed = value
     
     @ZRandomSpeed.setter
@@ -1625,7 +1659,8 @@ class Scanner():
         if value < 1 or value > 65536:
             print('Speed out of range. Ignoring...')
             return
-        self.write('SRZ{value}')
+        # FIX (2026-09): missing f prefix; the literal '{value}' was being sent.
+        self.write(f'SRZ{value}')
         self._ZRandomSpeed = value
     
     @RRandomSpeed.setter
@@ -1636,7 +1671,8 @@ class Scanner():
         if value < 1 or value > 65536:
             print('Speed out of range. Ignoring...')
             return
-        self.write('SRR{value}')
+        # FIX (2026-09): missing f prefix; the literal '{value}' was being sent.
+        self.write(f'SRR{value}')
         self._RRandomSpeed = value
 
     def setRandomSpeeds(self, Xvalue, Yvalue, Zvalue, Rvalue):
@@ -2142,6 +2178,10 @@ def _parseSpeedtype(speedtype):
         speedtype_lower = speedtype.lower()
         if speedtype_lower in allowed_speedtypes_str:
             code = allowed_speedtypes_str.index(speedtype_lower)
+        else:
+            # FIX (2026-09): unknown name left 'code' unbound (UnboundLocalError); fall back like the other branch.
+            print("Wrong speed type. Using default ('rectangular').")
+            return 0
     elif speedtype in [0,1,2,3]:
         code = speedtype
     else:
