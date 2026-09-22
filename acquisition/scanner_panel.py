@@ -3,10 +3,12 @@
 scanner_panel.py — Standalone panel for the XYZR scanner (SE SC-03-00), phase 1.
 ECOS project - Universidad Miguel Hernandez - Dpto. Ingenieria de Comunicaciones
 
-Phase 1 scope only (see task_scanner_phase1.md and scanner_tab_spec.md sections
-1-3, 5.1-5.3, 6): worker thread + command queue, status, session (beam axis,
-PE side, limits, manual step, speed), manual movement and STOP. NOT wired
-into ecos_gui.py (that is phase 2) and no focus/flatness/scan tools yet.
+Phase 1 scope only (see task_scanner_phase1.md, scanner_tab_spec.md sections
+1-3, 5.1-5.3, 6, and later fixes in task_scanner_phase1_fixes.md and
+task_scanner_jog.md): worker thread + command queue, status, session (beam
+axis, PE side, limits, speed), manual movement (per-axis jog + Go/Go to
+origin) and STOP. NOT wired into ecos_gui.py (that is phase 2) and no
+focus/flatness/scan tools yet.
 
 Run standalone:
     python acquisition/scanner_panel.py          (real hardware)
@@ -32,7 +34,7 @@ sys.path.insert(0, _HW_SCANNER_DIR)
 import serial
 import serial.tools.list_ports
 
-from PyQt5.QtCore import Qt, QThread, pyqtSignal
+from PyQt5.QtCore import QThread, pyqtSignal
 from PyQt5.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
     QGroupBox, QLabel, QLineEdit, QComboBox, QPushButton, QMessageBox,
@@ -86,6 +88,10 @@ SESSION_DEFAULT_LIMITS_MM = {'X': 100.0, 'Y': 100.0, 'Z': 50.0, 'R': 360.0}
 # instantiating a Scanner (which opens a port) just to read one attribute.
 R_STEP_UNIT = Scanner.uStepR
 
+# Default per-axis jog amount (task_scanner_jog.md point 2): X/Y 1.0 mm,
+# Z 0.5 mm, R one resolution unit (1.8 deg).
+JOG_DEFAULTS_MM = {'X': 1.0, 'Y': 1.0, 'Z': 0.5, 'R': R_STEP_UNIT}
+
 
 # ===========================================================================
 #  Helpers: beam/lateral <-> X/Y translation (spec 2: "la traduccion a X/Y
@@ -109,14 +115,14 @@ def fmt_pos(axis, value):
     return f'{value:.2f} mm'
 
 
-def round_r_step(value):
-    """R step field: nearest multiple of R_STEP_UNIT, at least one unit (1.8 deg)."""
+def round_r_jog(value):
+    """R jog field: nearest multiple of R_STEP_UNIT, at least one unit (1.8 deg)."""
     n = max(1, round(value / R_STEP_UNIT))
     return round(n * R_STEP_UNIT, 6)
 
 
 def round_r_target(value):
-    """R Go / '=N' target: nearest multiple of R_STEP_UNIT (0 is allowed)."""
+    """R 'Move to' target: nearest multiple of R_STEP_UNIT (0 is allowed)."""
     n = round(value / R_STEP_UNIT)
     return round(n * R_STEP_UNIT, 6)
 
@@ -222,8 +228,6 @@ class ScannerWorker(QThread):
             self._do_set_limits(cmd[1])
         elif op == 'set_zero':
             self._do_set_zero(cmd[1])
-        elif op == 'set_value':
-            self._do_set_value(*cmd[1:])
         elif op == 'set_speeds':
             self._do_set_speeds(cmd[1])
         elif op == 'power_cycle_sim':
@@ -369,16 +373,6 @@ class ScannerWorker(QThread):
         finally:
             self.busy.emit(False)
 
-    def _do_set_value(self, axis, value):
-        if self.scanner is None:
-            return
-        self.busy.emit(True)
-        try:
-            self.scanner.setAxis(axis, value)
-            self.moved.emit(self.scanner.getCoords())
-        finally:
-            self.busy.emit(False)
-
     def _do_set_speeds(self, speeds_dict):
         if self.scanner is None:
             return
@@ -424,8 +418,11 @@ class ScannerPanel(QWidget):
         self._pe_side = self._session.get('pe_side', 'origin')
         self._limits = {ax: float(self._session.get('limits', {}).get(ax, SESSION_DEFAULT_LIMITS_MM[ax]))
                          for ax in AXES}
-        self._steps = {ax: float(self._session.get('steps', {}).get(ax, R_STEP_UNIT if ax == 'R' else 1.0))
-                        for ax in AXES}
+        # task_scanner_jog.md: 'jog' replaces the old 'step' session key. An
+        # old JSON with 'step' still loads (used as the initial jog); the
+        # next save writes only 'jog'.
+        jog_source = self._session.get('jog', self._session.get('steps', {}))
+        self._jogs = {ax: float(jog_source.get(ax, JOG_DEFAULTS_MM[ax])) for ax in AXES}
         self._speeds = {ax: int(self._session.get('speeds', {}).get(ax, 100))
                          for ax in AXES}
 
@@ -448,7 +445,8 @@ class ScannerPanel(QWidget):
         self._refresh_role_label_texts()
         self._refresh_position_labels()
         self._refresh_all_role_limit_fields()
-        self._refresh_role_step_speed_fields()
+        self._refresh_role_speed_fields()
+        self._refresh_role_jog_fields()
         self._update_enabled_state()
 
     # =======================================================================
@@ -562,25 +560,19 @@ class ScannerPanel(QWidget):
 
         grid = QGridLayout()
         # Column layout (see the per-role loop below): 0 axis name, 1 limit
-        # edit, 2 apply-limit button, 3 step edit, 4 speed edit, 5 zero
-        # button, 6-7 set-value edit + '=N' button (merged header, spanning
-        # both, since they act together). Placed explicitly, column by
-        # column, rather than via a flat list that is easy to get out of
-        # sync with the widgets below (that was the phase-1 bug: 'Zero' and
-        # '=N' ended up shifted one column to the right).
+        # edit, 2 apply-limit button, 3 speed edit, 4 zero button. Placed
+        # explicitly, column by column, rather than via a flat list that is
+        # easy to get out of sync with the widgets below (that was the
+        # phase-1 header-alignment bug). task_scanner_jog.md removed the old
+        # Step and Set-value columns (Step moved to Manual movement as Jog;
+        # Set-value dropped).
         grid.addWidget(QLabel('<b>Axis</b>'), 0, 0)
         grid.addWidget(QLabel('<b>Limit</b>'), 0, 1)
-        grid.addWidget(QLabel('<b>Step (mm / °)</b>'), 0, 3)
-        grid.addWidget(QLabel('<b>Speed</b>'), 0, 4)
-        grid.addWidget(QLabel('<b>Zero</b>'), 0, 5)
-        lbl_setvalue_header = QLabel('<b>Set value</b>')
-        lbl_setvalue_header.setAlignment(Qt.AlignCenter)
-        grid.addWidget(lbl_setvalue_header, 0, 6, 1, 2)
+        grid.addWidget(QLabel('<b>Speed</b>'), 0, 3)
+        grid.addWidget(QLabel('<b>Zero</b>'), 0, 4)
 
         self._edit_limit = {}
-        self._edit_step = {}
         self._edit_speed = {}
-        self._edit_setvalue = {}
 
         for r, role in enumerate(ROLE_ORDER, start=1):
             grid.addWidget(self._lbl_role_name_for_session(role), r, 0)
@@ -594,33 +586,16 @@ class ScannerPanel(QWidget):
             btn_apply_limit.clicked.connect(self._make_apply_limit_handler(role))
             grid.addWidget(btn_apply_limit, r, 2)
 
-            edit_step = QLineEdit()
-            edit_step.setFixedWidth(60)
-            self._edit_step[role] = edit_step
-            if role == 'R':  # role 'R' always maps to axis 'R', fix 1
-                edit_step.editingFinished.connect(self._on_r_step_edited)
-            grid.addWidget(edit_step, r, 3)
-
             edit_speed = QLineEdit()
             edit_speed.setFixedWidth(60)
             self._edit_speed[role] = edit_speed
-            grid.addWidget(edit_speed, r, 4)
+            grid.addWidget(edit_speed, r, 3)
 
             btn_zero = QPushButton('Zero')
             btn_zero.clicked.connect(self._make_zero_handler(role))
-            grid.addWidget(btn_zero, r, 5)
+            grid.addWidget(btn_zero, r, 4)
 
-            edit_setvalue = QLineEdit()
-            edit_setvalue.setFixedWidth(60)
-            self._edit_setvalue[role] = edit_setvalue
-            grid.addWidget(edit_setvalue, r, 6)
-
-            btn_setvalue = QPushButton('=N')
-            btn_setvalue.clicked.connect(self._make_setvalue_handler(role))
-            grid.addWidget(btn_setvalue, r, 7)
-
-            self._session_widgets += [edit_limit, btn_apply_limit, edit_step, edit_speed,
-                                       btn_zero, edit_setvalue, btn_setvalue]
+            self._session_widgets += [edit_limit, btn_apply_limit, edit_speed, btn_zero]
         layout.addLayout(grid)
 
         btn_row = QHBoxLayout()
@@ -657,40 +632,56 @@ class ScannerPanel(QWidget):
         self._lbl_role_name_session[role] = lbl
         return lbl
 
-    # -- Movement (spec 5.3) --------------------------------------------------
+    # -- Movement (spec 5.3 + task_scanner_jog.md) ---------------------------
     def _build_movement_group(self):
         group = QGroupBox('Manual movement')
         layout = QVBoxLayout(group)
 
         grid = QGridLayout()
+        # Column layout: 0 axis name, 1 jog edit, 2 minus, 3 plus, 4 move-to
+        # edit, 5 go button. Every widget gets a fixed width (including Go,
+        # which used to stretch to fill the row) so the row reads as evenly
+        # proportioned columns instead of Go eating the leftover space.
+        grid.addWidget(QLabel('<b>Jog (mm / °)</b>'), 0, 1)
+        grid.addWidget(QLabel('<b>Move to (mm / °)</b>'), 0, 4)
+
+        self._edit_jog = {}
         self._edit_goto = {}
-        for r, role in enumerate(ROLE_ORDER):
+        for r, role in enumerate(ROLE_ORDER, start=1):
             lbl = QLabel()
             if not hasattr(self, '_lbl_role_name_move'):
                 self._lbl_role_name_move = {}
             self._lbl_role_name_move[role] = lbl
             grid.addWidget(lbl, r, 0)
 
+            edit_jog = QLineEdit()
+            edit_jog.setFixedWidth(55)
+            self._edit_jog[role] = edit_jog
+            if role == 'R':  # role 'R' always maps to axis 'R', fix 1
+                edit_jog.editingFinished.connect(self._on_r_jog_edited)
+            grid.addWidget(edit_jog, r, 1)
+
             btn_minus = QPushButton('-')
             btn_minus.setFixedWidth(30)
-            btn_minus.clicked.connect(self._make_step_handler(role, -1))
-            grid.addWidget(btn_minus, r, 1)
+            btn_minus.clicked.connect(self._make_jog_handler(role, -1))
+            grid.addWidget(btn_minus, r, 2)
 
             btn_plus = QPushButton('+')
             btn_plus.setFixedWidth(30)
-            btn_plus.clicked.connect(self._make_step_handler(role, +1))
-            grid.addWidget(btn_plus, r, 2)
+            btn_plus.clicked.connect(self._make_jog_handler(role, +1))
+            grid.addWidget(btn_plus, r, 3)
 
             edit_goto = QLineEdit()
-            edit_goto.setFixedWidth(70)
+            edit_goto.setFixedWidth(65)
             self._edit_goto[role] = edit_goto
-            grid.addWidget(edit_goto, r, 3)
+            grid.addWidget(edit_goto, r, 4)
 
             btn_goto = QPushButton('Go')
+            btn_goto.setFixedWidth(40)
             btn_goto.clicked.connect(self._make_goto_handler(role))
-            grid.addWidget(btn_goto, r, 4)
+            grid.addWidget(btn_goto, r, 5)
 
-            self._movement_widgets += [btn_minus, btn_plus, edit_goto, btn_goto]
+            self._movement_widgets += [edit_jog, btn_minus, btn_plus, edit_goto, btn_goto]
         layout.addLayout(grid)
 
         # Fix 5: fixed physical-axis order (R, Z, X, Y), regardless of which
@@ -858,20 +849,21 @@ class ScannerPanel(QWidget):
         self._refresh_role_label_texts()
         self._refresh_position_labels()
         self._refresh_all_role_limit_fields()
-        self._refresh_role_step_speed_fields()
+        self._refresh_role_speed_fields()
+        self._refresh_role_jog_fields()
 
     def _on_pe_side_changed(self, index):
         self._pe_side = 'origin' if index == 0 else 'max'
 
     def _capture_role_edits_into_state(self):
-        """Reads whatever is currently typed in the step/speed fields into the
+        """Reads whatever is currently typed in the jog/speed fields into the
         per-real-axis session state, before swapping which axis a role points
         to (or before saving), so in-progress edits are not silently lost."""
         for role in ROLE_ORDER:
             axis = self._role_axis[role]
-            step = self._read_float(self._edit_step[role], None)
-            if step is not None:
-                self._steps[axis] = step
+            jog = self._read_float(self._edit_jog[role], None)
+            if jog is not None:
+                self._jogs[axis] = jog
             speed = self._read_float(self._edit_speed[role], None)
             if speed is not None:
                 self._speeds[axis] = int(speed)
@@ -896,11 +888,15 @@ class ScannerPanel(QWidget):
             axis = self._role_axis[role]
             self._edit_limit[role].setText(f'{self._limits.get(axis, 0.0):g}')
 
-    def _refresh_role_step_speed_fields(self):
+    def _refresh_role_speed_fields(self):
         for role in ROLE_ORDER:
             axis = self._role_axis[role]
-            self._edit_step[role].setText(f'{self._steps.get(axis, 1.0):g}')
             self._edit_speed[role].setText(str(self._speeds.get(axis, 100)))
+
+    def _refresh_role_jog_fields(self):
+        for role in ROLE_ORDER:
+            axis = self._role_axis[role]
+            self._edit_jog[role].setText(f'{self._jogs.get(axis, JOG_DEFAULTS_MM[axis]):g}')
 
     # =======================================================================
     #  Movement handlers (spec 5.3 + section 6, "seguridad")
@@ -918,37 +914,40 @@ class ScannerPanel(QWidget):
             return False
         return True
 
-    def _on_r_step_edited(self):
-        """Fix 1: the R step field only accepts multiples of R_STEP_UNIT
-        (min. one unit); round it as soon as the user leaves the field."""
-        edit = self._edit_step['R']
+    def _on_r_jog_edited(self):
+        """Fix 1 (still applies to the jog field after task_scanner_jog.md):
+        R only accepts multiples of R_STEP_UNIT (min. one unit); round it as
+        soon as the user leaves the field."""
+        edit = self._edit_jog['R']
         value = self._read_float(edit, None)
         if value is None:
             return
-        rounded = round_r_step(value)
+        rounded = round_r_jog(value)
         edit.setText(f'{rounded:g}')
         if abs(rounded - value) > 1e-6:
             self._lbl_result.setText(
-                f'R step rounded to {rounded:g}° (multiple of {R_STEP_UNIT:g}°).'
+                f'R jog rounded to {rounded:g}° (multiple of {R_STEP_UNIT:g}°).'
             )
 
-    def _make_step_handler(self, role, sign):
+    def _make_jog_handler(self, role, sign):
+        """+/- buttons: move by the jog amount typed in that row's field,
+        read at click time (no Enter needed)."""
         def handler():
             axis = self._role_axis[role]
-            step = self._read_float(self._edit_step[role], None)
-            if step is None:
-                QMessageBox.warning(self, 'Scanner', 'Invalid step value.')
+            jog = self._read_float(self._edit_jog[role], None)
+            if jog is None:
+                QMessageBox.warning(self, 'Scanner', 'Invalid jog value.')
                 return
             if axis == 'R':
-                rounded_step = round_r_step(step)
-                if abs(rounded_step - step) > 1e-6:
-                    self._edit_step[role].setText(f'{rounded_step:g}')
+                rounded_jog = round_r_jog(jog)
+                if abs(rounded_jog - jog) > 1e-6:
+                    self._edit_jog[role].setText(f'{rounded_jog:g}')
                     self._lbl_result.setText(
-                        f'R step rounded to {rounded_step:g}° (multiple of {R_STEP_UNIT:g}°).'
+                        f'R jog rounded to {rounded_jog:g}° (multiple of {R_STEP_UNIT:g}°).'
                     )
-                step = rounded_step
+                jog = rounded_jog
             current = self._coords.get(axis, 0.0)
-            target = round(current + sign * step, 4)
+            target = round(current + sign * jog, 4)
             if not self._validate_target(axis, target):
                 return
             self._worker.enqueue(('move_axis', axis, target))
@@ -1031,26 +1030,6 @@ class ScannerPanel(QWidget):
     def _on_zero_all_clicked(self):
         self._worker.enqueue(('set_zero', list(AXES)))
 
-    def _make_setvalue_handler(self, role):
-        def handler():
-            axis = self._role_axis[role]
-            value = self._read_float(self._edit_setvalue[role], None)
-            if value is None:
-                QMessageBox.warning(self, 'Scanner', 'Invalid value.')
-                return
-            if axis == 'R':
-                rounded_value = round_r_target(value)
-                if abs(rounded_value - value) > 1e-6:
-                    self._edit_setvalue[role].setText(f'{rounded_value:g}')
-                    self._lbl_result.setText(
-                        f'R value rounded to {rounded_value:g}° (multiple of {R_STEP_UNIT:g}°).'
-                    )
-                value = rounded_value
-            if not self._validate_target(axis, value):
-                return
-            self._worker.enqueue(('set_value', axis, value))
-        return handler
-
     def _on_apply_speeds_clicked(self):
         self._capture_role_edits_into_state()
         speeds = {ax: int(self._speeds.get(ax, 100)) for ax in AXES}
@@ -1083,12 +1062,15 @@ class ScannerPanel(QWidget):
         self._cmb_pe_side.blockSignals(False)
 
         self._limits = {ax: float(d.get('limits', {}).get(ax, SESSION_DEFAULT_LIMITS_MM[ax])) for ax in AXES}
-        self._steps = {ax: float(d.get('steps', {}).get(ax, R_STEP_UNIT if ax == 'R' else 1.0)) for ax in AXES}
+        # 'jog' replaces the old 'step' key; an old JSON with 'step' still loads.
+        jog_source = d.get('jog', d.get('steps', {}))
+        self._jogs = {ax: float(jog_source.get(ax, JOG_DEFAULTS_MM[ax])) for ax in AXES}
         self._speeds = {ax: int(d.get('speeds', {}).get(ax, 100)) for ax in AXES}
 
         self._refresh_role_label_texts()
         self._refresh_all_role_limit_fields()
-        self._refresh_role_step_speed_fields()
+        self._refresh_role_speed_fields()
+        self._refresh_role_jog_fields()
 
     @staticmethod
     def _load_session_from_disk():
@@ -1106,7 +1088,7 @@ class ScannerPanel(QWidget):
             'pe_side': self._pe_side,
             'last_port': ('' if self._use_sim else (self._cmb_port.currentData() or '')),
             'limits': dict(self._limits),
-            'steps': dict(self._steps),
+            'jog': dict(self._jogs),
             'speeds': dict(self._speeds),
         }
         try:
