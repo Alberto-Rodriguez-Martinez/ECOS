@@ -13,6 +13,17 @@ import decimal
 #%%
 class Scanner():
     '''Class for the control of the scanner via serial comm.'''
+
+    # ADD (2026-09): class-level defaults for each axis' step resolution
+    # (mm/step for X/Y/Z, deg/step for R), so code that needs e.g. R's
+    # resolution can read Scanner.uStepR without instantiating Scanner
+    # (which opens a port). __init__ still assigns the matching instance
+    # attributes below; keep both in sync if this ever changes.
+    uStepX = 0.01
+    uStepY = 0.01
+    uStepZ = 0.005
+    uStepR = 1.8  # (200steps=360deg) --- the other value that doesnt work is 0.0281
+
     def __init__(self, port='COM4', baudrate=19200, timeout=0.1, move_timeout=120, ser=None):
 
         # ADD (2026-09): allow injecting an existing serial-like object (e.g. FakeSerial for

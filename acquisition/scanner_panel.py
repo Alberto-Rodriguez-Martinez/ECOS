@@ -15,14 +15,11 @@ Run standalone:
 Requires (Python 32-bit): numpy, pyserial, PyQt5, pyqtgraph 0.11. No scipy.
 """
 import argparse
-import ast
-import inspect
 import json
 import os
 import queue
 import re
 import sys
-import textwrap
 import threading
 import time
 
@@ -83,25 +80,11 @@ HARDWARE_RESET_LIMITS_TOL = {'X': 0.05, 'Y': 0.05, 'Z': 0.05, 'R': 5.0}
 SESSION_DEFAULT_LIMITS_MM = {'X': 100.0, 'Y': 100.0, 'Z': 50.0, 'R': 360.0}
 
 
-def _derive_r_step_unit():
-    """
-    R_STEP_UNIT (R's mechanical resolution, 1.8 deg/step) read straight out
-    of Scanner.__init__'s source instead of hand-writing the number here (so
-    it can't silently drift from Scanner.py) — without paying the ~2 s /
-    20-command cost of actually instantiating a Scanner (even over the
-    simulator) just to read one attribute.
-    """
-    tree = ast.parse(textwrap.dedent(inspect.getsource(Scanner.__init__)))
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Assign):
-            for target in node.targets:
-                if (isinstance(target, ast.Attribute) and target.attr == 'uStepR'
-                        and isinstance(target.value, ast.Name) and target.value.id == 'self'):
-                    return float(ast.literal_eval(node.value))
-    raise RuntimeError('Could not derive R_STEP_UNIT from Scanner.uStepR.')
-
-
-R_STEP_UNIT = _derive_r_step_unit()
+# R's mechanical resolution (1.8 deg/step). Read from Scanner's own class
+# attribute (see Scanner.py's ADD 2026-09) instead of hand-writing the
+# number here, so it can't silently drift from Scanner.py — and without
+# instantiating a Scanner (which opens a port) just to read one attribute.
+R_STEP_UNIT = Scanner.uStepR
 
 
 # ===========================================================================
