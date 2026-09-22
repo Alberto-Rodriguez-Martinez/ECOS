@@ -15,11 +15,14 @@ Run standalone:
 Requires (Python 32-bit): numpy, pyserial, PyQt5, pyqtgraph 0.11. No scipy.
 """
 import argparse
+import ast
+import inspect
 import json
 import os
 import queue
 import re
 import sys
+import textwrap
 import threading
 import time
 
@@ -32,7 +35,7 @@ sys.path.insert(0, _HW_SCANNER_DIR)
 import serial
 import serial.tools.list_ports
 
-from PyQt5.QtCore import QThread, pyqtSignal
+from PyQt5.QtCore import Qt, QThread, pyqtSignal
 from PyQt5.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
     QGroupBox, QLabel, QLineEdit, QComboBox, QPushButton, QMessageBox,
@@ -63,11 +66,42 @@ _ECOS_GUI_SESSION_FILE = os.path.join(_THIS_DIR, 'ecos_gui_session.json')
 AXES = ('X', 'Y', 'Z', 'R')
 ROLE_ORDER = ('beam', 'lateral', 'Z', 'R')
 ROLE_LABELS = {'beam': 'Beam', 'lateral': 'Lateral', 'Z': 'Z', 'R': 'R'}
+GO_TO_ORIGIN_AXIS_ORDER = ('R', 'Z', 'X', 'Y')  # fixed physical order, see fixes task point 5
 
-# Verified: after a controller power cut every limit resets to 10000 steps,
-# i.e. 100/100/50 mm and 18000 deg (Scanner's uStepX/Y/Z/R).
-DEFAULT_LIMITS_MM = {'X': 100.0, 'Y': 100.0, 'Z': 50.0, 'R': 18000.0}
-DEFAULT_LIMITS_TOL = {'X': 0.05, 'Y': 0.05, 'Z': 0.05, 'R': 5.0}
+# Hardware fact (verified): after a controller power cut every axis limit
+# resets to 10000 steps in firmware, i.e. 100/100/50 mm and 18000 deg
+# (Scanner's uStepX/Y/Z/R). Used only to DETECT that a reset happened, by
+# comparing it against what Scanner reports right after connecting.
+HARDWARE_RESET_LIMITS_MM = {'X': 100.0, 'Y': 100.0, 'Z': 50.0, 'R': 18000.0}
+HARDWARE_RESET_LIMITS_TOL = {'X': 0.05, 'Y': 0.05, 'Z': 0.05, 'R': 5.0}
+
+# GUI default limits: used for a brand-new session (no scanner_session.json
+# yet) and, per task_scanner_phase1_fixes.md point 3, as what is offered
+# after a detected reset when there is no saved session to resend. R
+# defaults to 360 deg (one full turn), not the firmware's post-reset
+# 18000 deg.
+SESSION_DEFAULT_LIMITS_MM = {'X': 100.0, 'Y': 100.0, 'Z': 50.0, 'R': 360.0}
+
+
+def _derive_r_step_unit():
+    """
+    R_STEP_UNIT (R's mechanical resolution, 1.8 deg/step) read straight out
+    of Scanner.__init__'s source instead of hand-writing the number here (so
+    it can't silently drift from Scanner.py) — without paying the ~2 s /
+    20-command cost of actually instantiating a Scanner (even over the
+    simulator) just to read one attribute.
+    """
+    tree = ast.parse(textwrap.dedent(inspect.getsource(Scanner.__init__)))
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign):
+            for target in node.targets:
+                if (isinstance(target, ast.Attribute) and target.attr == 'uStepR'
+                        and isinstance(target.value, ast.Name) and target.value.id == 'self'):
+                    return float(ast.literal_eval(node.value))
+    raise RuntimeError('Could not derive R_STEP_UNIT from Scanner.uStepR.')
+
+
+R_STEP_UNIT = _derive_r_step_unit()
 
 
 # ===========================================================================
@@ -90,6 +124,18 @@ def fmt_pos(axis, value):
     if axis == 'Z':
         return f'{value:.3f} mm'
     return f'{value:.2f} mm'
+
+
+def round_r_step(value):
+    """R step field: nearest multiple of R_STEP_UNIT, at least one unit (1.8 deg)."""
+    n = max(1, round(value / R_STEP_UNIT))
+    return round(n * R_STEP_UNIT, 6)
+
+
+def round_r_target(value):
+    """R Go / '=N' target: nearest multiple of R_STEP_UNIT (0 is allowed)."""
+    n = round(value / R_STEP_UNIT)
+    return round(n * R_STEP_UNIT, 6)
 
 
 # ===========================================================================
@@ -149,9 +195,16 @@ class ScannerWorker(QThread):
         self._running = True
         self.scanner = None  # Scanner instance once connected, else None
         self.ser = None      # shared _LockingSerialProxy, also used by STOP
+        # Fix 5 (go-to-origin): set by the GUI thread's STOP handler so a
+        # multi-axis sequence stops after the axis being interrupted instead
+        # of moving on to the next one.
+        self._abort_sequence = threading.Event()
 
     def enqueue(self, cmd):
         self._queue.put(cmd)
+
+    def request_sequence_abort(self):
+        self._abort_sequence.set()
 
     def stop_thread(self):
         self._running = False
@@ -180,6 +233,8 @@ class ScannerWorker(QThread):
             self._emit_limits()
         elif op == 'move_axis':
             self._do_move_axis(*cmd[1:])
+        elif op == 'move_sequence':
+            self._do_move_sequence(cmd[1])
         elif op == 'set_limits':
             self._do_set_limits(cmd[1])
         elif op == 'set_zero':
@@ -284,6 +339,30 @@ class ScannerWorker(QThread):
         finally:
             self.busy.emit(False)
 
+    def _do_move_sequence(self, axis_targets):
+        """
+        Fix 5 (go-to-origin): moves one axis at a time, in the given order,
+        going through Scanner.moveAxis exactly like a single manual move.
+        STOP (see ScannerPanel._on_stop_clicked) both interrupts whichever
+        axis is currently moving (via the shared serial proxy, same as any
+        other move) and sets _abort_sequence, so the sequence stops there
+        instead of continuing to the next axis.
+        """
+        if self.scanner is None:
+            return
+        self._abort_sequence.clear()
+        self.busy.emit(True)
+        try:
+            for axis, target in axis_targets:
+                if self._abort_sequence.is_set():
+                    break
+                self.scanner.moveAxis(axis, target)
+                self.moved.emit(self.scanner.getCoords())
+                if self._abort_sequence.is_set():
+                    break
+        finally:
+            self.busy.emit(False)
+
     # -- session: limits / zero / set-value / speeds -----------------------
     def _do_set_limits(self, limits_dict):
         if self.scanner is None:
@@ -360,9 +439,9 @@ class ScannerPanel(QWidget):
         beam = self._session.get('beam_axis', 'Y')
         self._role_axis = role_axis_map(beam)
         self._pe_side = self._session.get('pe_side', 'origin')
-        self._limits = {ax: float(self._session.get('limits', {}).get(ax, DEFAULT_LIMITS_MM[ax]))
+        self._limits = {ax: float(self._session.get('limits', {}).get(ax, SESSION_DEFAULT_LIMITS_MM[ax]))
                          for ax in AXES}
-        self._steps = {ax: float(self._session.get('steps', {}).get(ax, 5.0 if ax == 'R' else 1.0))
+        self._steps = {ax: float(self._session.get('steps', {}).get(ax, R_STEP_UNIT if ax == 'R' else 1.0))
                         for ax in AXES}
         self._speeds = {ax: int(self._session.get('speeds', {}).get(ax, 100))
                          for ax in AXES}
@@ -499,10 +578,21 @@ class ScannerPanel(QWidget):
         self._session_widgets += [self._cmb_beam_axis, self._cmb_pe_side]
 
         grid = QGridLayout()
-        headers = ['Axis', 'Limit', '', 'Step', 'Speed', '', 'Zero', '=N', '']
-        for c, text in enumerate(headers):
-            if text:
-                grid.addWidget(QLabel(f'<b>{text}</b>'), 0, c)
+        # Column layout (see the per-role loop below): 0 axis name, 1 limit
+        # edit, 2 apply-limit button, 3 step edit, 4 speed edit, 5 zero
+        # button, 6-7 set-value edit + '=N' button (merged header, spanning
+        # both, since they act together). Placed explicitly, column by
+        # column, rather than via a flat list that is easy to get out of
+        # sync with the widgets below (that was the phase-1 bug: 'Zero' and
+        # '=N' ended up shifted one column to the right).
+        grid.addWidget(QLabel('<b>Axis</b>'), 0, 0)
+        grid.addWidget(QLabel('<b>Limit</b>'), 0, 1)
+        grid.addWidget(QLabel('<b>Step (mm / °)</b>'), 0, 3)
+        grid.addWidget(QLabel('<b>Speed</b>'), 0, 4)
+        grid.addWidget(QLabel('<b>Zero</b>'), 0, 5)
+        lbl_setvalue_header = QLabel('<b>Set value</b>')
+        lbl_setvalue_header.setAlignment(Qt.AlignCenter)
+        grid.addWidget(lbl_setvalue_header, 0, 6, 1, 2)
 
         self._edit_limit = {}
         self._edit_step = {}
@@ -524,6 +614,8 @@ class ScannerPanel(QWidget):
             edit_step = QLineEdit()
             edit_step.setFixedWidth(60)
             self._edit_step[role] = edit_step
+            if role == 'R':  # role 'R' always maps to axis 'R', fix 1
+                edit_step.editingFinished.connect(self._on_r_step_edited)
             grid.addWidget(edit_step, r, 3)
 
             edit_speed = QLineEdit()
@@ -618,6 +710,13 @@ class ScannerPanel(QWidget):
             self._movement_widgets += [btn_minus, btn_plus, edit_goto, btn_goto]
         layout.addLayout(grid)
 
+        # Fix 5: fixed physical-axis order (R, Z, X, Y), regardless of which
+        # axis is currently mapped to "beam".
+        btn_goto_origin = QPushButton('Go to origin (R, Z, X, Y)')
+        btn_goto_origin.clicked.connect(self._on_goto_origin_clicked)
+        layout.addWidget(btn_goto_origin)
+        self._movement_widgets.append(btn_goto_origin)
+
         note = QLabel('SN (unlimitedDiffMove) is never used. Every target is checked '
                        'against the limits before it is sent.')
         note.setWordWrap(True)
@@ -693,6 +792,9 @@ class ScannerPanel(QWidget):
         except Exception as e:
             self._lbl_result.setText(f'STOP: error writing to the port: {e}')
             return
+        # Fix 5: also aborts a "Go to origin" sequence, if one is running,
+        # instead of letting it continue with the next axis.
+        self._worker.request_sequence_abort()
         self._lbl_result.setText('STOP sent.')
         self._worker.enqueue(('read_status',))
 
@@ -733,20 +835,25 @@ class ScannerPanel(QWidget):
 
     def _run_post_connect_checks(self):
         is_default = all(
-            abs(self._limits[ax] - DEFAULT_LIMITS_MM[ax]) <= DEFAULT_LIMITS_TOL[ax]
+            abs(self._limits[ax] - HARDWARE_RESET_LIMITS_MM[ax]) <= HARDWARE_RESET_LIMITS_TOL[ax]
             for ax in AXES
         )
         if is_default:
+            # Falls back to SESSION_DEFAULT_LIMITS_MM (R = 360 deg, not the
+            # firmware's 18000) axis by axis, so this still makes sense even
+            # when there is no saved session at all (fixes task point 3).
+            session_limits = self._session.get('limits', {})
+            to_send = {ax: float(session_limits.get(ax, SESSION_DEFAULT_LIMITS_MM[ax])) for ax in AXES}
+            proposal = (f'{to_send["X"]:g}/{to_send["Y"]:g}/{to_send["Z"]:g} mm, '
+                        f'{to_send["R"]:g}°')
             resend = QMessageBox.question(
                 self, 'Scanner',
                 'All four limits are at the factory default (10000 steps). '
                 'The controller may have been reset by a power cut.\n\n'
-                'Resend the limits from the saved session?',
+                f'Apply these limits now (X/Y/Z, R): {proposal}?',
                 QMessageBox.Yes | QMessageBox.No,
             )
             if resend == QMessageBox.Yes:
-                session_limits = self._session.get('limits', {})
-                to_send = {ax: float(session_limits.get(ax, DEFAULT_LIMITS_MM[ax])) for ax in AXES}
                 self._worker.enqueue(('set_limits', to_send))
         QMessageBox.information(
             self, 'Scanner',
@@ -828,6 +935,20 @@ class ScannerPanel(QWidget):
             return False
         return True
 
+    def _on_r_step_edited(self):
+        """Fix 1: the R step field only accepts multiples of R_STEP_UNIT
+        (min. one unit); round it as soon as the user leaves the field."""
+        edit = self._edit_step['R']
+        value = self._read_float(edit, None)
+        if value is None:
+            return
+        rounded = round_r_step(value)
+        edit.setText(f'{rounded:g}')
+        if abs(rounded - value) > 1e-6:
+            self._lbl_result.setText(
+                f'R step rounded to {rounded:g}° (multiple of {R_STEP_UNIT:g}°).'
+            )
+
     def _make_step_handler(self, role, sign):
         def handler():
             axis = self._role_axis[role]
@@ -835,6 +956,14 @@ class ScannerPanel(QWidget):
             if step is None:
                 QMessageBox.warning(self, 'Scanner', 'Invalid step value.')
                 return
+            if axis == 'R':
+                rounded_step = round_r_step(step)
+                if abs(rounded_step - step) > 1e-6:
+                    self._edit_step[role].setText(f'{rounded_step:g}')
+                    self._lbl_result.setText(
+                        f'R step rounded to {rounded_step:g}° (multiple of {R_STEP_UNIT:g}°).'
+                    )
+                step = rounded_step
             current = self._coords.get(axis, 0.0)
             target = round(current + sign * step, 4)
             if not self._validate_target(axis, target):
@@ -849,10 +978,53 @@ class ScannerPanel(QWidget):
             if target is None:
                 QMessageBox.warning(self, 'Scanner', 'Invalid target value.')
                 return
+            if axis == 'R':
+                rounded_target = round_r_target(target)
+                if abs(rounded_target - target) > 1e-6:
+                    self._edit_goto[role].setText(f'{rounded_target:g}')
+                    self._lbl_result.setText(
+                        f'R target rounded to {rounded_target:g}° (multiple of {R_STEP_UNIT:g}°).'
+                    )
+                target = rounded_target
             if not self._validate_target(axis, target):
                 return
             self._worker.enqueue(('move_axis', axis, target))
         return handler
+
+    def _on_goto_origin_clicked(self):
+        """
+        Fix 5: moves every axis that is not already at 0 to 0, one axis at a
+        time, in the fixed physical order R, Z, X, Y (never reordered by
+        which axis is currently "beam"). Confirms first, showing that order
+        and each axis' current -> final position. Goes through the worker's
+        move_sequence command, exactly like any other move, so STOP (which
+        also calls ScannerWorker.request_sequence_abort) stops the sequence
+        after whichever axis is interrupted instead of moving on.
+        """
+        pending = [(ax, self._coords.get(ax, 0.0)) for ax in GO_TO_ORIGIN_AXIS_ORDER
+                   if abs(self._coords.get(ax, 0.0)) > 1e-9]
+        if not pending:
+            self._lbl_result.setText('All axes are already at 0.')
+            return
+
+        axis_targets = []
+        for ax, _cur in pending:
+            if not self._validate_target(ax, 0.0):
+                return
+            axis_targets.append((ax, 0.0))
+
+        order_text = ' -> '.join(ax for ax, _ in pending)
+        lines = '\n'.join(
+            f'  {ax}: {fmt_pos(ax, cur)} -> {fmt_pos(ax, 0.0)}' for ax, cur in pending
+        )
+        resp = QMessageBox.question(
+            self, 'Scanner',
+            f'Move to origin in this order: {order_text}\n\n{lines}\n\nProceed?',
+            QMessageBox.Yes | QMessageBox.No,
+        )
+        if resp != QMessageBox.Yes:
+            return
+        self._worker.enqueue(('move_sequence', axis_targets))
 
     # =======================================================================
     #  Session handlers (spec 5.2)
@@ -883,6 +1055,14 @@ class ScannerPanel(QWidget):
             if value is None:
                 QMessageBox.warning(self, 'Scanner', 'Invalid value.')
                 return
+            if axis == 'R':
+                rounded_value = round_r_target(value)
+                if abs(rounded_value - value) > 1e-6:
+                    self._edit_setvalue[role].setText(f'{rounded_value:g}')
+                    self._lbl_result.setText(
+                        f'R value rounded to {rounded_value:g}° (multiple of {R_STEP_UNIT:g}°).'
+                    )
+                value = rounded_value
             if not self._validate_target(axis, value):
                 return
             self._worker.enqueue(('set_value', axis, value))
@@ -919,8 +1099,8 @@ class ScannerPanel(QWidget):
         self._cmb_pe_side.setCurrentIndex(0 if self._pe_side == 'origin' else 1)
         self._cmb_pe_side.blockSignals(False)
 
-        self._limits = {ax: float(d.get('limits', {}).get(ax, DEFAULT_LIMITS_MM[ax])) for ax in AXES}
-        self._steps = {ax: float(d.get('steps', {}).get(ax, 5.0 if ax == 'R' else 1.0)) for ax in AXES}
+        self._limits = {ax: float(d.get('limits', {}).get(ax, SESSION_DEFAULT_LIMITS_MM[ax])) for ax in AXES}
+        self._steps = {ax: float(d.get('steps', {}).get(ax, R_STEP_UNIT if ax == 'R' else 1.0)) for ax in AXES}
         self._speeds = {ax: int(d.get('speeds', {}).get(ax, 100)) for ax in AXES}
 
         self._refresh_role_label_texts()
