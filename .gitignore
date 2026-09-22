@@ -45,3 +45,6 @@ analysis/catalog.xlsx
 ~$*
 
 .venv32/
+
+# Scanner session (per-machine: port, session limits/steps/speeds)
+hardware/scanner/scanner_session.json
