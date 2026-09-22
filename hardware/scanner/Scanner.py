@@ -13,10 +13,11 @@ import decimal
 #%%
 class Scanner():
     '''Class for the control of the scanner via serial comm.'''
-    def __init__(self, port='COM4', baudrate=19200, timeout=0.1, move_timeout=120):
-        
-        # Open Serial communication
-        self.ser = serial.Serial(port, baudrate, timeout=timeout)
+    def __init__(self, port='COM4', baudrate=19200, timeout=0.1, move_timeout=120, ser=None):
+
+        # ADD (2026-09): allow injecting an existing serial-like object (e.g. FakeSerial for
+        # testing without hardware) instead of always opening a real serial.Serial port.
+        self.ser = ser if ser is not None else serial.Serial(port, baudrate, timeout=timeout)
         self.port = port
         # FIX (2026-09): max time (s) to wait for the response of a blocking command (see write).
         self.move_timeout = move_timeout
