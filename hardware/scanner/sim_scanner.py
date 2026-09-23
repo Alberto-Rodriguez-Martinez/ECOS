@@ -23,10 +23,10 @@ AXES = ('X', 'Y', 'Z', 'R')
 # every axis limit to 10000 steps (100/100/50 mm, 18000 deg).
 DEFAULT_LIMIT_STEPS = 10000
 
-# ASSUMPTION (not verified on hardware): commands the firmware rejects reply
-# with something that does NOT start with b'OK'. We use 'ER' + axis + 6 zero
-# digits + CR, matching the general 10-byte reply shape ('OK'/'ER' + axis +
-# 6 digits + '\r'), but the real reject payload has never been observed.
+# Verified on hardware (23/09/2026, check_negative.py): a rejected command
+# (SD out of [0, limit]) replies with 'ER' + axis + 6 zero digits + CR, e.g.
+# SDX-10 from position 0 -> b'ERX000000\r'. That is the same 10-byte reply
+# shape as 'OK' ('OK'/'ER' + axis + 6 digits + '\r').
 REJECT_PREFIX = 'ER'
 
 # ASSUMPTION (not verified on hardware): step speed is proportional to the
@@ -190,6 +190,11 @@ class FakeSerial:
             axis.pos = int(rest)
             return self._ok(ax, axis.pos), 0.0
         if op == 'SW':                       # set direction
+            # Verified (23/09/2026): SW only affects absolute moves (SM); it
+            # has no effect on relative moves (SD/SN), whose direction is
+            # given by the sign of the value. Relative moves below never
+            # consult axis.direction, so its effect on SM does not need
+            # simulating for the relative-move tests this module targets.
             axis.direction = rest
             return self._ok(ax, axis.pos), 0.0
         if op == 'ST':                       # set speed type
@@ -216,9 +221,14 @@ class FakeSerial:
     def _do_move_locked(self, op, ax, param):
         axis = self._axes[ax]
         if op == 'SN':
-            # Verified: SN ignores limits entirely.
+            # Verified (23/09/2026): SN accepts a signed param (the sign sets
+            # the direction) and ignores limits entirely, so target can go
+            # negative.
             target = axis.pos + param
         elif op == 'SD':
+            # Verified (23/09/2026): SD accepts a signed param (the sign sets
+            # the direction) and rejects with ER if the destination falls
+            # outside [0, limit].
             target = axis.pos + param
             if target < 0 or target > axis.limit:
                 return self._reject(ax), 0.0
@@ -263,6 +273,10 @@ class FakeSerial:
 
     @staticmethod
     def _ok(ax, value):
+        # Verified (23/09/2026): a negative position replies with the sign in
+        # place of the first digit, still 6 characters total, e.g. -10 ->
+        # '-00010' -> b'OKX-00010\r' (10 bytes). Python's ':06d' already
+        # formats a negative int that way, so no special-casing is needed.
         return f'OK{ax}{int(value):06d}\r'.encode('utf-8')
 
     @staticmethod

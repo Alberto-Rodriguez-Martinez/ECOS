@@ -120,6 +120,42 @@ class TestPowerCycle(unittest.TestCase):
         self.assertEqual(sc.X, 10.0)  # position is conserved
 
 
+class TestSignedRelativeMoves(unittest.TestCase):
+    """SD/SN signed relative moves and negative-position replies, verified on
+    hardware 23/09/2026 (see task_scanner_freemode.md section 0)."""
+
+    def test_SD_negative_within_range_moves(self):
+        sc, _fs = make_scanner()
+        sc.moveX(5)
+        sc.diffMoveX(-2)
+        self.assertEqual(sc.X, 3.0)
+
+    def test_SD_negative_out_of_range_is_rejected(self):
+        sc, _fs = make_scanner()
+        sc.moveX(0)
+        sc.diffMoveX(-1)  # would take X to -1, outside [0, limit]
+        self.assertEqual(sc.X, 0.0)
+
+    def test_SN_negative_reaches_negative_position_SCX_10_bytes(self):
+        sc, fs = make_scanner()
+        sc.moveX(0)
+        sc.unlimitedDiffMoveX(-0.1)  # 1 step, uStepX=0.01mm -> -10 steps
+
+        # Raw SCX reply: sign in place of the first digit, still 10 bytes.
+        fs.write(b'SCX\r')
+        raw = fs.read(10)
+        self.assertEqual(len(raw), 10)
+        self.assertEqual(raw, b'OKX-00010\r')
+
+    def test_read_negative_position_via_Scanner_X(self):
+        sc, _fs = make_scanner()
+        sc.moveX(0)
+        sc.unlimitedDiffMoveX(-0.1)
+        # Scanner.X does float(r[3:]) on the raw reply; must parse the sign
+        # correctly instead of raising ValueError.
+        self.assertEqual(sc.X, -0.1)
+
+
 class TestValue2uSteps(unittest.TestCase):
 
     def test_value2uSteps_rounding(self):
