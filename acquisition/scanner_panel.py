@@ -4,11 +4,14 @@ scanner_panel.py — Standalone panel for the XYZR scanner (SE SC-03-00), phase 
 ECOS project - Universidad Miguel Hernandez - Dpto. Ingenieria de Comunicaciones
 
 Phase 1 scope only (see task_scanner_phase1.md, scanner_tab_spec.md sections
-1-3, 5.1-5.3, 6, and later fixes in task_scanner_phase1_fixes.md and
-task_scanner_jog.md): worker thread + command queue, status, session (beam
-axis, PE side, limits, speed), manual movement (per-axis jog + Go/Go to
-origin) and STOP. NOT wired into ecos_gui.py (that is phase 2) and no
-focus/flatness/scan tools yet.
+1-3, 5.1-5.3, 6, later fixes in task_scanner_phase1_fixes.md and
+task_scanner_jog.md, and task_scanner_freemode.md for the free-movement mode
+and the port-list wording): worker thread + command queue, status, session
+(beam axis, PE side, limits, speed), manual movement (per-axis jog + Go/Go to
+origin), free-movement mode (unlimited signed jog, no GUI/firmware limit
+protection) and STOP. NOT wired into ecos_gui.py (that is phase 2) and no
+focus/flatness/scan tools yet (task_scanner_freemode.md point 4: those must
+gate on ScannerPanel.is_free_movement_active() once they exist).
 
 Run standalone:
     python acquisition/scanner_panel.py          (real hardware)
@@ -34,7 +37,7 @@ sys.path.insert(0, _HW_SCANNER_DIR)
 import serial
 import serial.tools.list_ports
 
-from PyQt5.QtCore import QThread, pyqtSignal
+from PyQt5.QtCore import Qt, QThread, pyqtSignal
 from PyQt5.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
     QGroupBox, QLabel, QLineEdit, QComboBox, QPushButton, QMessageBox,
@@ -58,8 +61,11 @@ IDENTITY_READ_TIMEOUT = 1.0  # s, generous upper bound while polling for the rep
 SIM_PORT_LABEL = 'Simulator'
 
 SESSION_FILE = os.path.join(_HW_SCANNER_DIR, 'scanner_session.json')
-# Read-only lookup, so the Arduino PT100's port can be marked (never preselected)
-# in the port list without hard-coding a COM number anywhere (spec 5.1).
+# Read-only lookup. This is another app's last-used port for its own (Arduino
+# PT100) device, kept only as a hint that a serial device other than the
+# scanner may be present there — COM numbers can be reassigned by Windows, so
+# this is never treated as proof of what is actually on that port today (task
+# task_scanner_freemode.md point 3). Never used to preselect a port.
 _ECOS_GUI_SESSION_FILE = os.path.join(_THIS_DIR, 'ecos_gui_session.json')
 
 AXES = ('X', 'Y', 'Z', 'R')
@@ -222,6 +228,8 @@ class ScannerWorker(QThread):
             self._emit_limits()
         elif op == 'move_axis':
             self._do_move_axis(*cmd[1:])
+        elif op == 'jog_unlimited':
+            self._do_jog_unlimited(*cmd[1:])
         elif op == 'move_sequence':
             self._do_move_sequence(cmd[1])
         elif op == 'set_limits':
@@ -322,6 +330,24 @@ class ScannerWorker(QThread):
         self.busy.emit(True)
         try:
             self.scanner.moveAxis(axis, value)
+            self.moved.emit(self.scanner.getCoords())
+        finally:
+            self.busy.emit(False)
+
+    def _do_jog_unlimited(self, axis, value):
+        """
+        Free-movement mode (task_scanner_freemode.md point 4): unlimited
+        signed relative move (SN / unlimitedDiffMoveAxis). The sign of
+        `value` sets the direction (verified on hardware 23/09/2026); the
+        firmware's own limit protection is bypassed, so this can take the
+        axis negative. The panel only sends this while free-movement mode is
+        active (see ScannerPanel._make_jog_handler).
+        """
+        if self.scanner is None:
+            return
+        self.busy.emit(True)
+        try:
+            self.scanner.unlimitedDiffMoveAxis(axis, value)
             self.moved.emit(self.scanner.getCoords())
         finally:
             self.busy.emit(False)
@@ -427,7 +453,24 @@ class ScannerPanel(QWidget):
                          for ax in AXES}
 
         self._movement_widgets = []
+        # Subset of movement controls that only make sense as absolute
+        # targets (Move to / Go to origin): disabled in free-movement mode
+        # on top of the normal connected/busy gating (see _update_enabled_state).
+        self._goto_widgets = []
         self._session_widgets = []
+
+        # Free-movement mode (task_scanner_freemode.md point 4): off by
+        # default, never persisted to the session file, forced off on
+        # disconnect (see _on_disconnected). is_free_movement_active() is the
+        # single point later phases (focus, flatness, scans) must check
+        # before starting.
+        self._free_movement = False
+
+        # Port list: which port (if any) has actually had its scanner
+        # identity verified this run (see _on_connected), and which port a
+        # connect attempt is currently in flight for (see _on_connect_clicked).
+        self._verified_scanner_port = None
+        self._pending_connect_port = None
 
         self._port_lock = threading.Lock()
         self._worker = ScannerWorker(self._port_lock)
@@ -455,6 +498,18 @@ class ScannerPanel(QWidget):
     def _build_ui(self):
         outer = QVBoxLayout(self)
         outer.setContentsMargins(4, 4, 4, 4)
+
+        # Free-movement banner: kept outside the scroll area, so it stays
+        # visible ("bien visible en el panel") no matter where the user has
+        # scrolled to (task_scanner_freemode.md point 4).
+        self._lbl_free_banner = QLabel('MOVIMIENTO LIBRE — sin protección de límites')
+        self._lbl_free_banner.setAlignment(Qt.AlignCenter)
+        self._lbl_free_banner.setStyleSheet(
+            'background-color: #b00020; color: white; font-weight: bold; '
+            'font-size: 13px; padding: 6px;'
+        )
+        self._lbl_free_banner.setVisible(False)
+        outer.addWidget(self._lbl_free_banner)
 
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
@@ -637,6 +692,15 @@ class ScannerPanel(QWidget):
         group = QGroupBox('Manual movement')
         layout = QVBoxLayout(group)
 
+        # Free-movement mode toggle (task_scanner_freemode.md point 4):
+        # replaces the removed "=N" maneuver for setting zero/limits. See
+        # _on_free_movement_toggled for the confirm/deactivate dialogs.
+        self._btn_free_movement = QPushButton('Movimiento libre (sin límites)')
+        self._btn_free_movement.setCheckable(True)
+        self._btn_free_movement.toggled.connect(self._on_free_movement_toggled)
+        layout.addWidget(self._btn_free_movement)
+        self._movement_widgets.append(self._btn_free_movement)
+
         grid = QGridLayout()
         # Column layout: 0 axis name, 1 jog edit, 2 minus, 3 plus, 4 move-to
         # edit, 5 go button. Every widget gets a fixed width (including Go,
@@ -681,7 +745,10 @@ class ScannerPanel(QWidget):
             btn_goto.clicked.connect(self._make_goto_handler(role))
             grid.addWidget(btn_goto, r, 5)
 
-            self._movement_widgets += [edit_jog, btn_minus, btn_plus, edit_goto, btn_goto]
+            self._movement_widgets += [edit_jog, btn_minus, btn_plus]
+            # 'Move to' is an absolute target: disabled in free-movement mode
+            # (the firmware does not accept negative absolute destinations).
+            self._goto_widgets += [edit_goto, btn_goto]
         layout.addLayout(grid)
 
         # Fix 5: fixed physical-axis order (R, Z, X, Y), regardless of which
@@ -689,10 +756,14 @@ class ScannerPanel(QWidget):
         btn_goto_origin = QPushButton('Go to origin (R, Z, X, Y)')
         btn_goto_origin.clicked.connect(self._on_goto_origin_clicked)
         layout.addWidget(btn_goto_origin)
-        self._movement_widgets.append(btn_goto_origin)
+        # Also absolute: same restriction as 'Move to' in free-movement mode.
+        self._goto_widgets.append(btn_goto_origin)
 
-        note = QLabel('SN (unlimitedDiffMove) is never used. Every target is checked '
-                       'against the limits before it is sent.')
+        note = QLabel(
+            "SN (unlimitedDiffMoveAxis) is only used by the jog -/+ buttons "
+            "while free-movement mode is active; every other move is "
+            "checked against the limits before it is sent."
+        )
         note.setWordWrap(True)
         note.setStyleSheet('color: gray; font-size: 10px;')
         layout.addWidget(note)
@@ -708,15 +779,21 @@ class ScannerPanel(QWidget):
         if self._use_sim:
             self._cmb_port.addItem(SIM_PORT_LABEL, SIM_PORT_LABEL)
         else:
-            arduino_port = self._read_arduino_port()
+            other_device_hint_port = self._read_arduino_port()
             ports = sorted(serial.tools.list_ports.comports(), key=lambda p: p.device)
             for p in ports:
+                # Only the system description identifies the port; we do not
+                # claim to know which physical device is on it. The hint
+                # below is a generic "heads up", never an identity claim, and
+                # it does not appear for a port already verified to be the
+                # scanner (task_scanner_freemode.md point 3).
                 label = f'{p.device} — {p.description}'
-                if arduino_port and p.device == arduino_port:
-                    label += '  [Arduino PT100 — not the scanner]'
+                if (other_device_hint_port and p.device == other_device_hint_port
+                        and p.device != self._verified_scanner_port):
+                    label += '  [other serial devices may be present]'
                 self._cmb_port.addItem(label, p.device)
             last_port = self._session.get('last_port', '')
-            if last_port and last_port != arduino_port:
+            if last_port and last_port != other_device_hint_port:
                 idx = self._cmb_port.findData(last_port)
                 if idx >= 0:
                     self._cmb_port.setCurrentIndex(idx)
@@ -743,6 +820,7 @@ class ScannerPanel(QWidget):
             if not port_name:
                 QMessageBox.warning(self, 'Scanner', 'Select a serial port first.')
                 return
+        self._pending_connect_port = port_name
         self._lbl_result.setText(f'Connecting to {port_name}...')
         self._worker.enqueue(('connect', port_name, is_sim))
 
@@ -777,6 +855,12 @@ class ScannerPanel(QWidget):
         self._connected = True
         self._awaiting_ack = True
         self._pending_post_connect_check = True
+        if not self._use_sim and self._pending_connect_port:
+            # ScannerWorker._do_connect only got here after the SCX identity
+            # check passed, so this port is now confirmed to be the scanner:
+            # drop any "other serial devices" hint it may have had.
+            self._verified_scanner_port = self._pending_connect_port
+            self._populate_ports()
         self._lbl_result.setText(msg)
         self._update_enabled_state()
 
@@ -787,6 +871,10 @@ class ScannerPanel(QWidget):
         self._coords = {ax: 0.0 for ax in AXES}
         self._refresh_position_labels()
         self._lbl_result.setText('Disconnected.')
+        if self._free_movement:
+            # task_scanner_freemode.md point 4: never persists across a
+            # disconnect; reconnecting always starts with it off.
+            self._deactivate_free_movement()
         self._update_enabled_state()
 
     def _on_moved(self, coords_tuple):
@@ -946,6 +1034,12 @@ class ScannerPanel(QWidget):
                         f'R jog rounded to {rounded_jog:g}° (multiple of {R_STEP_UNIT:g}°).'
                     )
                 jog = rounded_jog
+            if self._free_movement:
+                # task_scanner_freemode.md point 4: signed unlimited relative
+                # move (SN), GUI limit check skipped — the firmware's own
+                # protection is bypassed too.
+                self._worker.enqueue(('jog_unlimited', axis, sign * jog))
+                return
             current = self._coords.get(axis, 0.0)
             target = round(current + sign * jog, 4)
             if not self._validate_target(axis, target):
@@ -1007,6 +1101,105 @@ class ScannerPanel(QWidget):
         if resp != QMessageBox.Yes:
             return
         self._worker.enqueue(('move_sequence', axis_targets))
+
+    # =======================================================================
+    #  Free-movement mode (task_scanner_freemode.md point 4)
+    # =======================================================================
+    def is_free_movement_active(self):
+        """
+        Single point to check whether free-movement mode is active. Later
+        phases (focus, flatness, scans) must gate on this before starting,
+        per task_scanner_freemode.md point 4 ("Deja el punto único donde
+        comprobarlo").
+        """
+        return self._free_movement
+
+    def _axes_out_of_range(self):
+        """Axes whose current GUI position falls outside [0, limit]."""
+        return [
+            ax for ax in AXES
+            if self._coords.get(ax, 0.0) < -1e-9
+            or self._coords.get(ax, 0.0) > self._limits.get(ax, 0.0) + 1e-9
+        ]
+
+    def _on_free_movement_toggled(self, checked):
+        if checked:
+            box = QMessageBox(self)
+            box.setWindowTitle('Movimiento libre')
+            box.setIcon(QMessageBox.Warning)
+            box.setText(
+                'El firmware deja de proteger el recorrido: los botones -/+ '
+                'moverán el eje aunque se salga de [0, límite] o pase a ser '
+                'negativo.\n\n'
+                'La responsabilidad de evitar colisiones (con los '
+                'transductores u otros elementos) pasa a ser del usuario.\n\n'
+                '¿Activar el movimiento libre?'
+            )
+            btn_activate = box.addButton('Activar', QMessageBox.AcceptRole)
+            box.addButton('Cancelar', QMessageBox.RejectRole)
+            box.setDefaultButton(btn_activate)
+            box.exec_()
+            if box.clickedButton() is btn_activate:
+                self._free_movement = True
+                self._lbl_free_banner.setVisible(True)
+                self._lbl_result.setText('Movimiento libre activado: sin protección de límites.')
+                self._update_enabled_state()
+            else:
+                self._btn_free_movement.blockSignals(True)
+                self._btn_free_movement.setChecked(False)
+                self._btn_free_movement.blockSignals(False)
+            return
+
+        # Turning it off.
+        out_of_range = self._axes_out_of_range()
+        if not out_of_range:
+            self._deactivate_free_movement()
+            return
+
+        lines = '\n'.join(
+            f'  {ax}: {fmt_pos(ax, self._coords.get(ax, 0.0))} '
+            f'(límite {fmt_pos(ax, self._limits.get(ax, 0.0))})'
+            for ax in out_of_range
+        )
+        box = QMessageBox(self)
+        box.setWindowTitle('Movimiento libre — ejes fuera de rango')
+        box.setIcon(QMessageBox.Warning)
+        box.setText(
+            f'Estos ejes están fuera de su rango [0, límite]:\n\n{lines}\n\n'
+            '· Fijar cero aquí: pone a cero SOLO estos ejes fuera de rango '
+            '(los demás no se tocan).\n'
+            '· Mantener posición: desactiva el modo libre sin mover nada; '
+            'los destinos absolutos (Move to / Go to origin) fallarán en '
+            'estos ejes hasta que se corrija.\n'
+            '· Seguir en modo libre: cancela la desactivación.'
+        )
+        btn_zero = box.addButton('Fijar cero aquí', QMessageBox.AcceptRole)
+        btn_keep = box.addButton('Mantener posición', QMessageBox.DestructiveRole)
+        btn_stay = box.addButton('Seguir en modo libre', QMessageBox.RejectRole)
+        box.setDefaultButton(btn_stay)
+        box.exec_()
+        clicked = box.clickedButton()
+        if clicked is btn_zero:
+            self._worker.enqueue(('set_zero', out_of_range))
+            self._deactivate_free_movement()
+        elif clicked is btn_keep:
+            self._deactivate_free_movement()
+            self._lbl_result.setText(
+                'Movimiento libre desactivado con posiciones fuera de rango: '
+                'los destinos absolutos fallarán hasta corregirlo.'
+            )
+        else:  # Seguir en modo libre: cancel, keep it on.
+            self._btn_free_movement.blockSignals(True)
+            self._btn_free_movement.setChecked(True)
+            self._btn_free_movement.blockSignals(False)
+
+    def _deactivate_free_movement(self):
+        self._free_movement = False
+        self._lbl_free_banner.setVisible(False)
+        self._btn_free_movement.blockSignals(True)
+        self._btn_free_movement.setChecked(False)
+        self._btn_free_movement.blockSignals(False)
+        self._update_enabled_state()
 
     # =======================================================================
     #  Session handlers (spec 5.2)
@@ -1114,6 +1307,11 @@ class ScannerPanel(QWidget):
 
         for w in self._movement_widgets:
             w.setEnabled(can_move)
+        # Absolute-target controls: also disabled in free-movement mode,
+        # since the firmware rejects negative absolute destinations
+        # (task_scanner_freemode.md point 4).
+        for w in self._goto_widgets:
+            w.setEnabled(can_move and not self._free_movement)
         for w in self._session_widgets:
             w.setEnabled(can_use_session)
 
