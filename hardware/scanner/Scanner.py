@@ -567,10 +567,11 @@ class Scanner():
     # ======= DIFFERENTIAL MOVEMENT =======
     def diffMoveX(self, value):
         '''
-        Move the X axis by the specified value in the current direction. If the
-        current coordinate plus this value is greater than the current XLimit 
-        or is less than zero, the scanner does not move and a warning is 
-        printed.
+        Move the X axis by the specified value. The sign of the value
+        determines the direction of movement (verified on hardware,
+        23/09/2026). If the current coordinate plus this value is greater
+        than the current XLimit or is less than zero, the scanner does not
+        move (rejected with 'ER') and a warning is printed.
 
         Parameters
         ----------
@@ -592,10 +593,11 @@ class Scanner():
     
     def diffMoveY(self, value):
         '''
-        Move the Y axis by the specified value in the current direction. If the
-        current coordinate plus this value is greater than the current YLimit 
-        or is less than zero, the scanner does not move and a warning is 
-        printed.
+        Move the Y axis by the specified value. The sign of the value
+        determines the direction of movement (verified on hardware,
+        23/09/2026). If the current coordinate plus this value is greater
+        than the current YLimit or is less than zero, the scanner does not
+        move (rejected with 'ER') and a warning is printed.
 
         Parameters
         ----------
@@ -617,10 +619,11 @@ class Scanner():
     
     def diffMoveZ(self, value):
         '''
-        Move the Z axis by the specified value in the current direction. If the
-        current coordinate plus this value is greater than the current ZLimit 
-        or is less than zero, the scanner does not move and a warning is 
-        printed.
+        Move the Z axis by the specified value. The sign of the value
+        determines the direction of movement (verified on hardware,
+        23/09/2026). If the current coordinate plus this value is greater
+        than the current ZLimit or is less than zero, the scanner does not
+        move (rejected with 'ER') and a warning is printed.
 
         Parameters
         ----------
@@ -642,10 +645,11 @@ class Scanner():
     
     def diffMoveR(self, value):
         '''
-        Move the R axis by the specified value in the current direction. If the
-        current coordinate plus this value is greater than the current RLimit 
-        or is less than zero, the scanner does not move and a warning is 
-        printed.
+        Move the R axis by the specified value. The sign of the value
+        determines the direction of movement (verified on hardware,
+        23/09/2026). If the current coordinate plus this value is greater
+        than the current RLimit or is less than zero, the scanner does not
+        move (rejected with 'ER') and a warning is printed.
 
         Parameters
         ----------
@@ -667,10 +671,12 @@ class Scanner():
     
     def diffMove(self, Xvalue, Yvalue, Zvalue, Rvalue):
         '''
-        Move every axis by the specified value in their current direction. If
-        any of the current coordinates plus this value is greater than the
-        current corresponding limit or is less than zero, the scanner does not
-        move in that axis and a warning is printed.
+        Move every axis by the specified value. The sign of each value
+        determines the direction of movement (verified on hardware,
+        23/09/2026). If any of the current coordinates plus this value is
+        greater than the current corresponding limit or is less than zero,
+        the scanner does not move in that axis (rejected with 'ER') and a
+        warning is printed.
 
         Parameters
         ----------
@@ -696,10 +702,11 @@ class Scanner():
     
     def diffMoveAxis(self, axis, value):
         '''
-        Move the axis by the specified value in the current direction. If the
-        current coordinate plus this value is greater than the current axis
-        limit or is less than zero, the scanner does not move and a warning is 
-        printed.
+        Move the axis by the specified value. The sign of the value
+        determines the direction of movement (verified on hardware,
+        23/09/2026). If the current coordinate plus this value is greater
+        than the current axis limit or is less than zero, the scanner does
+        not move (rejected with 'ER') and a warning is printed.
 
         Parameters
         ----------
@@ -731,9 +738,11 @@ class Scanner():
     # ======= UNLIMITED DIFFERENTIAL MOVEMENT =======
     def unlimitedDiffMoveX(self, value):
         '''
-        Move the X axis by the specified value in the current direction. 
-        Ignores the current XLimit.
-        
+        Move the X axis by the specified value. The sign of the value
+        determines the direction of movement (verified on hardware,
+        23/09/2026). Ignores the current XLimit, so negative positions are
+        possible.
+
         Parameters
         ----------
         value : float
@@ -754,9 +763,11 @@ class Scanner():
     
     def unlimitedDiffMoveY(self, value):
         '''
-        Move the Y axis by the specified value in the current direction. 
-        Ignores the current YLimit.
-        
+        Move the Y axis by the specified value. The sign of the value
+        determines the direction of movement (verified on hardware,
+        23/09/2026). Ignores the current YLimit, so negative positions are
+        possible.
+
         Parameters
         ----------
         value : float
@@ -777,9 +788,11 @@ class Scanner():
     
     def unlimitedDiffMoveZ(self, value):
         '''
-        Move the Z axis by the specified value in the current direction. 
-        Ignores the current ZLimit.
-        
+        Move the Z axis by the specified value. The sign of the value
+        determines the direction of movement (verified on hardware,
+        23/09/2026). Ignores the current ZLimit, so negative positions are
+        possible.
+
         Parameters
         ----------
         value : float
@@ -800,9 +813,11 @@ class Scanner():
     
     def unlimitedDiffMoveR(self, value):
         '''
-        Move the R axis by the specified value in the current direction. 
-        Ignores the current RLimit.
-        
+        Move the R axis by the specified value. The sign of the value
+        determines the direction of movement (verified on hardware,
+        23/09/2026). Ignores the current RLimit, so negative positions are
+        possible.
+
         Parameters
         ----------
         value : float
@@ -823,8 +838,9 @@ class Scanner():
     
     def unlimitedDiffMove(self, Xvalue, Yvalue, Zvalue, Rvalue):
         '''
-        Move every axis by the specified value in their current direction.
-        Ignores limits.
+        Move every axis by the specified value. The sign of each value
+        determines the direction of movement (verified on hardware,
+        23/09/2026). Ignores limits, so negative positions are possible.
 
         Parameters
         ----------
@@ -850,8 +866,10 @@ class Scanner():
 
     def unlimitedDiffMoveAxis(self, axis, value):
         '''
-        Move the axis by the specified value in the current direction. Ignores
-        the current axis limit.
+        Move the axis by the specified value. The sign of the value
+        determines the direction of movement (verified on hardware,
+        23/09/2026). Ignores the current axis limit, so negative positions
+        are possible.
 
         Parameters
         ----------
@@ -1114,6 +1132,12 @@ class Scanner():
         '''
         Set the direction of all axis. Allowed values are '+' or '-'.
 
+        Warning: this only affects absolute movements (SM/moveX etc.); it has
+        no effect on relative movements (diffMove*/unlimitedDiffMove*), whose
+        direction is given by the sign of the value. It is not persisted by
+        the firmware (lost on power cycle) and is not used by scanner_panel.py
+        (verified on hardware, 23/09/2026).
+
         Parameters
         ----------
         Xdirection : str, optional
@@ -1139,6 +1163,12 @@ class Scanner():
     def setAxisDirection(self, axis, value):
         '''
         Set the direction of the specified axis.
+
+        Warning: this only affects absolute movements (SM/moveX etc.); it has
+        no effect on relative movements (diffMove*/unlimitedDiffMove*), whose
+        direction is given by the sign of the value. It is not persisted by
+        the firmware (lost on power cycle) and is not used by scanner_panel.py
+        (verified on hardware, 23/09/2026).
 
         Parameters
         ----------
