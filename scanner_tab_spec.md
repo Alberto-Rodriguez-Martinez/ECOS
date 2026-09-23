@@ -15,8 +15,11 @@ Escáner XYZR (controlador SE SC-03-00) para posicionar muestras de PVA dentro d
 - Puerto serie a elegir (COM3 en el portátil de pruebas del 21/09), 19200 baud. Respuestas de 10 bytes: `OK` + eje + 6 dígitos + `\r`. El Arduino PT100 también usa un puerto serie: pueden intercambiarse los números según el equipo.
 - Resolución: X e Y 0,01 mm/paso, Z 0,005 mm/paso, R 1,8°/paso.
 - Los movimientos **bloquean hasta terminar**: el `OK` llega al final. Con speed=100, X ≈ 6,7 mm/s.
-- El firmware **rechaza** destinos < 0 o > límite (`SL`). No hay finales de carrera físicos.
+- El firmware **rechaza** destinos < 0 o > límite (`SL`) con `b'ER' + eje + 6 caracteres + b'\r'`. No hay finales de carrera físicos.
+- **Órdenes de movimiento** (verificado el 23/09): `SM` absoluto, limitado. `SD` (`diffMove*`) relativo **con signo** y limitado en ambos extremos. `SN` (`unlimitedDiffMove*`) relativo con signo y **sin límites**. `SW` (dirección) invierte solo los **absolutos**, no afecta a los relativos, y **no se usa nunca** en el panel: es un estado oculto que se pierde al cortar la tensión.
+- Posiciones negativas: el signo ocupa el lugar de un dígito, la respuesta sigue teniendo 10 bytes (`b'OKX-00010\r'` = −0,1 mm).
 - **Z positivo = hacia abajo** (dirección `'-'` que fija el constructor).
+- **Sentido del eje del haz**: el contador creciente puede llevar la muestra **hacia** el transductor PE (es el caso del montaje del 23/09). No se corrige invirtiendo el eje ni moviendo el origen: se declara con **PE side = máximo** y el software aplica el signo correcto al tiempo de vuelo.
 - `Ctrl+C` / `SSF` detiene el movimiento en seco; el contador queda en la posición real.
 - Cortar la tensión del controlador: la **posición se conserva**, los **límites vuelven a 10000 pasos** (100/100/50 mm, 18000°). Reabrir el puerto serie no afecta.
 - El constructor de `Scanner` tarda ~4 s (≈20 órdenes). Solo una vez por sesión.
@@ -26,7 +29,7 @@ Escáner XYZR (controlador SE SC-03-00) para posicionar muestras de PVA dentro d
 - **Eje del haz**: Y o X, a elegir en la configuración de sesión.
 - **Eje lateral**: el otro eje horizontal.
 - **Z**: eje vertical.
-- **Lado PE**: extremo del eje del haz donde está el transductor PE (por defecto: origen, apuntando hacia +). Determina el signo: con el PE en el origen, mover la muestra hacia + la aleja del PE y el tiempo de vuelo del eco frontal crece.
+- **Lado PE**: extremo del eje del haz donde está el transductor PE (origen o máximo). Determina el signo: con el PE en el origen, mover la muestra hacia + la aleja del PE y el tiempo de vuelo del eco frontal crece; con el PE en el máximo, ocurre lo contrario. Se declara según cómo se mueva físicamente el eje, sin invertir nada.
 - Toda la GUI habla de haz, lateral y Z. La traducción a X/Y ocurre en una sola función.
 - Coordenadas de sesión: rango [0, límite] por eje. El cero se fija en una esquina del volumen de trabajo; Z = 0 es la altura segura, arriba.
 
@@ -143,7 +146,8 @@ Si los PT100 están conectados, se registra la temperatura en cada punto del bar
 
 ## 6. Seguridad
 
-- Nunca se usa `SN` (`unlimitedDiffMove*`).
+- `SN` (`unlimitedDiffMove*`) solo se usa en el **modo de movimiento libre**, activado explícitamente por el usuario con confirmación y con aviso visible en pantalla. Nunca en foco, planitud ni barridos.
+- `SW` (direcciones) no se usa nunca: afecta solo a los movimientos absolutos, no a los relativos, y se pierde al cortar la tensión.
 - Todo destino se comprueba contra los límites en la GUI **antes** de enviarlo, además de la comprobación del firmware.
 - Rangos de foco, planitud y barridos recortados a los límites, con aviso.
 - El STOP siempre está activo.
