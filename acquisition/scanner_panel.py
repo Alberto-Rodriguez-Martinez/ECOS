@@ -41,7 +41,7 @@ from PyQt5.QtCore import Qt, QThread, pyqtSignal
 from PyQt5.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
     QGroupBox, QLabel, QLineEdit, QComboBox, QPushButton, QMessageBox,
-    QScrollArea, QFrame,
+    QScrollArea, QFrame, QCheckBox,
 )
 
 from Scanner import Scanner
@@ -98,6 +98,20 @@ R_STEP_UNIT = Scanner.uStepR
 # Z 0.5 mm, R one resolution unit (1.8 deg).
 JOG_DEFAULTS_MM = {'X': 1.0, 'Y': 1.0, 'Z': 0.5, 'R': R_STEP_UNIT}
 
+# Verified on hardware (23/09/2026): SPR (speed) has no effect on the R axis
+# at all. Speed is therefore only tracked/shown/applied for X/Y/Z — R has no
+# Speed field and 'Apply speeds' never sends SPR (task_scanner_r_axis.md
+# point 3).
+SPEED_AXES = ('X', 'Y', 'Z')
+
+# Verified on hardware (23/09/2026): a single large continuous R move loses
+# steps once the sample holder is mounted, but loose 1.8 deg (R_STEP_UNIT)
+# orders do not. So every R move (jog, 'Move to', 'Go to origin') is sent as
+# a sequence of independent single-step commands by default
+# (task_scanner_r_axis.md point 1).
+R_STEP_PAUSE_MS_DEFAULT = 100
+R_STEP_PAUSE_MS_RANGE = (0, 2000)
+
 
 # ===========================================================================
 #  Helpers: beam/lateral <-> X/Y translation (spec 2: "la traduccion a X/Y
@@ -127,10 +141,32 @@ def round_r_jog(value):
     return round(n * R_STEP_UNIT, 6)
 
 
-def round_r_target(value):
-    """R 'Move to' target: nearest multiple of R_STEP_UNIT (0 is allowed)."""
-    n = round(value / R_STEP_UNIT)
-    return round(n * R_STEP_UNIT, 6)
+def round_r_target_circular(value):
+    """
+    R 'Move to' target: normalized to [0, 360) and rounded to the nearest
+    multiple of R_STEP_UNIT. R's position counter is circular (verified on
+    hardware, 23/09/2026), so a target is always a point on the circle, not
+    an absolute step count (task_scanner_r_axis.md point 2).
+    """
+    n = round((value % 360.0) / R_STEP_UNIT)
+    return round(n * R_STEP_UNIT, 6) % 360.0
+
+
+def r_shortest_path(current_deg, target_deg):
+    """
+    Shortest signed path from current_deg to target_deg (both expected in
+    [0, 360)), quantized to R_STEP_UNIT.
+
+    Returns (signed_degrees, n_steps): n_steps is the non-negative number of
+    R_STEP_UNIT commands to send, and signed_degrees = n_steps * R_STEP_UNIT
+    with the sign giving the direction (>0 = '+', <0 = '-'). Used to move R
+    with diffMoveR/unlimitedDiffMoveR instead of an absolute SM target, which
+    would not respect the circular counter (task_scanner_r_axis.md point 2).
+    """
+    diff = (target_deg - current_deg + 180.0) % 360.0 - 180.0
+    n_steps = int(round(abs(diff) / R_STEP_UNIT))
+    sign = 1.0 if diff >= 0 else -1.0
+    return sign * n_steps * R_STEP_UNIT, n_steps
 
 
 # ===========================================================================
@@ -178,6 +214,10 @@ class ScannerWorker(QThread):
     connected = pyqtSignal(str)
     disconnected = pyqtSignal()
     moved = pyqtSignal(tuple)     # (X, Y, Z, R) in mm/mm/mm/deg
+    # task_scanner_r_axis.md point 5: single-axis move result (axis, value),
+    # cheaper than `moved` when only one axis actually moved — avoids
+    # rereading the other three via getCoords().
+    moved_axis = pyqtSignal(str, float)
     limits = pyqtSignal(tuple)    # (Xlim, Ylim, Zlim, Rlim)
     busy = pyqtSignal(bool)
     error = pyqtSignal(str)
@@ -324,15 +364,27 @@ class ScannerWorker(QThread):
         self.limits.emit(self.scanner.getLimits())
 
     # -- movement ---------------------------------------------------------
+    #
+    # task_scanner_r_axis.md point 5 (jog latency): a jog is a single-axis
+    # move, so re-reading all four coordinates via getCoords() after one
+    # (3 extra blocking SC reads, each with Scanner.write's own >=0.1 s
+    # settle) is wasted time; _do_move_axis/_do_jog_unlimited below only
+    # re-read the axis that actually moved. Busy is also released as soon as
+    # the move's own OK arrives, before that single readback, so the
+    # buttons accept the next click sooner. What is left (Scanner.write's
+    # 0.1 s sleep-then-poll around the move command itself, and one more
+    # such round trip for the readback) is inherent to the serial protocol
+    # and is not forced further, since Scanner.py is out of scope here.
     def _do_move_axis(self, axis, value):
         if self.scanner is None:
             return
         self.busy.emit(True)
         try:
             self.scanner.moveAxis(axis, value)
-            self.moved.emit(self.scanner.getCoords())
         finally:
             self.busy.emit(False)
+        if self.scanner is not None:
+            self.moved_axis.emit(axis, self.scanner.getAxis(axis))
 
     def _do_jog_unlimited(self, axis, value):
         """
@@ -348,33 +400,78 @@ class ScannerWorker(QThread):
         self.busy.emit(True)
         try:
             self.scanner.unlimitedDiffMoveAxis(axis, value)
-            self.moved.emit(self.scanner.getCoords())
         finally:
             self.busy.emit(False)
+        if self.scanner is not None:
+            self.moved_axis.emit(axis, self.scanner.getAxis(axis))
 
-    def _do_move_sequence(self, axis_targets):
+    def _do_move_sequence(self, steps):
         """
-        Fix 5 (go-to-origin): moves one axis at a time, in the given order,
-        going through Scanner.moveAxis exactly like a single manual move.
-        STOP (see ScannerPanel._on_stop_clicked) both interrupts whichever
-        axis is currently moving (via the shared serial proxy, same as any
-        other move) and sets _abort_sequence, so the sequence stops there
-        instead of continuing to the next axis.
+        Fix 5 (go-to-origin) + task_scanner_r_axis.md point 1: runs a list of
+        move steps in order, one at a time. Each step is either:
+          ('axis', axis, target)  -- a single absolute SM move (X/Y/Z), or
+          ('r', total_degrees, stepwise, pause_ms, unlimited)  -- R's own
+              relative, circular-aware sequence (see _run_r_step_sequence);
+              R is never moved with an absolute SM target.
+        STOP (see ScannerPanel._on_stop_clicked) sets _abort_sequence, which
+        is checked both between steps here and between R's own sub-steps
+        inside _run_r_step_sequence, so a single STOP press aborts the whole
+        sequence, not just whichever step (or R sub-step) is running.
         """
         if self.scanner is None:
             return
         self._abort_sequence.clear()
         self.busy.emit(True)
         try:
-            for axis, target in axis_targets:
+            for step in steps:
                 if self._abort_sequence.is_set():
                     break
-                self.scanner.moveAxis(axis, target)
-                self.moved.emit(self.scanner.getCoords())
+                if step[0] == 'axis':
+                    _, axis, target = step
+                    self.scanner.moveAxis(axis, target)
+                    self.moved_axis.emit(axis, self.scanner.getAxis(axis))
+                else:  # 'r'
+                    _, total_degrees, stepwise, pause_ms, unlimited = step
+                    self._run_r_step_sequence(total_degrees, stepwise, pause_ms, unlimited)
                 if self._abort_sequence.is_set():
                     break
         finally:
             self.busy.emit(False)
+
+    def _run_r_step_sequence(self, total_degrees, stepwise, pause_ms, unlimited):
+        """
+        task_scanner_r_axis.md point 1: moves R by `total_degrees` (signed,
+        relative) using diffMoveR, or unlimitedDiffMoveR in free-movement
+        mode. When `stepwise` is True (the default, from the 'Mover R paso a
+        paso' checkbox), it is split into independent R_STEP_UNIT (1.8 deg)
+        commands with `pause_ms` between them -- verified on hardware
+        23/09/2026: one large continuous move loses steps once the sample
+        holder is mounted, but loose 1.8 deg orders do not. When False, it
+        is sent as a single command (only safe without the holder mounted).
+        R's circular counter (verified 23/09/2026) needs no special
+        handling here: each relative step is small and the firmware manages
+        the wraparound on its own. Reads R's real position back exactly
+        once, at the end (or as soon as _abort_sequence is set), never after
+        every sub-step.
+        """
+        move_one = self.scanner.unlimitedDiffMoveR if unlimited else self.scanner.diffMoveR
+        try:
+            if not stepwise:
+                if abs(total_degrees) > 1e-9:
+                    move_one(total_degrees)
+                return
+            sign = 1.0 if total_degrees >= 0 else -1.0
+            n_steps = int(round(abs(total_degrees) / R_STEP_UNIT))
+            for i in range(1, n_steps + 1):
+                if self._abort_sequence.is_set():
+                    break
+                move_one(sign * R_STEP_UNIT)
+                self.message.emit(f'R: paso {i}/{n_steps}')
+                if i < n_steps and pause_ms > 0 and not self._abort_sequence.is_set():
+                    time.sleep(pause_ms / 1000.0)
+        finally:
+            if self.scanner is not None:
+                self.moved_axis.emit('R', self.scanner.getAxis('R'))
 
     # -- session: limits / zero / set-value / speeds -----------------------
     def _do_set_limits(self, limits_dict):
@@ -449,8 +546,19 @@ class ScannerPanel(QWidget):
         # next save writes only 'jog'.
         jog_source = self._session.get('jog', self._session.get('steps', {}))
         self._jogs = {ax: float(jog_source.get(ax, JOG_DEFAULTS_MM[ax])) for ax in AXES}
+        # SPR has no effect on R (verified 23/09/2026): only X/Y/Z carry a
+        # speed. An old session JSON with a speeds.R value is simply never
+        # read here, so it is ignored without error (task_scanner_r_axis.md
+        # point 3).
         self._speeds = {ax: int(self._session.get('speeds', {}).get(ax, 100))
-                         for ax in AXES}
+                         for ax in SPEED_AXES}
+
+        # task_scanner_r_axis.md point 1: R-stepwise mode (default on) and
+        # the pause between its 1.8 deg sub-steps, both persisted to the
+        # session.
+        self._r_stepwise = bool(self._session.get('r_stepwise', True))
+        self._r_step_pause_ms = self._clamp_r_pause(
+            self._session.get('r_step_pause_ms', R_STEP_PAUSE_MS_DEFAULT))
 
         self._movement_widgets = []
         # Subset of movement controls that only make sense as absolute
@@ -477,6 +585,7 @@ class ScannerPanel(QWidget):
         self._worker.connected.connect(self._on_connected)
         self._worker.disconnected.connect(self._on_disconnected)
         self._worker.moved.connect(self._on_moved)
+        self._worker.moved_axis.connect(self._on_moved_axis)
         self._worker.limits.connect(self._on_limits)
         self._worker.busy.connect(self._on_busy)
         self._worker.error.connect(self._on_message)
@@ -622,7 +731,7 @@ class ScannerPanel(QWidget):
         # Step and Set-value columns (Step moved to Manual movement as Jog;
         # Set-value dropped).
         grid.addWidget(QLabel('<b>Axis</b>'), 0, 0)
-        grid.addWidget(QLabel('<b>Limit</b>'), 0, 1)
+        grid.addWidget(QLabel('<b>Limit (mm / °)</b>'), 0, 1)
         grid.addWidget(QLabel('<b>Speed</b>'), 0, 3)
         grid.addWidget(QLabel('<b>Zero</b>'), 0, 4)
 
@@ -641,16 +750,23 @@ class ScannerPanel(QWidget):
             btn_apply_limit.clicked.connect(self._make_apply_limit_handler(role))
             grid.addWidget(btn_apply_limit, r, 2)
 
-            edit_speed = QLineEdit()
-            edit_speed.setFixedWidth(60)
-            self._edit_speed[role] = edit_speed
-            grid.addWidget(edit_speed, r, 3)
+            if role == 'R':
+                # SPR has no effect on R (verified 23/09/2026): no speed
+                # field for it, just a placeholder cell (task_scanner_r_axis.md
+                # point 3).
+                grid.addWidget(QLabel('—'), r, 3)
+            else:
+                edit_speed = QLineEdit()
+                edit_speed.setFixedWidth(60)
+                self._edit_speed[role] = edit_speed
+                grid.addWidget(edit_speed, r, 3)
+                self._session_widgets.append(edit_speed)
 
             btn_zero = QPushButton('Zero')
             btn_zero.clicked.connect(self._make_zero_handler(role))
             grid.addWidget(btn_zero, r, 4)
 
-            self._session_widgets += [edit_limit, btn_apply_limit, edit_speed, btn_zero]
+            self._session_widgets += [edit_limit, btn_apply_limit, btn_zero]
         layout.addLayout(grid)
 
         btn_row = QHBoxLayout()
@@ -700,6 +816,31 @@ class ScannerPanel(QWidget):
         self._btn_free_movement.toggled.connect(self._on_free_movement_toggled)
         layout.addWidget(self._btn_free_movement)
         self._movement_widgets.append(self._btn_free_movement)
+
+        # R stepwise mode (task_scanner_r_axis.md point 1): on by default.
+        # Every R move (jog, 'Move to', 'Go to origin') is chopped into
+        # independent R_STEP_UNIT (1.8 deg) commands with a pause in
+        # between, because a single large continuous move loses steps once
+        # the sample holder is mounted (verified on hardware 23/09/2026).
+        r_step_row = QHBoxLayout()
+        self._chk_r_stepwise = QCheckBox('Mover R paso a paso')
+        self._chk_r_stepwise.setChecked(self._r_stepwise)
+        self._chk_r_stepwise.toggled.connect(self._on_r_stepwise_toggled)
+        r_step_row.addWidget(self._chk_r_stepwise)
+        r_step_row.addWidget(QLabel('Pausa entre pasos de R (ms):'))
+        self._edit_r_pause_ms = QLineEdit(str(self._r_step_pause_ms))
+        self._edit_r_pause_ms.setFixedWidth(50)
+        self._edit_r_pause_ms.editingFinished.connect(self._on_r_pause_edited)
+        r_step_row.addWidget(self._edit_r_pause_ms)
+        layout.addLayout(r_step_row)
+        self._movement_widgets += [self._chk_r_stepwise, self._edit_r_pause_ms]
+
+        r_step_note = QLabel(
+            'Sin trocear y con el soporte de muestras puesto, el eje R pierde pasos.'
+        )
+        r_step_note.setWordWrap(True)
+        r_step_note.setStyleSheet('color: gray; font-size: 10px;')
+        layout.addWidget(r_step_note)
 
         grid = QGridLayout()
         # Column layout: 0 axis name, 1 jog edit, 2 minus, 3 plus, 4 move-to
@@ -881,6 +1022,16 @@ class ScannerPanel(QWidget):
         self._coords = dict(zip(AXES, coords_tuple))
         self._refresh_position_labels()
 
+    def _on_moved_axis(self, axis, value):
+        """task_scanner_r_axis.md point 5: single-axis counterpart of
+        _on_moved, for moves that only ever touch one axis (jog, 'Move to',
+        R's stepwise sequence) — updates just that axis instead of
+        overwriting all four from a full getCoords()."""
+        self._coords[axis] = value
+        for role in ROLE_ORDER:
+            if self._role_axis[role] == axis:
+                self._lbl_pos[role].setText(fmt_pos(axis, value))
+
     def _on_limits(self, limits_tuple):
         self._limits = dict(zip(AXES, limits_tuple))
         self._refresh_all_role_limit_fields()
@@ -952,9 +1103,10 @@ class ScannerPanel(QWidget):
             jog = self._read_float(self._edit_jog[role], None)
             if jog is not None:
                 self._jogs[axis] = jog
-            speed = self._read_float(self._edit_speed[role], None)
-            if speed is not None:
-                self._speeds[axis] = int(speed)
+            if role in self._edit_speed:  # R has no speed field, see SPEED_AXES
+                speed = self._read_float(self._edit_speed[role], None)
+                if speed is not None:
+                    self._speeds[axis] = int(speed)
 
     def _refresh_role_label_texts(self):
         for role in ROLE_ORDER:
@@ -978,6 +1130,8 @@ class ScannerPanel(QWidget):
 
     def _refresh_role_speed_fields(self):
         for role in ROLE_ORDER:
+            if role not in self._edit_speed:  # R: no speed field (point 3)
+                continue
             axis = self._role_axis[role]
             self._edit_speed[role].setText(str(self._speeds.get(axis, 100)))
 
@@ -1017,6 +1171,17 @@ class ScannerPanel(QWidget):
                 f'R jog rounded to {rounded:g}° (multiple of {R_STEP_UNIT:g}°).'
             )
 
+    def _on_r_stepwise_toggled(self, checked):
+        self._r_stepwise = checked
+
+    def _on_r_pause_edited(self):
+        edit = self._edit_r_pause_ms
+        value = self._read_float(edit, None)
+        self._r_step_pause_ms = self._clamp_r_pause(
+            value if value is not None else self._r_step_pause_ms
+        )
+        edit.setText(str(self._r_step_pause_ms))
+
     def _make_jog_handler(self, role, sign):
         """+/- buttons: move by the jog amount typed in that row's field,
         read at click time (no Enter needed)."""
@@ -1027,6 +1192,10 @@ class ScannerPanel(QWidget):
                 QMessageBox.warning(self, 'Scanner', 'Invalid jog value.')
                 return
             if axis == 'R':
+                # task_scanner_r_axis.md point 1: R never moves with a
+                # single absolute SM; always diffMoveR/unlimitedDiffMoveR,
+                # chopped into 1-step commands unless 'Mover R paso a paso'
+                # is off (see ScannerWorker._run_r_step_sequence).
                 rounded_jog = round_r_jog(jog)
                 if abs(rounded_jog - jog) > 1e-6:
                     self._edit_jog[role].setText(f'{rounded_jog:g}')
@@ -1034,6 +1203,15 @@ class ScannerPanel(QWidget):
                         f'R jog rounded to {rounded_jog:g}° (multiple of {R_STEP_UNIT:g}°).'
                     )
                 jog = rounded_jog
+                total_degrees = sign * jog
+                if not self._free_movement:
+                    target = round(self._coords.get('R', 0.0) + total_degrees, 4)
+                    if not self._validate_target('R', target):
+                        return
+                self._worker.enqueue(('move_sequence', [
+                    ('r', total_degrees, self._r_stepwise, self._r_step_pause_ms, self._free_movement)
+                ]))
+                return
             if self._free_movement:
                 # task_scanner_freemode.md point 4: signed unlimited relative
                 # move (SN), GUI limit check skipped — the firmware's own
@@ -1050,18 +1228,33 @@ class ScannerPanel(QWidget):
     def _make_goto_handler(self, role):
         def handler():
             axis = self._role_axis[role]
-            target = self._read_float(self._edit_goto[role], None)
-            if target is None:
+            raw_target = self._read_float(self._edit_goto[role], None)
+            if raw_target is None:
                 QMessageBox.warning(self, 'Scanner', 'Invalid target value.')
                 return
             if axis == 'R':
-                rounded_target = round_r_target(target)
-                if abs(rounded_target - target) > 1e-6:
-                    self._edit_goto[role].setText(f'{rounded_target:g}')
-                    self._lbl_result.setText(
-                        f'R target rounded to {rounded_target:g}° (multiple of {R_STEP_UNIT:g}°).'
-                    )
-                target = rounded_target
+                # task_scanner_r_axis.md point 2: R is circular, so the
+                # target is normalized to [0, 360) and reached via the
+                # shortest signed path, sent as relative step(s) — never as
+                # an absolute SM (which would ignore the wraparound).
+                target_deg = round_r_target_circular(raw_target)
+                self._edit_goto[role].setText(f'{target_deg:g}')
+                current_deg = self._coords.get('R', 0.0) % 360.0
+                signed_degrees, n_steps = r_shortest_path(current_deg, target_deg)
+                if n_steps == 0:
+                    self._lbl_result.setText(f'R ya está en {current_deg:.1f}°.')
+                    return
+                # Status-bar notice, not a blocking dialog (point 2): shows
+                # direction, degrees and step count before sending anything.
+                self._lbl_result.setText(
+                    f'R: {current_deg:.1f}° → {target_deg:.1f}°, girando '
+                    f'{signed_degrees:+.1f}° ({n_steps} pasos)'
+                )
+                self._worker.enqueue(('move_sequence', [
+                    ('r', signed_degrees, self._r_stepwise, self._r_step_pause_ms, False)
+                ]))
+                return
+            target = raw_target
             if not self._validate_target(axis, target):
                 return
             self._worker.enqueue(('move_axis', axis, target))
@@ -1072,35 +1265,53 @@ class ScannerPanel(QWidget):
         Fix 5: moves every axis that is not already at 0 to 0, one axis at a
         time, in the fixed physical order R, Z, X, Y (never reordered by
         which axis is currently "beam"). Confirms first, showing that order
-        and each axis' current -> final position. Goes through the worker's
-        move_sequence command, exactly like any other move, so STOP (which
-        also calls ScannerWorker.request_sequence_abort) stops the sequence
-        after whichever axis is interrupted instead of moving on.
+        and each axis' current -> final position/path. Goes through the
+        worker's move_sequence command, exactly like any other move, so STOP
+        (which also calls ScannerWorker.request_sequence_abort) stops the
+        sequence after whichever step is interrupted instead of moving on.
+
+        task_scanner_r_axis.md point 1/2: R's step is built as a 'r'
+        shortest-path entry (see _make_goto_handler), not an ('axis', 'R', 0)
+        absolute SM target — R is circular and does not accept negative
+        absolute destinations either.
         """
-        pending = [(ax, self._coords.get(ax, 0.0)) for ax in GO_TO_ORIGIN_AXIS_ORDER
-                   if abs(self._coords.get(ax, 0.0)) > 1e-9]
-        if not pending:
+        steps = []
+        lines = []
+        axes_included = []
+        for ax in GO_TO_ORIGIN_AXIS_ORDER:
+            cur = self._coords.get(ax, 0.0)
+            if ax == 'R':
+                cur_deg = cur % 360.0
+                signed_degrees, n_steps = r_shortest_path(cur_deg, 0.0)
+                if n_steps == 0:
+                    continue
+                steps.append(('r', signed_degrees, self._r_stepwise, self._r_step_pause_ms, False))
+                lines.append(
+                    f'  R: {cur_deg:.1f}° -> 0.0°, girando {signed_degrees:+.1f}° ({n_steps} pasos)'
+                )
+                axes_included.append('R')
+            else:
+                if abs(cur) <= 1e-9:
+                    continue
+                if not self._validate_target(ax, 0.0):
+                    return
+                steps.append(('axis', ax, 0.0))
+                lines.append(f'  {ax}: {fmt_pos(ax, cur)} -> {fmt_pos(ax, 0.0)}')
+                axes_included.append(ax)
+
+        if not steps:
             self._lbl_result.setText('All axes are already at 0.')
             return
 
-        axis_targets = []
-        for ax, _cur in pending:
-            if not self._validate_target(ax, 0.0):
-                return
-            axis_targets.append((ax, 0.0))
-
-        order_text = ' -> '.join(ax for ax, _ in pending)
-        lines = '\n'.join(
-            f'  {ax}: {fmt_pos(ax, cur)} -> {fmt_pos(ax, 0.0)}' for ax, cur in pending
-        )
+        order_text = ' -> '.join(axes_included)
         resp = QMessageBox.question(
             self, 'Scanner',
-            f'Move to origin in this order: {order_text}\n\n{lines}\n\nProceed?',
+            f'Move to origin in this order: {order_text}\n\n' + '\n'.join(lines) + '\n\nProceed?',
             QMessageBox.Yes | QMessageBox.No,
         )
         if resp != QMessageBox.Yes:
             return
-        self._worker.enqueue(('move_sequence', axis_targets))
+        self._worker.enqueue(('move_sequence', steps))
 
     # =======================================================================
     #  Free-movement mode (task_scanner_freemode.md point 4)
@@ -1224,8 +1435,11 @@ class ScannerPanel(QWidget):
         self._worker.enqueue(('set_zero', list(AXES)))
 
     def _on_apply_speeds_clicked(self):
+        # SPR has no effect on R (verified 23/09/2026): SPEED_AXES excludes
+        # it, so 'Apply speeds' can never send SPR (task_scanner_r_axis.md
+        # point 3).
         self._capture_role_edits_into_state()
-        speeds = {ax: int(self._speeds.get(ax, 100)) for ax in AXES}
+        speeds = {ax: int(self._speeds.get(ax, 100)) for ax in SPEED_AXES}
         for ax, v in speeds.items():
             if not (1 <= v <= 65536):
                 QMessageBox.warning(self, 'Scanner', f'Speed for {ax} must be between 1 and 65536.')
@@ -1258,7 +1472,16 @@ class ScannerPanel(QWidget):
         # 'jog' replaces the old 'step' key; an old JSON with 'step' still loads.
         jog_source = d.get('jog', d.get('steps', {}))
         self._jogs = {ax: float(jog_source.get(ax, JOG_DEFAULTS_MM[ax])) for ax in AXES}
-        self._speeds = {ax: int(d.get('speeds', {}).get(ax, 100)) for ax in AXES}
+        # SPEED_AXES excludes R: a speeds.R value in an old JSON is simply
+        # never read, so it loads without error (task_scanner_r_axis.md point 3).
+        self._speeds = {ax: int(d.get('speeds', {}).get(ax, 100)) for ax in SPEED_AXES}
+
+        self._r_stepwise = bool(d.get('r_stepwise', True))
+        self._chk_r_stepwise.blockSignals(True)
+        self._chk_r_stepwise.setChecked(self._r_stepwise)
+        self._chk_r_stepwise.blockSignals(False)
+        self._r_step_pause_ms = self._clamp_r_pause(d.get('r_step_pause_ms', R_STEP_PAUSE_MS_DEFAULT))
+        self._edit_r_pause_ms.setText(str(self._r_step_pause_ms))
 
         self._refresh_role_label_texts()
         self._refresh_all_role_limit_fields()
@@ -1283,6 +1506,8 @@ class ScannerPanel(QWidget):
             'limits': dict(self._limits),
             'jog': dict(self._jogs),
             'speeds': dict(self._speeds),
+            'r_stepwise': self._r_stepwise,
+            'r_step_pause_ms': self._r_step_pause_ms,
         }
         try:
             with open(SESSION_FILE, 'w') as f:
@@ -1333,6 +1558,14 @@ class ScannerPanel(QWidget):
             return float(edit.text().strip())
         except (ValueError, AttributeError):
             return default
+
+    @staticmethod
+    def _clamp_r_pause(value):
+        lo, hi = R_STEP_PAUSE_MS_RANGE
+        try:
+            return max(lo, min(hi, int(round(float(value)))))
+        except (ValueError, TypeError):
+            return R_STEP_PAUSE_MS_DEFAULT
 
     # =======================================================================
     #  Shutdown
