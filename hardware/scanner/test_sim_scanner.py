@@ -156,6 +156,54 @@ class TestSignedRelativeMoves(unittest.TestCase):
         self.assertEqual(sc.X, -0.1)
 
 
+class TestRZeroCrossing(unittest.TestCase):
+    """R's circular counter (upward-only) and the downward-crossing
+    rejection, verified on hardware 23-24/09/2026
+    (see task_scanner_r_zerocross.md)."""
+
+    def test_R_SD_below_zero_is_rejected_not_wrapped(self):
+        sc, _fs = make_scanner()
+        sc.moveR(0)
+        sc.diffMoveR(-1.8)  # would take R to -1 step: rejected, not 199
+        self.assertEqual(sc.R, 0.0)
+
+    def test_R_SAR_then_negative_step_crosses_zero(self):
+        # The exact maneuver verified on hardware: with R at 0, SAR200
+        # redefines the counter to one full turn (360 deg) without moving,
+        # then a single negative step succeeds, landing on 199 steps.
+        sc, _fs = make_scanner()
+        sc.moveR(0)
+        sc.setAxis('R', 360.0)  # SAR200: redefine only, verified no motion
+        self.assertEqual(sc.R, 360.0)
+        sc.diffMoveR(-1.8)
+        self.assertAlmostEqual(sc.R, 358.2, places=6)  # 199 steps * 1.8
+
+    def test_R_wraps_to_zero_past_full_revolution(self):
+        # Verified: the physical counter is circular upward, independent of
+        # the (much higher, default) software limit.
+        sc, _fs = make_scanner()
+        sc.moveR(0)
+        sc.diffMoveR(360.0)  # 200 steps in one relative command
+        self.assertEqual(sc.R, 0.0)
+
+    def test_R_wraps_exactly_at_default_session_limit(self):
+        # task_scanner_r_zerocross.md point 2: with RLimit set to exactly
+        # one revolution (200 steps = 360 deg, the panel's own session
+        # default), does the last upward step (199 -> 200) get rejected by
+        # the limit check before it can wrap? Verified in this simulator:
+        # no -- the check is strict '>' and 200 is not > 200, so it passes
+        # and then wraps via the same circular behaviour. This is why
+        # scanner_panel.py only implements the downward-crossing fix (point
+        # 1); the symmetric upward one (point 2) is not needed here.
+        sc, _fs = make_scanner()
+        sc.RLimit = 360.0  # 200 steps
+        sc.moveR(0)
+        sc.diffMoveR(199 * 1.8)  # step 199, still short of the limit
+        self.assertAlmostEqual(sc.R, 358.2, places=6)
+        sc.diffMoveR(1.8)  # step 200: at the limit, not rejected, then wraps
+        self.assertEqual(sc.R, 0.0)
+
+
 class TestValue2uSteps(unittest.TestCase):
 
     def test_value2uSteps_rounding(self):

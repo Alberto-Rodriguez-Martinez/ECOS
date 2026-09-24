@@ -29,6 +29,14 @@ DEFAULT_LIMIT_STEPS = 10000
 # shape as 'OK' ('OK'/'ER' + axis + 6 digits + '\r').
 REJECT_PREFIX = 'ER'
 
+# Verified on hardware (23-24/09/2026, task_scanner_r_axis.md /
+# task_scanner_r_zerocross.md): R's physical counter is circular, but only
+# going UP -- it wraps to 0 after a full revolution (200 steps = 360 deg,
+# since Scanner.uStepR = 1.8 deg/step). Going down, the counter never jumps
+# to 199; a relative move (SD) that would take it below 0 is rejected with
+# ER instead (see _do_move_locked/_wrap_r below).
+R_STEPS_PER_REV = 200
+
 # ASSUMPTION (not verified on hardware): step speed is proportional to the
 # firmware "speed" parameter and identical in steps/s on every axis; only the
 # verified calibration point is X axis, speed=100 -> ~6.7 mm/s. Since
@@ -169,7 +177,10 @@ class FakeSerial:
     def _settle_move_locked(self):
         mv = self._move
         if mv is not None and (time.time() - mv['start_time']) >= mv['duration']:
-            self._axes[mv['axis']].pos = mv['target_pos']
+            pos = mv['target_pos']
+            if mv['axis'] == 'R':
+                pos = self._wrap_r(pos)
+            self._axes[mv['axis']].pos = pos
             self._move = None
 
     def _handle_locked(self, text):
@@ -187,6 +198,12 @@ class FakeSerial:
             axis.limit = int(rest)
             return self._ok(ax, axis.limit), 0.0
         if op == 'SA':                       # set current position (no motion)
+            # Verified (24/09/2026): SA redefines the counter without moving
+            # anything and without wrapping, even at a value equal to the
+            # limit/one full revolution -- e.g. SAR200 (R_STEPS_PER_REV)
+            # leaves R at 200 steps (360 deg), not 0. That is exactly what
+            # the panel's zero-crossing handling relies on (see
+            # scanner_panel.py's _run_r_step_sequence).
             axis.pos = int(rest)
             return self._ok(ax, axis.pos), 0.0
         if op == 'SW':                       # set direction
@@ -228,7 +245,9 @@ class FakeSerial:
         elif op == 'SD':
             # Verified (23/09/2026): SD accepts a signed param (the sign sets
             # the direction) and rejects with ER if the destination falls
-            # outside [0, limit].
+            # outside [0, limit]. For R specifically, a target < 0 is exactly
+            # the "crossing 0 downward" rejection verified 24/09/2026 -- no
+            # extra check needed here, target < 0 already covers it.
             target = axis.pos + param
             if target < 0 or target > axis.limit:
                 return self._reject(ax), 0.0
@@ -237,6 +256,11 @@ class FakeSerial:
             if target < 0 or target > axis.limit:
                 return self._reject(ax), 0.0
 
+        # `target` is kept raw/unwrapped here (used below for distance/
+        # duration, and by _do_stop_locked for interpolation); the upward
+        # wrap for R (_wrap_r) is only applied where a position actually
+        # lands: below, in the immediate OK reply, and in
+        # _settle_move_locked/_do_stop_locked.
         distance = abs(target - axis.pos)
         steps_per_sec = BASE_STEPS_PER_SEC_AT_SPEED_100 * (axis.speed / 100.0)
         duration = (distance / steps_per_sec) if steps_per_sec > 0 else 0.0
@@ -249,9 +273,10 @@ class FakeSerial:
             'start_pos': axis.pos,
             'target_pos': target,
         }
+        reply_pos = self._wrap_r(target) if ax == 'R' else target
         # Verified: the OK reply (and the position update) is only available
         # once the move has finished, hence ready_delay = duration.
-        return self._ok(ax, target), duration
+        return self._ok(ax, reply_pos), duration
 
     def _do_stop_locked(self):
         mv = self._move
@@ -265,11 +290,27 @@ class FakeSerial:
         elapsed = min(time.time() - mv['start_time'], mv['duration'])
         frac = (elapsed / mv['duration']) if mv['duration'] > 0 else 1.0
         delta = mv['target_pos'] - mv['start_pos']
-        axis.pos = mv['start_pos'] + int(round(delta * frac))
+        pos = mv['start_pos'] + int(round(delta * frac))
+        if mv['axis'] == 'R':
+            pos = self._wrap_r(pos)
+        axis.pos = pos
         self._move = None
         # Releases the interrupted move's pending reply immediately, with the
         # real (partial) position, instead of the original target position.
         return self._ok(mv['axis'], axis.pos), 0.0
+
+    @staticmethod
+    def _wrap_r(pos):
+        """
+        R's physical counter is circular upward only (verified 23-24/09/2026):
+        past R_STEPS_PER_REV (one full revolution) it wraps to 0. A negative
+        value (only reachable via SN, which ignores limits) is never
+        wrapped -- it stays negative, matching hardware ("al bajar de 0 no
+        salta a 199").
+        """
+        if pos >= R_STEPS_PER_REV:
+            return pos % R_STEPS_PER_REV
+        return pos
 
     @staticmethod
     def _ok(ax, value):

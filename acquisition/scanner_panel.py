@@ -94,6 +94,12 @@ SESSION_DEFAULT_LIMITS_MM = {'X': 100.0, 'Y': 100.0, 'Z': 50.0, 'R': 360.0}
 # instantiating a Scanner (which opens a port) just to read one attribute.
 R_STEP_UNIT = Scanner.uStepR
 
+# Steps in one full revolution (360 deg / uStepR = 200). Verified on hardware
+# (23-24/09/2026): R's physical counter wraps to 0 past this point going up,
+# but a relative step that would cross 0 going down is rejected instead
+# (task_scanner_r_zerocross.md).
+R_STEPS_PER_REV = round(360.0 / R_STEP_UNIT)
+
 # Default per-axis jog amount (task_scanner_jog.md point 2): X/Y 1.0 mm,
 # Z 0.5 mm, R one resolution unit (1.8 deg).
 JOG_DEFAULTS_MM = {'X': 1.0, 'Y': 1.0, 'Z': 0.5, 'R': R_STEP_UNIT}
@@ -446,13 +452,30 @@ class ScannerWorker(QThread):
         paso' checkbox), it is split into independent R_STEP_UNIT (1.8 deg)
         commands with `pause_ms` between them -- verified on hardware
         23/09/2026: one large continuous move loses steps once the sample
-        holder is mounted, but loose 1.8 deg orders do not. When False, it
-        is sent as a single command (only safe without the holder mounted).
-        R's circular counter (verified 23/09/2026) needs no special
-        handling here: each relative step is small and the firmware manages
-        the wraparound on its own. Reads R's real position back exactly
-        once, at the end (or as soon as _abort_sequence is set), never after
-        every sub-step.
+        holder is mounted, but loose 1.8 deg orders do not (task_scanner_r_
+        axis.md); 24/09/2026 confirmed this also holds WITH the holder
+        mounted. When False, it is sent as a single command (only safe
+        without the holder mounted; the zero-crossing handling below does
+        not apply to it, see task_scanner_r_zerocross.md).
+
+        task_scanner_r_zerocross.md point 1: R's counter is circular only
+        going up (it wraps to 0 on its own past R_STEPS_PER_REV); a
+        DOWNWARD relative step that would cross 0 is rejected by the
+        firmware instead. So, for a downward limited move (not
+        unlimitedDiffMoveR, which is verified to allow negative positions
+        outright), this tracks the running position and, exactly when it
+        reaches step 0, sends setAxis('R', 360) first -- a raw SAR that only
+        redefines the counter to one full turn, verified not to move
+        anything -- before the next (now valid) negative step. Progress
+        numbering is not reset at the crossing. Point 2 (upward crossing at
+        the limit) was checked in the simulator and does not need the
+        symmetric fix: with R's default limit at exactly one revolution,
+        the boundary step (199 -> 200) is not rejected (the check is a
+        strict '>'), so it wraps via the ordinary circular behaviour (see
+        test_sim_scanner.TestRZeroCrossing).
+
+        Reads R's real position back exactly once, at the end (or as soon
+        as _abort_sequence is set), never after every sub-step.
         """
         move_one = self.scanner.unlimitedDiffMoveR if unlimited else self.scanner.diffMoveR
         try:
@@ -462,10 +485,35 @@ class ScannerWorker(QThread):
                 return
             sign = 1.0 if total_degrees >= 0 else -1.0
             n_steps = int(round(abs(total_degrees) / R_STEP_UNIT))
+            if n_steps == 0:
+                return
+
+            # Only a limited downward move can hit the "crossing 0" rejection.
+            track_crossing = sign < 0 and not unlimited
+            if track_crossing:
+                pos_steps = int(round(self.scanner.getAxis('R') / R_STEP_UNIT)) % R_STEPS_PER_REV
+
             for i in range(1, n_steps + 1):
                 if self._abort_sequence.is_set():
                     break
+                if track_crossing and pos_steps == 0:
+                    # About to cross 0 going down: redefine the counter to
+                    # one full turn first (point 1). Point 3 (Reserva): call
+                    # Scanner.write directly, not setAxis, so an unexpected
+                    # ER can be detected and the sequence aborted instead of
+                    # silently continuing with a stale/wrong counter.
+                    reply = self.scanner.write(f'SAR{R_STEPS_PER_REV}')
+                    if reply[:2] != b'OK':
+                        self.message.emit(
+                            f'R: SAR de cruce de cero rechazado ({reply!r}); secuencia abortada.'
+                        )
+                        break
+                    pos_steps = R_STEPS_PER_REV
+                    if self._abort_sequence.is_set():
+                        break
                 move_one(sign * R_STEP_UNIT)
+                if track_crossing:
+                    pos_steps -= 1
                 self.message.emit(f'R: paso {i}/{n_steps}')
                 if i < n_steps and pause_ms > 0 and not self._abort_sequence.is_set():
                     time.sleep(pause_ms / 1000.0)
