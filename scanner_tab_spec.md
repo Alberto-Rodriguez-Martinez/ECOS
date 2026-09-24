@@ -23,6 +23,7 @@ Escáner XYZR (controlador SE SC-03-00) para posicionar muestras de PVA dentro d
 - `Ctrl+C` / `SSF` detiene el movimiento en seco; el contador queda en la posición real.
 - Cortar la tensión del controlador: la **posición se conserva**, los **límites vuelven a 10000 pasos** (100/100/50 mm, 18000°). Reabrir el puerto serie no afecta.
 - El constructor de `Scanner` tarda ~4 s (≈20 órdenes). Solo una vez por sesión.
+- **Eje R** (verificado el 23/09): `uStepR = 1.8` es correcto (200 pasos = una vuelta) y el contador es **circular** (al completar la vuelta vuelve a 0). `SPR` **no tiene efecto** sobre R. Con el soporte de muestras montado, un giro continuo **pierde pasos**; paso a paso (órdenes de 1,8° sueltas) gira bien. Por eso todo movimiento de R se trocea en pasos con una pausa configurable. Antes de usar R para corregir la orientación en la planitud, hay que comprobar su repetibilidad con la carga real.
 
 ## 2. Conceptos
 
