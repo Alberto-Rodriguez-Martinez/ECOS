@@ -125,6 +125,10 @@ SPEED_AXES = ('X', 'Y', 'Z')
 R_STEP_PAUSE_MS_DEFAULT = 100
 R_STEP_PAUSE_MS_RANGE = (0, 2000)
 
+# A sequenced move counts as reached when the axis reads back within this of
+# its target (X/Y resolve 0.01 mm, Z 0.005 mm).
+POINT_TOLERANCE_MM = 0.05
+
 
 # ===========================================================================
 #  Helpers: beam/lateral <-> X/Y translation (spec 2: "la traduccion a X/Y
@@ -235,6 +239,9 @@ class ScannerWorker(QThread):
     busy = pyqtSignal(bool)
     error = pyqtSignal(str)
     message = pyqtSignal(str)
+    # Phase 2: result of a 'move_point' command, (token, reached). The token is
+    # the caller's own, so a sequencer can ignore answers to stale requests.
+    point_moved = pyqtSignal(int, bool)
 
     def __init__(self, port_lock, parent=None):
         super().__init__(parent)
@@ -285,6 +292,8 @@ class ScannerWorker(QThread):
             self._do_jog_unlimited(*cmd[1:])
         elif op == 'move_sequence':
             self._do_move_sequence(cmd[1])
+        elif op == 'move_point':
+            self._do_move_point(*cmd[1:])
         elif op == 'set_limits':
             self._do_set_limits(cmd[1])
         elif op == 'set_zero':
@@ -451,6 +460,44 @@ class ScannerWorker(QThread):
         finally:
             self.busy.emit(False)
 
+    def _do_move_point(self, token, targets):
+        """
+        Phase 2 (sequencer): move X/Y/Z axes to absolute targets, in order,
+        [(axis, mm), ...], then answer with point_moved(token, reached).
+        `reached` is True only if every axis read back within
+        POINT_TOLERANCE_MM of its target: Scanner.moveAxis only prints a
+        warning when the firmware rejects a move (ER), it does not raise, so
+        the readback is what tells a rejected or interrupted move apart. A
+        STOP (request_sequence_abort) ends it quietly with reached=False.
+        """
+        reached = False
+        try:
+            if self.scanner is None:
+                raise RuntimeError('scanner not connected')
+            self._abort_sequence.clear()
+            self.busy.emit(True)
+            try:
+                for axis, target in targets:
+                    if self._abort_sequence.is_set():
+                        break
+                    self.scanner.moveAxis(axis, target)
+                    pos = self.scanner.getAxis(axis)
+                    self.moved_axis.emit(axis, pos)
+                    if self._abort_sequence.is_set():
+                        break
+                    if abs(pos - target) > POINT_TOLERANCE_MM:
+                        raise RuntimeError(
+                            f'{axis} is at {pos:g}, target {target:g} '
+                            '(move rejected or interrupted)')
+                else:
+                    reached = True
+            finally:
+                self.busy.emit(False)
+        except Exception as e:
+            self.error.emit(f'Move failed: {e}')
+        finally:
+            self.point_moved.emit(token, reached)
+
     def _run_r_step_sequence(self, total_degrees, stepwise, pause_ms, unlimited):
         """
         task_scanner_r_axis.md point 1: moves R by `total_degrees` (signed,
@@ -573,6 +620,9 @@ class ScannerWorker(QThread):
 #  ScannerPanel — QWidget, runnable standalone or embeddable as a tab (phase 2)
 # ===========================================================================
 class ScannerPanel(QWidget):
+    # Emitted first thing when the panel's STOP is pressed, so a sequencer can
+    # end its sequence (the worker only aborts its own multi-step moves).
+    stop_pressed = pyqtSignal()
 
     def __init__(self, use_sim=False, parent=None):
         super().__init__(parent)
@@ -583,6 +633,10 @@ class ScannerPanel(QWidget):
         self._connected = False
         self._busy = False
         self._shut_down = False
+        # Phase 2: a sequence (see scan_sequencer.py) is running. Locks the
+        # manual movement, the session controls and disconnecting; STOP stays.
+        self._seq_active = False
+        self._seq_text = ''
         # Phase 1 gate (task_scanner_phase1.md section "Conexion"): until both
         # post-connect warnings are acknowledged, only manual movement + STOP
         # are enabled.
@@ -685,6 +739,7 @@ class ScannerPanel(QWidget):
         scroll.setWidget(content)
         layout = QVBoxLayout(content)
         layout.setSpacing(6)
+        self._content_layout = layout
 
         layout.addWidget(self._build_status_group())
         layout.addWidget(self._build_session_group())
@@ -1025,6 +1080,7 @@ class ScannerPanel(QWidget):
         self._worker.enqueue(('disconnect',))
 
     def _on_stop_clicked(self):
+        self.stop_pressed.emit()
         # FIX/ADD (2026-09): does NOT go through the worker's queue, and does
         # NOT call any Scanner method — it writes 'SSF\r' straight to the
         # shared _LockingSerialProxy from the GUI thread, exactly so it can
@@ -1381,6 +1437,69 @@ class ScannerPanel(QWidget):
         """
         return self._free_movement
 
+    # =======================================================================
+    #  API for the host window / sequencer (phase 2)
+    # =======================================================================
+    @property
+    def worker(self):
+        return self._worker
+
+    @property
+    def uses_simulator(self):
+        return self._use_sim
+
+    def sequence_blocker(self):
+        """
+        The one place that says whether a sequence may start: None if it can,
+        otherwise the reason. Covers the connection and post-connect warnings
+        of phase 1 and free-movement mode (task_scanner_freemode.md point 4).
+        """
+        if not self._connected:
+            return 'Scanner not connected.'
+        if self._awaiting_ack:
+            return 'Acknowledge the post-connect warnings first.'
+        if self.is_free_movement_active():
+            return 'Free-movement mode is active: turn it off first.'
+        if self._seq_active:
+            return 'A sequence is already running.'
+        if self._busy:
+            return 'The scanner is moving.'
+        return None
+
+    def role_axis(self, role):
+        """Physical axis ('X'/'Y'/'Z'/'R') currently playing role beam/lateral/Z/R."""
+        return self._role_axis[role]
+
+    def current_coords(self):
+        return dict(self._coords)
+
+    def axis_limit(self, axis):
+        return self._limits.get(axis)
+
+    def validate_position(self, position):
+        """None if every {axis: mm} target is inside [0, limit], else an error string."""
+        for axis, value in position.items():
+            limit = self._limits.get(axis)
+            if limit is None:
+                return 'Limits are unknown; read them first.'
+            if not (0 <= value <= limit):
+                return f'{axis} target ({value:g}) is out of range [0, {limit:g}].'
+        return None
+
+    def set_sequence_active(self, active):
+        self._seq_active = bool(active)
+        if not active:
+            self._seq_text = ''
+        self._update_enabled_state()
+
+    def set_sequence_progress(self, done, total):
+        self._seq_text = f'Sequence {done}/{total}'
+        self._update_enabled_state()
+
+    def add_tool_widget(self, widget):
+        """Add a widget (a tool's own controls) at the bottom of the scrollable panel."""
+        self._content_layout.insertWidget(self._content_layout.count() - 1, widget)
+
     def _axes_out_of_range(self):
         """Axes whose current GUI position falls outside [0, limit]."""
         return [
@@ -1578,11 +1697,11 @@ class ScannerPanel(QWidget):
     def _update_enabled_state(self):
         connected = self._connected
         unlocked = connected and not self._awaiting_ack
-        can_move = connected and not self._busy
-        can_use_session = unlocked and not self._busy
+        can_move = connected and not self._busy and not self._seq_active
+        can_use_session = unlocked and not self._busy and not self._seq_active
 
         self._btn_connect.setEnabled(not connected and not self._busy)
-        self._btn_disconnect.setEnabled(connected)
+        self._btn_disconnect.setEnabled(connected and not self._seq_active)
         self._cmb_port.setEnabled(not connected and not self._use_sim)
         self._btn_refresh.setEnabled(not connected and not self._use_sim)
 
@@ -1600,6 +1719,8 @@ class ScannerPanel(QWidget):
 
         if not connected:
             self._lbl_state.setText('Disconnected')
+        elif self._seq_active:
+            self._lbl_state.setText(self._seq_text or 'Sequence')
         elif self._busy:
             self._lbl_state.setText('Moving')
         else:

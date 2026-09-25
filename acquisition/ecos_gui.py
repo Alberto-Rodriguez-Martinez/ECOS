@@ -43,7 +43,7 @@ os.environ["QT_AUTO_SCREEN_SCALE_FACTOR"] = "1"
 os.environ["QT_SCALE_FACTOR"] = "1"
 
 from PyQt5.QtWidgets import (
-    QApplication, QMainWindow, QWidget, QTabWidget,
+    QApplication, QMainWindow, QWidget, QTabWidget, QSpinBox,
     QVBoxLayout, QHBoxLayout, QFormLayout,
     QGroupBox, QLabel, QLineEdit, QComboBox,
     QCheckBox, QPushButton, QRadioButton, QButtonGroup,
@@ -83,9 +83,10 @@ _ARGS = _arg_parser.parse_args()
 
 try:
     from scanner_panel import ScannerPanel
+    from scan_sequencer import ScanSequencer
     _SCANNER_PANEL_ERR = None
 except Exception as _sp_err:   # e.g. pyserial missing: the rest of the GUI still works
-    ScannerPanel = None
+    ScannerPanel = ScanSequencer = None
     _SCANNER_PANEL_ERR = str(_sp_err)
     print(f"[ecos_gui] Scanner tab unavailable: {_sp_err}")
 
@@ -311,6 +312,11 @@ class EcosGUI(QMainWindow):
         self._timer.timeout.connect(self._update_plots)
         self._timer.start(REALTIME_INTERVAL)
 
+        # ── Scanner sequencer (needs the timer: it pauses the live refresh) ───
+        self._sequencer = None
+        if self._scanner_panel is not None:
+            self._setup_sequencer()
+
     # ==========================================================================
     #  Menu
     # ==========================================================================
@@ -369,6 +375,8 @@ class EcosGUI(QMainWindow):
     #  Window close
     # ==========================================================================
     def closeEvent(self, event):
+        if self._sequencer is not None:
+            self._sequencer.shutdown()   # its leave hook restarts the timer: stop it after
         self._timer.stop()
         if self._scanner_panel is not None:
             self._scanner_panel.shutdown()
@@ -845,37 +853,40 @@ class EcosGUI(QMainWindow):
             self._sedaq.GetAScan()
             ch1 = self._raw_to_float(self._sedaq.DataADC1, self._reclen, quant)
             ch2 = self._raw_to_float(self._sedaq.DataADC2, self._reclen, quant)
-
-            rmin, rmax = self._region.getRegion()
-            smin = max(0, int(rmin))
-            smax = min(self._reclen, int(rmax))
-
-            x_full = self._samples_to_unit(np.arange(self._reclen))
-            x_zoom = self._samples_to_unit(np.arange(smin, smax))
-
-            if self._chk_ch1.isChecked():
-                self._curve_ov_ch1.setData(x_full, ch1)
-                if smax > smin:
-                    self._curve_zoom_ch1.setData(x_zoom, ch1[smin:smax])
-            else:
-                self._curve_ov_ch1.setData([], [])
-                self._curve_zoom_ch1.setData([], [])
-
-            if self._chk_ch2.isChecked():
-                self._curve_ov_ch2.setData(x_full, ch2)
-                if smax > smin:
-                    self._curve_zoom_ch2.setData(x_zoom, ch2[smin:smax])
-            else:
-                self._curve_ov_ch2.setData([], [])
-                self._curve_zoom_ch2.setData([], [])
-
-            if smax > smin:
-                self._plot_zoom.setXRange(
-                    self._samples_to_unit(smin),
-                    self._samples_to_unit(smax), padding=0
-                )
+            self._plot_ascans(ch1, ch2)
         except Exception as e:
             print(f"[_update_plots] {e}")
+
+    def _plot_ascans(self, ch1, ch2):
+        """Draw one pair of full-record A-scans on the zoom and overview plots."""
+        rmin, rmax = self._region.getRegion()
+        smin = max(0, int(rmin))
+        smax = min(self._reclen, int(rmax))
+
+        x_full = self._samples_to_unit(np.arange(self._reclen))
+        x_zoom = self._samples_to_unit(np.arange(smin, smax))
+
+        if self._chk_ch1.isChecked():
+            self._curve_ov_ch1.setData(x_full, ch1)
+            if smax > smin:
+                self._curve_zoom_ch1.setData(x_zoom, ch1[smin:smax])
+        else:
+            self._curve_ov_ch1.setData([], [])
+            self._curve_zoom_ch1.setData([], [])
+
+        if self._chk_ch2.isChecked():
+            self._curve_ov_ch2.setData(x_full, ch2)
+            if smax > smin:
+                self._curve_zoom_ch2.setData(x_zoom, ch2[smin:smax])
+        else:
+            self._curve_ov_ch2.setData([], [])
+            self._curve_zoom_ch2.setData([], [])
+
+        if smax > smin:
+            self._plot_zoom.setXRange(
+                self._samples_to_unit(smin),
+                self._samples_to_unit(smax), padding=0
+            )
 
     @staticmethod
     def _raw_to_float(buf, reclen, quant):
@@ -1166,7 +1177,7 @@ class EcosGUI(QMainWindow):
         except ValueError:
             return AVG_N
 
-    def _acquire_avg(self, avg_n, channels):
+    def _acquire_avg(self, avg_n, channels, reclen=None):
         """
         Average avg_n A-scans and return one full-record array per requested
         channel (1 and/or 2). A capture that comes out all zeros on any
@@ -1176,7 +1187,8 @@ class EcosGUI(QMainWindow):
         retry would hang the GUI thread with no message.
         """
         quant = 1024
-        accs  = {ch: np.zeros(self._reclen) for ch in channels}
+        reclen = self._reclen if reclen is None else reclen
+        accs  = {ch: np.zeros(reclen) for ch in channels}
         n     = 0
         tries = 0
         max_tries = AVG_MAX_ATTEMPTS_FACTOR * avg_n
@@ -1191,7 +1203,7 @@ class EcosGUI(QMainWindow):
             sigs = {
                 ch: self._raw_to_float(
                     self._sedaq.DataADC1 if ch == 1 else self._sedaq.DataADC2,
-                    self._reclen, quant)
+                    reclen, quant)
                 for ch in channels
             }
             if any(np.all(sig == 0.0) for sig in sigs.values()):
@@ -1239,6 +1251,168 @@ class EcosGUI(QMainWindow):
             QMessageBox.critical(self, "Acquisition error", str(e))
         finally:
             self._timer.start(REALTIME_INTERVAL)
+
+    # ==========================================================================
+    #  Scanner sequences (phase 2: sequencer + debug test sequence)
+    # ==========================================================================
+    def _setup_sequencer(self):
+        panel = self._scanner_panel
+        self._sequencer = ScanSequencer(
+            panel.worker, self._sedaq, self._seq_acquire,
+            coords_fn=panel.current_coords,
+            blocker_fn=panel.sequence_blocker,
+            temp_factory=self._open_seq_arduino,
+            enter_exclusive=self._timer.stop,
+            leave_exclusive=lambda: self._timer.start(REALTIME_INTERVAL),
+            parent=self,
+        )
+        seq = self._sequencer
+        panel.stop_pressed.connect(seq.abort)
+        seq.started.connect(self._on_seq_started)
+        seq.progress.connect(self._on_seq_progress)
+        seq.finished.connect(self._on_seq_finished)
+        seq.message.connect(self._on_seq_message)
+        seq.state_changed.connect(self._on_seq_state)
+        if panel.uses_simulator:
+            panel.add_tool_widget(self._build_test_sequence_group())
+            seq.point_done.connect(self._on_test_point)
+
+    def _seq_acquire(self, avg_n):
+        """Acquisition step of a sequence: averaged Ch1/Ch2, drawn on the live plots."""
+        reclen = self._sedaq.RecLen
+        ch1, ch2 = self._acquire_avg(avg_n, (1, 2), reclen)
+        if reclen == self._reclen:
+            self._plot_ascans(ch1, ch2)
+        return ch1, ch2
+
+    def _open_seq_arduino(self):
+        """One Arduino instance per sequence (its constructor waits 2 s for the
+        board to reset). None when there is no hardware: the temperature is then
+        stored as NaN, never asked for in a modal dialog."""
+        if not _HW_AVAILABLE:
+            return None
+        return Arduino(port=self._txt_arduino_port.text().strip(), baudrate=115200, N_avg=3)
+
+    def _on_seq_started(self, n):
+        self._acq_scroll.setEnabled(False)   # manual acquisition, gain, excitation...
+        self._scanner_panel.set_sequence_active(True)
+        self._scanner_panel.set_sequence_progress(0, n)
+
+    def _on_seq_progress(self, done, n, remaining_s):
+        self._scanner_panel.set_sequence_progress(done, n)
+        eta = "" if remaining_s != remaining_s else f" · ~{remaining_s:.0f} s left"
+        self._seq_status(f"Point {done}/{n}{eta}")
+
+    def _on_seq_finished(self, status, text):
+        self._acq_scroll.setEnabled(True)
+        self._scanner_panel.set_sequence_active(False)
+        self._seq_status(f"{status}: {text}")
+
+    def _on_seq_message(self, text):
+        print(f"[sequencer] {text}")
+        self._seq_status(text)
+
+    def _on_seq_state(self, state):
+        if hasattr(self, "_btn_test_run"):   # debug group exists in simulator mode only
+            self._btn_test_pause.setText("Resume" if state == "paused" else "Pause")
+            self._btn_test_run.setEnabled(state == "idle")
+            self._btn_test_pause.setEnabled(state != "idle")
+            self._btn_test_stop.setEnabled(state != "idle")
+
+    def _seq_status(self, text):
+        if hasattr(self, "_lbl_test_seq"):
+            self._lbl_test_seq.setText(text)
+
+    # -- debug test sequence (simulator only): validates the whole cycle ------
+    def _build_test_sequence_group(self):
+        box = QGroupBox("Debug: test sequence (simulator only)")
+        form = QFormLayout(box)
+        self._spin_test_n = QSpinBox()
+        self._spin_test_n.setRange(2, 500)
+        self._spin_test_n.setValue(10)
+        self._spin_test_span = QDoubleSpinBox()
+        self._spin_test_span.setRange(0.1, 100.0)
+        self._spin_test_span.setValue(10.0)
+        self._spin_test_span.setSuffix(" mm")
+        self._spin_test_settle = QSpinBox()
+        self._spin_test_settle.setRange(0, 5000)
+        self._spin_test_settle.setValue(100)
+        self._spin_test_settle.setSuffix(" ms")
+        self._spin_test_avg = QSpinBox()
+        self._spin_test_avg.setRange(1, 200)
+        self._spin_test_avg.setValue(5)
+        form.addRow("Points along lateral axis:", self._spin_test_n)
+        form.addRow("Span (centred here):", self._spin_test_span)
+        form.addRow("Settle:", self._spin_test_settle)
+        form.addRow("Averages:", self._spin_test_avg)
+
+        row = QHBoxLayout()
+        self._btn_test_run = QPushButton("Run")
+        self._btn_test_pause = QPushButton("Pause")
+        self._btn_test_stop = QPushButton("Stop")
+        self._btn_test_pause.setEnabled(False)
+        self._btn_test_stop.setEnabled(False)
+        self._btn_test_run.clicked.connect(self._on_test_seq_run)
+        self._btn_test_pause.clicked.connect(self._on_test_seq_pause)
+        self._btn_test_stop.clicked.connect(self._sequencer.stop)
+        for b in (self._btn_test_run, self._btn_test_pause, self._btn_test_stop):
+            row.addWidget(b)
+        form.addRow(row)
+        self._lbl_test_seq = QLabel("Idle.")
+        self._lbl_test_seq.setWordWrap(True)
+        form.addRow(self._lbl_test_seq)
+        return box
+
+    def _on_test_seq_run(self):
+        panel = self._scanner_panel
+        axis = panel.role_axis('lateral')
+        limit = panel.axis_limit(axis)
+        if limit is None or not panel.current_coords():
+            self._lbl_test_seq.setText("Connect the scanner first.")
+            return
+        n = self._spin_test_n.value()
+        span = min(self._spin_test_span.value(), limit)
+        centre = panel.current_coords()[axis]
+        lo = min(max(centre - span / 2.0, 0.0), limit - span)   # keep [lo, lo+span] inside [0, limit]
+        positions = [{axis: round(float(x), 2)} for x in np.linspace(lo, lo + span, n)]   # 0.01 mm resolution
+
+        self._plot_scan.clear()
+        self._plot_scan.setTitle("Test sequence: max amplitude")
+        self._plot_scan.setLabel('bottom', f"{axis} position", units='mm')
+        self._plot_scan.setLabel('left', 'Max |amplitude|', units='a.u.')
+        self._test_xs, self._test_y1, self._test_y2 = [], [], []
+        self._test_curve1 = self._plot_scan.plot(
+            pen=pg.mkPen('r', width=1), symbol='o', symbolSize=6, symbolBrush='r')
+        self._test_curve2 = self._plot_scan.plot(
+            pen=pg.mkPen('y', width=1), symbol='o', symbolSize=6, symbolBrush='y')
+        self._test_axis = axis
+
+        reason = self._sequencer.start(
+            positions, self._spin_test_settle.value(), self._spin_test_avg.value(),
+            lambda ch1, ch2: (float(np.max(np.abs(ch1))), float(np.max(np.abs(ch2)))),
+            temp_after=[n - 1],
+            validate_fn=panel.validate_position,
+        )
+        if reason:
+            self._lbl_test_seq.setText(reason)
+            return
+        self._show_scanner_plot()
+
+    def _on_test_seq_pause(self):
+        if self._sequencer.state == "paused":
+            self._sequencer.resume()
+        else:
+            self._sequencer.pause()
+
+    def _on_test_point(self, i, coords, value):
+        try:
+            self._test_xs.append(coords[self._test_axis])
+            self._test_y1.append(value[0])
+            self._test_y2.append(value[1])
+            self._test_curve1.setData(self._test_xs, self._test_y1)
+            self._test_curve2.setData(self._test_xs, self._test_y2)
+        except Exception as e:
+            print(f"[test sequence] {e}")
 
     # ==========================================================================
     #  Windowing
