@@ -31,8 +31,14 @@ import time
 os.environ.setdefault("QT_AUTO_SCREEN_SCALE_FACTOR", "1")
 
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
-_HW_SCANNER_DIR = os.path.join(_THIS_DIR, '..', 'hardware', 'scanner')
-sys.path.insert(0, _HW_SCANNER_DIR)
+_REPO_ROOT = os.path.abspath(os.path.join(_THIS_DIR, '..'))
+_HW_SCANNER_DIR = os.path.join(_REPO_ROOT, 'hardware', 'scanner')
+# The driver is imported by package path (hardware.scanner.Scanner), never as a
+# bare `Scanner`: tools/Scanner.py is an unrelated old driver, and with both
+# directories on sys.path the order would silently decide which one loads.
+# Appended (not inserted) so it cannot shadow anything else.
+if _REPO_ROOT not in sys.path:
+    sys.path.append(_REPO_ROOT)
 
 import serial
 import serial.tools.list_ports
@@ -44,8 +50,8 @@ from PyQt5.QtWidgets import (
     QScrollArea, QFrame, QCheckBox,
 )
 
-from Scanner import Scanner
-from sim_scanner import FakeSerial
+from hardware.scanner.Scanner import Scanner
+from hardware.scanner.sim_scanner import FakeSerial
 
 # ---------------------------------------------------------------------------
 # Constants

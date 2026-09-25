@@ -77,6 +77,11 @@ if _ARGS.demo:
     print("[ecos_gui] Demo mode — hardware import skipped (--demo flag).")
 else:
     try:
+        if sys.maxsize > 2**32:
+            # SeDaqDLL.dll is 32-bit: constructing SeDaqDLL() in a 64-bit
+            # process crashes the interpreter (access violation) instead of
+            # raising, so it can never be left to the except below.
+            raise RuntimeError("SeDaqDLL.dll requires 32-bit Python")
         from SeDaq import SeDaqDLL
         from GenCode_ToolBox import MakeGenCode
         from ECOS_US_ToolBox import MakeWindow, Envelope, LongVelocity_Thickness
@@ -101,6 +106,7 @@ AVG_N_LIVE        = 1
 AVG_N             = 25
 REALTIME_INTERVAL = 34       # ms (~30 fps)
 DEFAULT_COM       = "COM3"
+AVG_MAX_ATTEMPTS_FACTOR = 4  # captures tried per requested average before giving up
 
 BITS_OPTIONS = {
     "8 bit":  256,
@@ -162,6 +168,10 @@ class _DemoSeDaq:
 
     def Close(self):
         print("[Demo] Close")
+
+
+class AcquisitionError(RuntimeError):
+    """The digitizer did not deliver usable captures."""
 
 
 # ==============================================================================
@@ -1108,22 +1118,45 @@ class EcosGUI(QMainWindow):
         except ValueError:
             return AVG_N
 
+    def _acquire_avg(self, avg_n, channels):
+        """
+        Average avg_n A-scans and return one full-record array per requested
+        channel (1 and/or 2). A capture that comes out all zeros on any
+        requested channel is discarded and retried, but only up to
+        AVG_MAX_ATTEMPTS_FACTOR * avg_n captures in total: with the hardware
+        disconnected or failing every capture is all zeros, and an unbounded
+        retry would hang the GUI thread with no message.
+        """
+        quant = 1024
+        accs  = {ch: np.zeros(self._reclen) for ch in channels}
+        n     = 0
+        tries = 0
+        max_tries = AVG_MAX_ATTEMPTS_FACTOR * avg_n
+        while n < avg_n:
+            if tries >= max_tries:
+                raise AcquisitionError(
+                    f"Acquisition failed: only {n} of {avg_n} valid captures after "
+                    f"{tries} attempts (all-zero signals; is the digitizer connected?)"
+                )
+            tries += 1
+            self._sedaq.GetAScan()
+            sigs = {
+                ch: self._raw_to_float(
+                    self._sedaq.DataADC1 if ch == 1 else self._sedaq.DataADC2,
+                    self._reclen, quant)
+                for ch in channels
+            }
+            if any(np.all(sig == 0.0) for sig in sigs.values()):
+                continue
+            for ch, sig in sigs.items():
+                accs[ch] += sig
+            n += 1
+        return [accs[ch] / avg_n for ch in channels]
+
     def _acquire_ch_avg(self, channel, smin, smax):
         """Average N A-scans from channel 1 or 2 and return the windowed slice."""
-        avg_n = self._get_avg_n()
-        quant = 1024
-        acc   = np.zeros(self._reclen)
-        n     = 0
-        while n < avg_n:
-            self._sedaq.GetAScan()
-            if channel == 1:
-                sig = self._raw_to_float(self._sedaq.DataADC1, self._reclen, quant)
-            else:
-                sig = self._raw_to_float(self._sedaq.DataADC2, self._reclen, quant)
-            if not np.all(sig == 0.0):
-                acc += sig
-                n   += 1
-        return (acc / avg_n)[smin:smax]
+        avg = self._acquire_avg(self._get_avg_n(), (channel,))[0]
+        return avg[smin:smax]
 
     # ==========================================================================
     #  Acquisition buttons
