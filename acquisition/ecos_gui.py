@@ -43,7 +43,7 @@ os.environ["QT_AUTO_SCREEN_SCALE_FACTOR"] = "1"
 os.environ["QT_SCALE_FACTOR"] = "1"
 
 from PyQt5.QtWidgets import (
-    QApplication, QMainWindow, QWidget,
+    QApplication, QMainWindow, QWidget, QTabWidget,
     QVBoxLayout, QHBoxLayout, QFormLayout,
     QGroupBox, QLabel, QLineEdit, QComboBox,
     QCheckBox, QPushButton, QRadioButton, QButtonGroup,
@@ -58,6 +58,11 @@ import pyqtgraph as pg
 sys.path.insert(0, _TOOLS_DIR)
 sys.path.insert(0, _HW_DIR)
 sys.path.insert(0, _DB_DIR)
+# acquisition/ itself, for scanner_panel: os.chdir(tools/) above means the
+# script directory cannot be assumed to be found through the cwd.
+_ACQ_DIR = os.path.dirname(os.path.abspath(__file__))
+if _ACQ_DIR not in sys.path:
+    sys.path.append(_ACQ_DIR)
 
 import warnings
 warnings.filterwarnings("ignore", category=RuntimeWarning)
@@ -70,7 +75,19 @@ _arg_parser.add_argument(
     "--demo", action="store_true",
     help="Run without hardware (simulated signals)."
 )
+_arg_parser.add_argument(
+    "--scanner-sim", action="store_true",
+    help="Use the scanner serial simulator (implied by demo mode)."
+)
 _ARGS = _arg_parser.parse_args()
+
+try:
+    from scanner_panel import ScannerPanel
+    _SCANNER_PANEL_ERR = None
+except Exception as _sp_err:   # e.g. pyserial missing: the rest of the GUI still works
+    ScannerPanel = None
+    _SCANNER_PANEL_ERR = str(_sp_err)
+    print(f"[ecos_gui] Scanner tab unavailable: {_sp_err}")
 
 if _ARGS.demo:
     _HW_AVAILABLE = False
@@ -257,6 +274,12 @@ class EcosGUI(QMainWindow):
             self._sedaq = _DemoSeDaq()
             self._demo  = True
 
+        # ── Scanner panel (embedded as a tab, see _build_right_panel) ─────────
+        if ScannerPanel is not None:
+            self._scanner_panel = ScannerPanel(use_sim=self._demo or _ARGS.scanner_sim)
+        else:
+            self._scanner_panel = None
+
         # ── Build UI ──────────────────────────────────────────────────────────
         central = QWidget()
         self.setCentralWidget(central)
@@ -347,6 +370,8 @@ class EcosGUI(QMainWindow):
     # ==========================================================================
     def closeEvent(self, event):
         self._timer.stop()
+        if self._scanner_panel is not None:
+            self._scanner_panel.shutdown()
         try:
             with open(SESSION_FILE, 'w') as f:
                 json.dump(self._collect_session(), f, indent=2)
@@ -429,7 +454,16 @@ class EcosGUI(QMainWindow):
         self._cursor_label.hide()
         self._plot_zoom.scene().sigMouseMoved.connect(self._on_mouse_moved)
 
-        layout.addWidget(self._plot_zoom, stretch=3)
+        # The big plot lives in a tab widget: "A-scan" is the live zoom plot,
+        # "Scanner" is where the scanner tools draw (focus curve, flatness
+        # lines, scan map). The overview below stays outside the tabs so the
+        # live A-scan is always visible.
+        self._left_tabs = QTabWidget()
+        self._left_tabs.addTab(self._plot_zoom, "A-scan")
+        self._plot_scan = pg.PlotWidget(title="Scanner")
+        self._plot_scan.showGrid(x=True, y=True, alpha=0.3)
+        self._left_tabs.addTab(self._plot_scan, "Scanner")
+        layout.addWidget(self._left_tabs, stretch=3)
 
         # Overview plot
         self._plot_ov = pg.PlotWidget(title="Overview — full record")
@@ -477,7 +511,21 @@ class EcosGUI(QMainWindow):
         layout.addWidget(self._build_block_descriptor())
         layout.addWidget(self._build_block_save())
         layout.addStretch()
-        return scroll
+        self._acq_scroll = scroll
+
+        self._right_tabs = QTabWidget()
+        self._right_tabs.addTab(scroll, "Acquisition")
+        if self._scanner_panel is not None:
+            self._right_tabs.addTab(self._scanner_panel, "Scanner")
+        else:
+            lbl = QLabel(f"Scanner unavailable:\n{_SCANNER_PANEL_ERR}")
+            lbl.setAlignment(Qt.AlignCenter)
+            self._right_tabs.addTab(lbl, "Scanner")
+        return self._right_tabs
+
+    def _show_scanner_plot(self):
+        """Bring the big plot to the "Scanner" tab (called when a scanner tool starts)."""
+        self._left_tabs.setCurrentWidget(self._plot_scan)
 
     # ==========================================================================
     #  Block 1 — Pulser Control

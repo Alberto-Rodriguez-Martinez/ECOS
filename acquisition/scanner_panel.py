@@ -9,15 +9,16 @@ task_scanner_jog.md, and task_scanner_freemode.md for the free-movement mode
 and the port-list wording): worker thread + command queue, status, session
 (beam axis, PE side, limits, speed), manual movement (per-axis jog + Go/Go to
 origin), free-movement mode (unlimited signed jog, no GUI/firmware limit
-protection) and STOP. NOT wired into ecos_gui.py (that is phase 2) and no
-focus/flatness/scan tools yet (task_scanner_freemode.md point 4: those must
+protection) and STOP. Phase 2 (task_scanner_phase2.md): the panel is also
+embedded as a tab of ecos_gui.py (shutdown() is then called by the host window).
+No focus/flatness/scan tools yet (task_scanner_freemode.md point 4: those must
 gate on ScannerPanel.is_free_movement_active() once they exist).
 
 Run standalone:
     python acquisition/scanner_panel.py          (real hardware)
     python acquisition/scanner_panel.py --sim     (simulator, no hardware needed)
 
-Requires (Python 32-bit): numpy, pyserial, PyQt5, pyqtgraph 0.11. No scipy.
+Requires: numpy, pyserial, PyQt5 (no scipy, no pyqtgraph: works in the 32-bit .venv).
 """
 import argparse
 import json
@@ -581,6 +582,7 @@ class ScannerPanel(QWidget):
 
         self._connected = False
         self._busy = False
+        self._shut_down = False
         # Phase 1 gate (task_scanner_phase1.md section "Conexion"): until both
         # post-connect warnings are acknowledged, only manual movement + STOP
         # are enabled.
@@ -1625,13 +1627,27 @@ class ScannerPanel(QWidget):
     #  Shutdown
     # =======================================================================
     def closeEvent(self, event):
+        self.shutdown()
+        event.accept()
+
+    def shutdown(self):
+        """
+        Save the session, stop any move in flight, close the port and stop the
+        worker thread. Called from closeEvent when run standalone and by the
+        host window when the panel is embedded as a tab (a child widget gets no
+        closeEvent of its own). Safe to call more than once.
+        """
+        if self._shut_down:
+            return
+        self._shut_down = True
         self._capture_role_edits_into_state()
         self._write_session_file()
         if self._worker is not None:
+            if self._busy:
+                self._on_stop_clicked()
             self._worker.enqueue(('disconnect',))
             self._worker.stop_thread()
             self._worker.wait(2000)
-        event.accept()
 
 
 # ===========================================================================
