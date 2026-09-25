@@ -1,6 +1,6 @@
 # Especificación: pestaña Escáner en ECOS
 
-Estado: borrador para revisión (2026-09-21). **No implementar hasta aprobación.**
+Estado: aprobada. Fase 1 implementada y probada en hardware (21–24/09). Última revisión: 2026-09-25.
 
 ## 1. Contexto
 
@@ -38,14 +38,19 @@ Escáner XYZR (controlador SE SC-03-00) para posicionar muestras de PVA dentro d
 
 - **Driver**: `hardware/scanner/Scanner.py`, sin cambios de API.
 - **Worker**: `ScannerWorker` (QThread), único dueño del puerto serie. Recibe órdenes por cola y emite señales: `moved(coords)`, `error(str)`, `busy(bool)`, `progress(i, n)`. Ninguna llamada al puerto desde el hilo de la GUI.
-- **Secuenciador genérico**: un solo bucle para foco, planitud y barridos.
+- **Secuenciador genérico**: uno solo para foco, planitud y barridos.
   - Entrada: lista de posiciones, tiempo de espera tras cada movimiento, número de promedios y una función de medida por punto.
   - Por cada punto: mover → esperar el `OK` → esperar el tiempo de asentamiento → adquirir N veces y promediar → calcular la medida → emitir el resultado.
   - Admite pausa, continuar y parada.
-- **Acceso al SeDaq**: el secuenciador adquiere usando la misma función de adquisición de `ecos_gui.py`. Durante una secuencia, el refresco en vivo se pausa o se sirve con esas mismas adquisiciones, para que nunca haya dos accesos simultáneos al SeDaq. **Claude Code: identificar en `ecos_gui.py` la función de adquisición y el temporizador de refresco antes de proponer la integración.**
+- **El secuenciador es dirigido por eventos, no un bucle** (decidido el 25/09, tras el análisis de `ecos_gui.py`). Vive en el hilo de la GUI y avanza así:
+  1. Pide el movimiento al `ScannerWorker`, que está en su hilo, y devuelve el control enseguida.
+  2. Al recibir `moved`, programa un `QTimer.singleShot` con el tiempo de asentamiento.
+  3. Al vencer, adquiere **en el hilo de la GUI**, calcula la medida, actualiza la gráfica y pide el punto siguiente.
+  - Motivo: el SeDaq se sigue tocando siempre desde el mismo hilo que hoy, así que no hace falta ningún lock ni suponer nada sobre la seguridad de la DLL. La ventana no se congela, porque lo largo (el movimiento) ocurre en el worker. Pausa y parada funcionan entre puntos, sin `processEvents()`.
+- **Acceso al SeDaq**: el secuenciador adquiere con la misma función de `ecos_gui.py`. Al empezar una secuencia se para el `QTimer` de refresco en vivo y se reanuda al terminar, que es el patrón que ya usan `_on_acquire_pett`, `_on_acquire_wp` y `_on_preview_window`. Durante la secuencia, cada punto repinta la gráfica, así que no se pierde la sensación de tiempo real.
 - **Ubicación del código**: la GUI va en `acquisition/scanner_panel.py`, y en `hardware/` solo el driver. El panel es un QWidget que se puede ejecutar solo para pruebas (`python scanner_panel.py`) o insertar como pestaña en `ecos_gui.py`.
-- **Estimadores**: reutilizar los de ECOS para el tiempo de vuelo y la envolvente (Hilbert). No duplicar el procesado.
-- **Sin scipy en 32 bits**: todo el código de la pestaña (y lo que importe) debe funcionar solo con numpy, porque scipy no se instala en Python 3.12 de 32 bits. Hilbert se calcula con FFT de numpy y los ajustes con `numpy.polyfit`. Si un estimador de ECOS que se quiera reutilizar usa scipy, portarlo a numpy.
+- **Estimadores**: reutilizar los de ECOS para el tiempo de vuelo y la envolvente (Hilbert), sin duplicar el procesado.
+- **Entornos** (corregido el 25/09): `ecos_gui.py` importa scipy al cargar y funciona en la máquina de adquisición, luego allí hay scipy. **No hay que portar nada a numpy.** El `.venv32` del portátil de desarrollo no tiene scipy, así que la GUI integrada se desarrolla y se prueba en el `.venv` de 64 bits (con `_DemoSeDaq` y el simulador del escáner); el `.venv32` queda para `scanner_panel.py --sim`, que solo necesita pyserial, PyQt5 y numpy. La prueba en 32 bits se hace en la máquina con el hardware.
 
 ## 4. Distribución en pantalla
 
@@ -139,11 +144,28 @@ Flujo al pulsar Inicio:
 Cada referencia (inicial y final) se guarda en el archivo del barrido con: señales de Ch1 y Ch2, ganancias, posición, hora y temperatura.
 
 #### Temperatura
-Si los PT100 están conectados, se registra la temperatura en cada punto del barrido y en cada referencia. Si no, se guarda como no disponible (NaN) y se avisa al empezar.
-- Guardado: **un archivo por barrido**. Propuesta, a confirmar:
-  - `.npz` con las señales (N_z × N_lat × N_muestras), las coordenadas reales de cada punto, la temperatura por punto y las referencias en agua (si se tomaron).
-  - Metadatos en JSON como en el resto de ECOS: parámetros del barrido y del pulser, sesión del escáner, `operator` y comentario.
-  - Nombre según la convención de ECOS, con `SCAN` como tipo, guardado en `../database`.
+- **No se lee en cada punto.** El agua de la vasija cambia despacio y cada lectura cuesta ~2 s, porque `Arduino.__init__` espera el reinicio del puerto. Se lee: al empezar el barrido, al terminarlo, en cada referencia en agua y, en un barrido de superficie, al acabar cada línea.
+- Durante una secuencia se abre **una sola instancia de `Arduino`** y se reutiliza, cerrándola al final. El patrón actual de `_read_temperature` (crear y cerrar en cada lectura) no sirve aquí.
+- Cada valor se guarda con su marca de tiempo y el índice del punto en que se tomó, para poder interpolar después.
+- Si los PT100 no están disponibles, se guarda NaN y se avisa al empezar. **Nunca se abre el diálogo manual de temperatura durante un barrido**: `_read_temperature` cae hoy a `_ask_manual_temperature`, que es modal y bloquearía la secuencia. Hace falta un modo «no preguntar, marcar NaN y seguir».
+
+#### Guardado
+**Una carpeta por barrido**, siguiendo la convención del resto de ECOS:
+
+```
+PVA_10_PG_5_A_C005_SCAN_20260925_171200/
+  meta.json    specimen, protocol, equipment (parámetros del pulser), bloque scanner_session,
+               parámetros del barrido, operator y comentario. schema_version: "scan-32-1.0"
+  scan.npz     señales (N_línea × N_punto × N_muestras) por canal, coordenadas reales de cada
+               punto, temperaturas con su marca de tiempo e índice, y las referencias en agua
+               con su ganancia, posición, hora y temperatura
+```
+
+- Sin `results.json`: en un barrido los resultados se calculan después, en el análisis.
+- **Se guarda automáticamente en `../database`**, con el nombre de la convención de ECOS y `SCAN` como tipo, para que `analysis/ecos_loader.py` pueda catalogarlo. Un botón «Guardar en otra carpeta…» permite elegir otra ubicación.
+- El bloque `scanner_session` es el diccionario que ya produce `ScannerPanel`, que es serializable a JSON.
+- Hace falta **una función nueva** (p. ej. `save_scan_raw_32`): `save_experiment_raw_32` valida que haya exactamente tres señales 1D de igual longitud y no admite un cubo. Se reutiliza su esquema de metadatos, no su firma.
+- `operator` está hoy fijo como «Sebas» en `BD_Experimentos_PVA.py`. En la función nueva debe ser un campo.
 
 ## 6. Seguridad
 
@@ -167,7 +189,15 @@ Cada fase termina con prueba en hardware y commit.
 
 ## 8. Puntos abiertos
 
-- Formato de guardado de los barridos (sección 5.6).
-- Estimador de tiempo de vuelo que se reutiliza de ECOS.
-- Si el STOP funciona con el worker bloqueado en `write()` (fase 1).
+- **Duración real de `GetAScan()`**, con y sin promediado, para el `RecLen` que use el escáner. Hay que medirla en el hardware: de ella dependen el número de promedios y el tiempo estimado de un barrido.
+- **Tiempo de asentamiento tras un movimiento.** No hay ningún valor de referencia; hay que caracterizar la vibración residual del soporte en el equipo real.
+- Confirmar que `import ECOS_US_ToolBox` funciona en el Python de la máquina de adquisición (sección 3).
+- Estimador de tiempo de vuelo que se reutiliza de ECOS: `LongVelocity_Thickness` usa `CalcToFAscanCosine_XCRFFT`, que es el candidato.
+- `BITS_OPTIONS` en `ecos_gui.py` parece código muerto: el cuantizador está fijo a 1024 en `_update_plots` y `_acquire_ch_avg`. Aclararlo si el foco necesita conocer la resolución real del ADC.
 - Relación entre el parámetro de velocidad y los mm/s de cada eje: calibrar si se necesita una velocidad concreta.
+
+### Resueltos
+- Formato y ubicación del guardado de barridos: sección 5.6 (25/09).
+- Hilo del secuenciador: dirigido por eventos en el hilo de la GUI, sección 3 (25/09).
+- scipy: no hay que portar nada, sección 3 (25/09).
+- El STOP funciona con el worker bloqueado en `write()`: verificado en hardware (22–24/09).
