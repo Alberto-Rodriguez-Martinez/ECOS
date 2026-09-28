@@ -41,19 +41,24 @@ Conoce la posición del escáner (se la inyecta el panel tras cada movimiento) y
 ## 2. Herramienta de Foco (spec 5.4)
 
 ### Interfaz, en la pestaña Escáner
-- Parámetros: rango ±N mm en el eje del haz alrededor de la posición actual, paso grueso, paso fino, número de promedios y ventana temporal de búsqueda del eco.
+- Parámetros: rango ±N mm en el eje del haz alrededor de la posición actual, paso grueso, paso fino y número de promedios.
+- **No hay parámetro de ventana.** La búsqueda se hace dentro de la ventana de adquisición Smin–Smax que el usuario ya tiene puesta en la pestaña Acquisition, que es la que coloca mirando el A-scan. La herramienta **solo la lee**: no la modifica y no hay nada que restaurar.
 - Botón Ejecutar, y el STOP de siempre.
 - Al lanzarla, la gráfica grande pasa a la pestaña Escáner.
 
-### Ventana de búsqueda que sigue al eco
-Al moverse 1 mm en el eje del haz, el eco se desplaza `2/c_w ≈ 1,33 µs`. Con una ventana fija, el eco se sale a los pocos milímetros. Implementa la ventana ancha con búsqueda del máximo dentro de ella, y deja la recolocación predictiva anotada como alternativa si el ruido resulta ser un problema. Explica en el código por qué se elige.
+### El eco se desplaza: aviso, no parámetro
+Al moverse 1 mm en el eje del haz, el eco se desplaza `2/c_w ≈ 1,33 µs`, así que en un rango de ±5 mm recorre unos 13 µs. Si la ventana Smin–Smax es estrecha, el eco se sale por un extremo y la curva de foco queda cortada, con un máximo falso en el borde.
+
+No se resuelve con una ventana propia, sino avisando: si en algún punto del barrido el máximo de la envolvente cae **pegado a un borde de la ventana** (dentro de un margen configurable, por ejemplo el 5 % de su anchura), se avisa de que hay que ampliar Smin–Smax y se marcan esos puntos en la gráfica. El usuario la ve en pantalla y la ajusta.
+
+Este aviso se comprueba durante el barrido, no solo al final, para poder avisar cuanto antes.
 
 ### Algoritmo
 1. Barrido grueso en todo el rango, recortado a los límites de sesión, avisando si se recorta.
 2. Barrido fino alrededor del máximo.
 3. Ajuste parabólico **sobre la amplitud en dB**, con 3–5 puntos alrededor del máximo. El perfil axial cerca del foco se aproxima a una gaussiana, y una gaussiana en logaritmo es una parábola, así que el ajuste es el adecuado y no una aproximación de conveniencia.
 4. Mover al óptimo.
-- Medida por punto: pico de la envolvente (`Envelope` de `ECOS_US_ToolBox`, que ya usa Hilbert) del eco dentro de la ventana.
+- Medida por punto: pico de la envolvente (`Envelope` de `ECOS_US_ToolBox`, que ya usa Hilbert) dentro de Smin–Smax. **Nunca sobre todo el registro**: fuera de la ventana hay el pulso de excitación, reverberaciones y otros ecos que darían un máximo que no es el de la cara frontal.
 - Si el máximo cae en el borde del rango: avisar («amplía el rango») y **no moverse**.
 - No guarda nada.
 
@@ -63,7 +68,10 @@ Amplitud frente a posición: los puntos medidos, la parábola ajustada y una mar
 ### Ejecución
 Usa el secuenciador de la fase 2 tal cual. No escribas un bucle nuevo.
 
-## 3. Valores por defecto pendientes de medir
+## 3. Secuencia de prueba de la fase 2
+La secuencia de depuración añadida en la fase 2 mide hoy, probablemente, sobre todo el registro. Alinéala con lo anterior: que mida dentro de Smin–Smax, igual que el foco.
+
+## 4. Valores por defecto pendientes de medir
 El tiempo de asentamiento y el número de promedios no están caracterizados en el equipo real. Pon valores razonables (por ejemplo, 200 ms y 10 promedios), **marcados en el código como pendientes de medir**, y que sean editables desde la interfaz.
 
 ## Verificación
@@ -75,7 +83,9 @@ Todo en `~\anaconda3_32` (32 bits, Python 3.9.7).
 4. Con el rango saliéndose de los límites de sesión, lo recorta y avisa.
 5. STOP a mitad: se detiene, el refresco en vivo vuelve y el escáner no se mueve al óptimo.
 6. La gráfica se ve correctamente, con la parábola y el óptimo marcados.
-7. `python -m unittest` de todos los tests del proyecto sigue pasando.
+7. Con una ventana Smin–Smax demasiado estrecha para el rango, avisa de que hay que ampliarla y marca los puntos afectados.
+8. Ni el foco ni la secuencia de prueba modifican Smin–Smax.
+9. `python -m unittest` de todos los tests del proyecto sigue pasando.
 
 ## No hacer
 - Planitud y barridos (fases 4 a 6).
