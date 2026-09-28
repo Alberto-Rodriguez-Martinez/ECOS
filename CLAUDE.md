@@ -33,6 +33,16 @@ APWP (Adaptive Pulse Waveform Programming) está previsto para fases futuras —
 - Frecuencia de muestreo adquisición: 100 MHz
 - Diseño de medidas: repeated-measures sobre ciclos freeze-thaw
 
+## Tests
+`python -m unittest` desde la raíz no descubre ninguno: `acquisition/` no es un
+paquete (no tiene `__init__.py`). Hay que lanzar cada carpeta por separado, desde la raíz:
+- `python -m unittest discover -s acquisition`
+- `python -m unittest discover -s hardware/scanner`
+
+Se ejecutan en el entorno de producción de 32 bits (`conda run -p ~\anaconda3_32 python -m unittest ...`).
+`hardware/scanner/test_connection.py` es un script manual para el hardware real: el
+discover lo importa pero no ejecuta nada.
+
 ## Tarea actual
 Antes de desarrollar código nuevo, auditar la carpeta `tools/` para identificar:
 - Funciones duplicadas o solapadas

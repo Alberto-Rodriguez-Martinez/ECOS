@@ -89,7 +89,8 @@ from sim_sedaq import SimSeDaq, make_params_widget as make_sim_params_widget
 
 try:
     from scanner_panel import ScannerPanel
-    from scan_sequencer import ScanSequencer
+    from scan_sequencer import ScanSequencer, DEFAULT_AVG_N, DEFAULT_SETTLE_MS
+    from focus_tool import FocusTool, FocusGroup, window_peak
     _SCANNER_PANEL_ERR = None
 except Exception as _sp_err:   # e.g. pyserial missing: the rest of the GUI still works
     ScannerPanel = ScanSequencer = None
@@ -1236,6 +1237,12 @@ class EcosGUI(QMainWindow):
         seq.message.connect(self._on_seq_message)
         seq.state_changed.connect(self._on_seq_state)
 
+        # Focus (phase 3): reads Smin–Smax of the Acquisition tab, never sets it.
+        self._focus_tool = FocusTool(seq, panel, self._get_smin_smax, self._plot_scan,
+                                     show_plot_fn=self._show_scanner_plot,
+                                     cw_fn=lambda: self._state.Cw_mean, parent=self)
+        panel.add_tool_widget(FocusGroup(self._focus_tool, seq, self._get_smin_smax))
+
         if isinstance(self._sedaq, SimSeDaq):
             panel.scanner_state_changed.connect(self._push_scanner_state_to_sim)
             self._push_scanner_state_to_sim()
@@ -1280,6 +1287,7 @@ class EcosGUI(QMainWindow):
         self._acq_scroll.setEnabled(True)
         self._scanner_panel.set_sequence_active(False)
         self._seq_status(f"{status}: {text}")
+        self._test_seq_running = False
 
     def _on_seq_message(self, text):
         print(f"[sequencer] {text}")
@@ -1293,7 +1301,8 @@ class EcosGUI(QMainWindow):
             self._btn_test_stop.setEnabled(state != "idle")
 
     def _seq_status(self, text):
-        if hasattr(self, "_lbl_test_seq"):
+        # Only the debug test sequence reports here; the focus tool has its own label.
+        if getattr(self, "_test_seq_running", False):
             self._lbl_test_seq.setText(text)
 
     # -- debug test sequence (simulator only): validates the whole cycle ------
@@ -1309,11 +1318,11 @@ class EcosGUI(QMainWindow):
         self._spin_test_span.setSuffix(" mm")
         self._spin_test_settle = QSpinBox()
         self._spin_test_settle.setRange(0, 5000)
-        self._spin_test_settle.setValue(100)
+        self._spin_test_settle.setValue(DEFAULT_SETTLE_MS)   # pending measurement
         self._spin_test_settle.setSuffix(" ms")
         self._spin_test_avg = QSpinBox()
         self._spin_test_avg.setRange(1, 200)
-        self._spin_test_avg.setValue(5)
+        self._spin_test_avg.setValue(DEFAULT_AVG_N)          # pending measurement
         form.addRow("Points along lateral axis:", self._spin_test_n)
         form.addRow("Span (centred here):", self._spin_test_span)
         form.addRow("Settle:", self._spin_test_settle)
@@ -1349,24 +1358,38 @@ class EcosGUI(QMainWindow):
         lo = min(max(centre - span / 2.0, 0.0), limit - span)   # keep [lo, lo+span] inside [0, limit]
         positions = [{axis: round(float(x), 2)} for x in np.linspace(lo, lo + span, n)]   # 0.01 mm resolution
 
+        # Measured inside Smin–Smax (read only), like the focus tool.
+        smin, smax = self._get_smin_smax()
+        if smax - smin < 16:
+            self._lbl_test_seq.setText(f"Acquisition window Smin–Smax too short ({smin}–{smax}).")
+            return
+
         self._plot_scan.clear()
-        self._plot_scan.setTitle("Test sequence: max amplitude")
+        self._plot_scan.setTitle(f"Test sequence: envelope peak in Smin–Smax ({smin}–{smax})")
         self._plot_scan.setLabel('bottom', f"{axis} position", units='mm')
-        self._plot_scan.setLabel('left', 'Max |amplitude|', units='a.u.')
+        self._plot_scan.setLabel('left', 'Envelope peak', units='a.u.')
+        self._plot_scan.getAxis('bottom').enableAutoSIPrefix(False)
+        self._plot_scan.getAxis('left').enableAutoSIPrefix(False)
+        self._plot_scan.enableAutoRange()
         self._test_xs, self._test_y1, self._test_y2 = [], [], []
         self._test_curve1 = self._plot_scan.plot(
-            pen=pg.mkPen('r', width=1), symbol='o', symbolSize=6, symbolBrush='r')
+            pen=pg.mkPen((255, 0, 0), width=1), symbol='o', symbolSize=6,
+            symbolBrush=(255, 0, 0))
         self._test_curve2 = self._plot_scan.plot(
-            pen=pg.mkPen('y', width=1), symbol='o', symbolSize=6, symbolBrush='y')
+            pen=pg.mkPen((255, 255, 0), width=1), symbol='o', symbolSize=6,
+            symbolBrush=(255, 255, 0))
         self._test_axis = axis
 
+        self._test_seq_running = True
         reason = self._sequencer.start(
             positions, self._spin_test_settle.value(), self._spin_test_avg.value(),
-            lambda ch1, ch2: (float(np.max(np.abs(ch1))), float(np.max(np.abs(ch2)))),
+            lambda ch1, ch2: (window_peak(ch1, smin, smax).amp,
+                              window_peak(ch2, smin, smax).amp),
             temp_after=[n - 1],
             validate_fn=panel.validate_position,
         )
         if reason:
+            self._test_seq_running = False
             self._lbl_test_seq.setText(reason)
             return
         self._show_scanner_plot()
@@ -1378,6 +1401,8 @@ class EcosGUI(QMainWindow):
             self._sequencer.pause()
 
     def _on_test_point(self, i, coords, value):
+        if not getattr(self, "_test_seq_running", False):
+            return      # another tool's sequence (e.g. focus)
         try:
             self._test_xs.append(coords[self._test_axis])
             self._test_y1.append(value[0])

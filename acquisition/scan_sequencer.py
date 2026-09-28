@@ -29,6 +29,13 @@ from PyQt5.QtCore import QObject, QTimer, pyqtSignal
 SEQUENCE_AXES = ('X', 'Y', 'Z')   # R needs its own stepwise handling: not sequenced here
 NAN = float('nan')
 
+# Defaults offered by the tools' panels (always editable there).
+# PENDIENTE DE MEDIR en el equipo real (scanner_tab_spec.md section 8): neither
+# the residual vibration of the holder after a move nor the duration of
+# GetAScan() has been characterized yet. Reasonable guesses until then.
+DEFAULT_SETTLE_MS = 200
+DEFAULT_AVG_N = 10
+
 
 @contextmanager
 def preserved_reclen(sedaq, new_reclen=None):
@@ -115,7 +122,7 @@ class ScanSequencer(QObject):
 
     # -- control ---------------------------------------------------------------
     def start(self, positions, settle_ms, avg_n, measure_fn, *,
-              temp_after=(), reclen=None, validate_fn=None):
+              temp_after=(), reclen=None, validate_fn=None, record_temperature=True):
         """
         positions   list of {axis: target_mm}, axes among X/Y/Z
         settle_ms   wait after each move before acquiring
@@ -125,6 +132,8 @@ class ScanSequencer(QObject):
                     the start and the end, which are always read)
         reclen      optional RecLen for the duration of the sequence
         validate_fn validate_fn(position) -> None or an error string, per position
+        record_temperature  False: no Arduino is opened and no temperature is read
+                    (tools that store nothing, e.g. focus)
 
         Returns None when the sequence started, otherwise the reason it could
         not (nothing has been touched in that case).
@@ -151,7 +160,8 @@ class ScanSequencer(QObject):
         self._settle_ms = max(0, int(settle_ms))
         self._avg_n = max(1, int(avg_n))
         self._measure = measure_fn
-        self._temp_after = set(temp_after)
+        self._record_temp = bool(record_temperature)
+        self._temp_after = set(temp_after) if self._record_temp else set()
         self._index = 0
         self.results = []
         self.temperatures = []
@@ -169,8 +179,10 @@ class ScanSequencer(QObject):
         try:
             self._enter_exclusive()
             self._stack.enter_context(preserved_reclen(self._sedaq, reclen))
-            self._open_temperature()
-            self._read_temperature(-1)
+            self._arduino = None
+            if self._record_temp:
+                self._open_temperature()
+                self._read_temperature(-1)
             self.progress.emit(0, len(positions), NAN)
             self._request_move()
         except Exception as e:
@@ -345,7 +357,7 @@ class ScanSequencer(QObject):
 
     def _cleanup(self, final_temperature):
         try:
-            if final_temperature:      # NaN record when there is no Arduino
+            if final_temperature and self._record_temp:   # NaN record when there is no Arduino
                 self._read_temperature(len(self._positions))
         finally:
             try:
