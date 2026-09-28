@@ -77,9 +77,15 @@ _arg_parser.add_argument(
 )
 _arg_parser.add_argument(
     "--scanner-sim", action="store_true",
-    help="Use the scanner serial simulator (implied by demo mode)."
+    help="Use the scanner serial simulator and the synthetic SeDaq (implied by demo mode)."
 )
 _ARGS = _arg_parser.parse_args()
+
+# Simulator mode: synthetic SeDaq (sim_sedaq.SimSeDaq) whose echoes follow the
+# simulated scanner. Also the fallback whenever the real digitizer is missing.
+_SIM_MODE = _ARGS.demo or _ARGS.scanner_sim
+
+from sim_sedaq import SimSeDaq, make_params_widget as make_sim_params_widget
 
 try:
     from scanner_panel import ScannerPanel
@@ -142,52 +148,8 @@ SIGNAL_YMIN = -0.5
 SIGNAL_YMAX =  0.5
 
 # ==============================================================================
-# [3] DEMO HARDWARE
+# [3] ACQUISITION ERRORS (the simulated digitizer is sim_sedaq.SimSeDaq)
 # ==============================================================================
-class _DemoSeDaq:
-    def __init__(self):
-        self.RecLen   = DEFAULT_RECLEN
-        self.DataADC1 = [512] * DEFAULT_RECLEN
-        self.DataADC2 = [512] * DEFAULT_RECLEN
-
-    def GetAScan(self):
-        n  = self.RecLen
-        t  = np.arange(n)
-        noise = np.random.normal(0, 8, n)
-
-        def _pulse(center, amp=220, width=60, period=20):
-            env = np.exp(-((t - center) ** 2) / (2 * width ** 2))
-            return amp * env * np.sin(2 * np.pi * t / period)
-
-        ch1 = np.clip(_pulse(2200) + noise + 512, 0, 1023).astype(int)
-        ch2 = np.clip(_pulse(1900, amp=170) + noise + 512, 0, 1023).astype(int)
-        self.DataADC1 = list(ch1)
-        self.DataADC2 = list(ch2)
-
-    def SetRecLen(self, n):
-        self.RecLen   = n
-        self.DataADC1 = [512] * n
-        self.DataADC2 = [512] * n
-
-    def UpdateGenCode(self, gencode):
-        print(f"[Demo] UpdateGenCode — {len(gencode)} bytes")
-
-    def SetGain1(self, g):
-        print(f"[Demo] SetGain1 = {g}")
-
-    def SetGain2(self, g):
-        print(f"[Demo] SetGain2 = {g}")
-
-    def SetExtVoltage(self, v):
-        print(f"[Demo] SetExtVoltage = {v}")
-
-    def SetRelay(self, m):
-        print(f"[Demo] SetRelay = {m}")
-
-    def Close(self):
-        print("[Demo] Close")
-
-
 class AcquisitionError(RuntimeError):
     """The digitizer did not deliver usable captures."""
 
@@ -244,7 +206,7 @@ class EcosGUI(QMainWindow):
         self._L               = None
 
         # ── Hardware connection ───────────────────────────────────────────────
-        if _HW_AVAILABLE:
+        if _HW_AVAILABLE and not _SIM_MODE:
             try:
                 self._sedaq = SeDaqDLL()
                 time.sleep(0.5)
@@ -269,15 +231,15 @@ class EcosGUI(QMainWindow):
                     self, "Hardware warning",
                     f"DLL found but initialisation failed:\n{e}\n\nRunning in demo mode."
                 )
-                self._sedaq = _DemoSeDaq()
+                self._sedaq = SimSeDaq(reclen=DEFAULT_RECLEN)
                 self._demo  = True
         else:
-            self._sedaq = _DemoSeDaq()
+            self._sedaq = SimSeDaq(reclen=DEFAULT_RECLEN)
             self._demo  = True
 
         # ── Scanner panel (embedded as a tab, see _build_right_panel) ─────────
         if ScannerPanel is not None:
-            self._scanner_panel = ScannerPanel(use_sim=self._demo or _ARGS.scanner_sim)
+            self._scanner_panel = ScannerPanel(use_sim=self._demo or _SIM_MODE)
         else:
             self._scanner_panel = None
 
@@ -1273,9 +1235,20 @@ class EcosGUI(QMainWindow):
         seq.finished.connect(self._on_seq_finished)
         seq.message.connect(self._on_seq_message)
         seq.state_changed.connect(self._on_seq_state)
+
+        if isinstance(self._sedaq, SimSeDaq):
+            panel.scanner_state_changed.connect(self._push_scanner_state_to_sim)
+            self._push_scanner_state_to_sim()
+            panel.add_tool_widget(make_sim_params_widget(self._sedaq))
         if panel.uses_simulator:
             panel.add_tool_widget(self._build_test_sequence_group())
             seq.point_done.connect(self._on_test_point)
+
+    def _push_scanner_state_to_sim(self):
+        """Synthetic SeDaq: echoes follow the (simulated) scanner position."""
+        panel = self._scanner_panel
+        coords = panel.current_coords() if panel.is_connected else None
+        self._sedaq.set_scanner_state(coords, panel.role_axis('beam'), panel.pe_side())
 
     def _seq_acquire(self, avg_n):
         """Acquisition step of a sequence: averaged Ch1/Ch2, drawn on the live plots."""

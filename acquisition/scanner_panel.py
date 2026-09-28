@@ -623,6 +623,10 @@ class ScannerPanel(QWidget):
     # Emitted first thing when the panel's STOP is pressed, so a sequencer can
     # end its sequence (the worker only aborts its own multi-step moves).
     stop_pressed = pyqtSignal()
+    # Phase 3: the position or the beam-axis / PE-side geometry changed (after
+    # every move, zeroing, connect/disconnect or session edit). The host uses
+    # it to feed the synthetic SeDaq (sim_sedaq.SimSeDaq.set_scanner_state).
+    scanner_state_changed = pyqtSignal()
 
     def __init__(self, use_sim=False, parent=None):
         super().__init__(parent)
@@ -1129,10 +1133,12 @@ class ScannerPanel(QWidget):
             # disconnect; reconnecting always starts with it off.
             self._deactivate_free_movement()
         self._update_enabled_state()
+        self.scanner_state_changed.emit()
 
     def _on_moved(self, coords_tuple):
         self._coords = dict(zip(AXES, coords_tuple))
         self._refresh_position_labels()
+        self.scanner_state_changed.emit()
 
     def _on_moved_axis(self, axis, value):
         """task_scanner_r_axis.md point 5: single-axis counterpart of
@@ -1143,6 +1149,7 @@ class ScannerPanel(QWidget):
         for role in ROLE_ORDER:
             if self._role_axis[role] == axis:
                 self._lbl_pos[role].setText(fmt_pos(axis, value))
+        self.scanner_state_changed.emit()
 
     def _on_limits(self, limits_tuple):
         self._limits = dict(zip(AXES, limits_tuple))
@@ -1202,9 +1209,11 @@ class ScannerPanel(QWidget):
         self._refresh_all_role_limit_fields()
         self._refresh_role_speed_fields()
         self._refresh_role_jog_fields()
+        self.scanner_state_changed.emit()
 
     def _on_pe_side_changed(self, index):
         self._pe_side = 'origin' if index == 0 else 'max'
+        self.scanner_state_changed.emit()
 
     def _capture_role_edits_into_state(self):
         """Reads whatever is currently typed in the jog/speed fields into the
@@ -1473,6 +1482,14 @@ class ScannerPanel(QWidget):
     def current_coords(self):
         return dict(self._coords)
 
+    @property
+    def is_connected(self):
+        return self._connected
+
+    def pe_side(self):
+        """'origin' or 'max': end of the beam axis where the PE transducer is (spec 2)."""
+        return self._pe_side
+
     def axis_limit(self, axis):
         return self._limits.get(axis)
 
@@ -1662,6 +1679,7 @@ class ScannerPanel(QWidget):
         self._refresh_all_role_limit_fields()
         self._refresh_role_speed_fields()
         self._refresh_role_jog_fields()
+        self.scanner_state_changed.emit()
 
     @staticmethod
     def _load_session_from_disk():
