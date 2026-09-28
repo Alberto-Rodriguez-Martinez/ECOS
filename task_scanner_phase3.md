@@ -1,15 +1,16 @@
 # Tarea: Fase 3 — SeDaq sintético y herramienta de Foco
 
-Lee antes `scanner_tab_spec.md` (secciones 3, 4, 5.1 y 5.4). Se desarrolla **sin hardware**, en el `.venv` de 64 bits.
+Lee antes `scanner_tab_spec.md` (secciones 3, 4, 5.1 y 5.4). Se desarrolla **sin hardware de adquisición**, con el SeDaq sintético que crea esta misma tarea.
 
 Son dos partes: un generador de ecos sintéticos que sustituya al `_DemoSeDaq` actual, y la herramienta de Foco construida sobre él. La primera existe para que la segunda se pueda validar contra una respuesta conocida.
 
-## Restricción de compatibilidad
-El código de gráficas se ejecutará en la máquina de adquisición, que tiene **pyqtgraph 0.11**. En desarrollo hay 0.13.7. Cíñete al subconjunto de API que funciona en 0.11:
-- Colores como tuplas RGB, nunca como nombres (`'r'`, `'blue'`).
-- `enableAutoSIPrefix(False)` explícito en los ejes con unidades.
-- Nada de API añadida después de 0.11. Si dudas de un método, no lo uses.
-Anota en el código cualquier punto donde hayas tenido que elegir por esto.
+## Entorno: el de producción
+Verificado el 28/09 en el PC del despacho: el entorno que ejecuta `ecos_gui.py` con el SeDaq es **`~\anaconda3_32`: Python 3.9.7 de 32 bits, scipy 1.6.2, pyqtgraph 0.11.0, pyserial**. Desarrolla y prueba **en ese mismo entorno**, no en uno de 64 bits: así el código se escribe contra las versiones reales y no aparecen sorpresas al llevarlo al laboratorio.
+
+- Se activa con `conda activate ~\anaconda3_32` o `conda run -p ~\anaconda3_32 python ...`. Llamar al `python.exe` directamente falla: sin activar, `Library\bin` no está en el PATH y numpy no carga sus DLL.
+- **El código debe ser compatible con Python 3.9**: nada de `match`, ni de `X | Y` en anotaciones evaluadas en tiempo de ejecución (si hace falta, `from __future__ import annotations`), ni de otras novedades posteriores.
+- **pyqtgraph 0.11**: colores como tuplas RGB, nunca como nombres (`'r'`, `'blue'`); `enableAutoSIPrefix(False)` explícito en los ejes con unidades; nada de API posterior a 0.11.
+- Los entornos de 64 bits siguen sirviendo para el análisis y los notebooks, no para esto.
 
 ## 1. SeDaq sintético: `acquisition/sim_sedaq.py`
 
@@ -66,6 +67,8 @@ Usa el secuenciador de la fase 2 tal cual. No escribas un bucle nuevo.
 El tiempo de asentamiento y el número de promedios no están caracterizados en el equipo real. Pon valores razonables (por ejemplo, 200 ms y 10 promedios), **marcados en el código como pendientes de medir**, y que sean editables desde la interfaz.
 
 ## Verificación
+Todo en `~\anaconda3_32` (32 bits, Python 3.9.7).
+
 1. `python acquisition/ecos_gui.py --scanner-sim` arranca con el SeDaq sintético y se ve el A-scan en vivo, con el eco cambiando al mover el escáner a mano.
 2. Con `x_foco` fijado en un valor conocido y un rango que lo contenga, Foco lo encuentra **con un error menor que el paso fino**. Test automático que lo compruebe con varios valores de `x_foco` y de SNR.
 3. Con el foco fuera del rango, avisa y no mueve el escáner.
@@ -77,7 +80,7 @@ El tiempo de asentamiento y el número de promedios no están caracterizados en 
 ## No hacer
 - Planitud y barridos (fases 4 a 6).
 - Tocar el driver del escáner ni su simulador serie.
-- Usar API de pyqtgraph posterior a 0.11.
+- Usar API de pyqtgraph posterior a 0.11, ni sintaxis posterior a Python 3.9.
 
 ## Commits propuestos
 - `feat(sim): synthetic SeDaq with focus and tilt model`
