@@ -29,12 +29,10 @@ from PyQt5.QtCore import QObject, QTimer, pyqtSignal
 SEQUENCE_AXES = ('X', 'Y', 'Z')   # R needs its own stepwise handling: not sequenced here
 NAN = float('nan')
 
-# Defaults offered by the tools' panels (always editable there).
-# PENDIENTE DE MEDIR en el equipo real (scanner_tab_spec.md section 8): neither
-# the residual vibration of the holder after a move nor the duration of
-# GetAScan() has been characterized yet. Reasonable guesses until then.
-DEFAULT_SETTLE_MS = 200
-DEFAULT_AVG_N = 10
+# Defaults offered by the tools' panels (always editable there). Measured on
+# the real equipment in the phase-3 hardware tests (30/09).
+DEFAULT_SETTLE_MS = 5000
+DEFAULT_AVG_N = 100
 
 
 @contextmanager

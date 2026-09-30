@@ -27,13 +27,27 @@ Pulse-echo channel (PE_CHANNEL = Ch2, as everywhere in ecos_gui.py):
     plus, to make "measure only inside Smin–Smax" matter: the excitation
     main bang near t = 0 (saturating), the back-wall echo and the first
     water-path reverberation (at 2·t_front).
+    Back-wall echo: t_back = t_front + 2·h/c_sample, with its own focal gain,
+    A_back = back_ratio·A0·exp(−(d_back − F)² / (2σ²)), where
+    d_back = d + h·c_sample/c_w is the water-equivalent (paraxial) distance of
+    the back face. So each face peaks at its own beam position, as with a real
+    focused transducer: with a thin sample and back_ratio > 1 the back echo is
+    inside the window and larger than the front one, and the maximum of the
+    window jumps between them along a sweep (SimParams.thin_sample()).
 
 Through-transmission channel (Ch1): a pulse crossing the sample, with its
 own time of flight and an amplitude that depends on lateral and Z (an
 inclusion plus a mild lateral ripple), so a scan gives a structured map.
 
-Waveform: sine at f0 under a Gaussian envelope with fractional -6 dB bandwidth
-`bw`. Noise: Gaussian, SNR (dB) relative to the in-focus front echo A0.
+Waveform: carrier at f0 under a Gaussian envelope with fractional -6 dB
+bandwidth `bw`. The carrier phase (carrier_phase, degrees) sets its shape:
+0° is a sine (odd: inverting it leaves its signed maximum unchanged), 90° a
+cosine with a dominant central half-cycle, like a real transducer pulse.
+Polarity: every PE echo can be inverted on its own (invert_front,
+invert_back, invert_reverb), relative to its default sign (front and
+reverberation +, back wall −). A measure that takes the signed maximum of the
+signal instead of the envelope gives a different value for an inverted echo;
+SimParams.inverted_front() is that case. Noise: Gaussian, SNR (dB) relative to the in-focus front echo A0.
 Gain: SetGain1/2 scale each channel by 10^((g − g_ref)/20) (noise included:
 it is receiver noise) and the 10-bit quantizer saturates at full scale. The
 ADC adds its own noise floor (adc_noise_lsb) whatever the gain, as a real
@@ -73,11 +87,16 @@ class SimParams:
     # -- pulse ------------------------------------------------------------------
     f0: float = 5e6              # Hz
     bw: float = 0.6              # fractional −6 dB bandwidth
+    carrier_phase: float = 0.0   # degrees: 0 sine (odd pulse), 90 cosine (dominant central lobe)
     fs: float = 100e6            # Hz, acquisition sampling rate
     # -- amplitudes (full scale = 0.5) at the reference gains --------------------
     A0: float = 0.2              # front echo at the focus
-    back_ratio: float = 0.4      # back-wall echo / front echo
+    back_ratio: float = 0.4      # back-wall echo / front echo, each at its own focus
     reverb_ratio: float = 0.15   # first water-path reverberation / front echo
+    # -- polarity of each PE echo, relative to its default sign ------------------
+    invert_front: bool = False   # default +
+    invert_back: bool = False    # default − (back wall)
+    invert_reverb: bool = False  # default +
     bang_amp: float = 0.6        # excitation main bang (saturates on purpose)
     tt_amp: float = 0.15         # through-transmission pulse
     snr_db: float = 30.0         # A0 over the noise standard deviation
@@ -89,6 +108,32 @@ class SimParams:
     incl_z: float = 25.0
     incl_radius: float = 4.0
     incl_contrast: float = 0.6   # fractional amplitude loss at the inclusion centre
+
+    @classmethod
+    def thin_sample(cls, **overrides):
+        """
+        Thin sample whose back-face echo is inside any window that holds the
+        front one (2·h/c_sample ≈ 1.95 µs later) and larger than it (e.g. a
+        sample resting on a strong reflector): the case where the global
+        maximum of Smin–Smax jumps from the front face to the back face.
+        The back face peaks h·c_sample/c_w ≈ 1.5 mm before x_focus (PE side
+        'origin'), well beyond a fine step.
+        """
+        values = dict(thickness=1.5, back_ratio=2.5)
+        values.update(overrides)
+        return cls(**values)
+
+    @classmethod
+    def inverted_front(cls, **overrides):
+        """
+        Front-face echo with inverted polarity and a cosine carrier (dominant
+        central half-cycle, now negative): its positive excursion is only the
+        side lobes, so a signed maximum under-reads it and lands half a period
+        off the envelope peak, while the Hilbert envelope is unchanged.
+        """
+        values = dict(invert_front=True, carrier_phase=90.0)
+        values.update(overrides)
+        return cls(**values)
 
 
 class SimSeDaq:
@@ -189,6 +234,16 @@ class SimSeDaq:
         """Front-face echo time of flight [s]."""
         return 2.0 * self.face_distance(x_beam, lat, z) * 1e-3 / self.params.c_w
 
+    def back_tof(self, x_beam, lat, z):
+        """Back-face echo time of flight [s]."""
+        p = self.params
+        return self.front_tof(x_beam, lat, z) + 2.0 * p.thickness * 1e-3 / p.c_sample
+
+    def expected_back_focus(self, lat=None, z=None):
+        """Beam-axis position where the back-face echo peaks (the wrong answer)."""
+        p = self.params
+        return self.expected_focus(lat, z) - self._sign() * p.thickness * p.c_sample / p.c_w
+
     # -- signal generation -------------------------------------------------------
     def clean_signals(self):
         """Noise-free, unquantized (ch1, ch2) at the current position and gains."""
@@ -201,11 +256,17 @@ class SimSeDaq:
         a_front = p.A0 * np.exp(-((d - p.focal_distance) ** 2) / (2.0 * p.sigma ** 2))
         t_front = 2.0 * d * 1e-3 / p.c_w
         t_back = t_front + 2.0 * p.thickness * 1e-3 / p.c_sample
+        d_back = d + p.thickness * p.c_sample / p.c_w
+        a_back = p.back_ratio * p.A0 * np.exp(-((d_back - p.focal_distance) ** 2)
+                                              / (2.0 * p.sigma ** 2))
         pe = self._pulse(t, 0.3e-6, p.bang_amp)
         if d > 0:
-            pe += self._pulse(t, t_front, a_front)
-            pe += self._pulse(t, t_back, -p.back_ratio * a_front)
-            pe += self._pulse(t, 2.0 * t_front, p.reverb_ratio * a_front)
+            s_front = -1.0 if p.invert_front else 1.0
+            s_back = 1.0 if p.invert_back else -1.0
+            s_reverb = -1.0 if p.invert_reverb else 1.0
+            pe += self._pulse(t, t_front, s_front * a_front)
+            pe += self._pulse(t, t_back, s_back * a_back)
+            pe += self._pulse(t, 2.0 * t_front, s_reverb * p.reverb_ratio * a_front)
 
         # TT (Ch1): through the sample, amplitude mapped over (lat, z).
         t_tt = ((p.tt_separation - p.thickness) * 1e-3 / p.c_w
@@ -218,7 +279,8 @@ class SimSeDaq:
         return tt * self._gain_scale(1), pe * self._gain_scale(2)
 
     def _pulse(self, t, t0, amp):
-        """Sine at f0 under a Gaussian envelope of fractional −6 dB bandwidth bw."""
+        """Carrier at f0 (phase carrier_phase) under a Gaussian envelope of
+        fractional −6 dB bandwidth bw. The sign of amp is the echo polarity."""
         p = self.params
         sigma_f = p.bw * p.f0 / (2.0 * np.sqrt(2.0 * np.log(2.0)))
         tau = 1.0 / (2.0 * np.pi * sigma_f)
@@ -228,7 +290,8 @@ class SimSeDaq:
         i1 = min(len(t), int((t0 + 6 * tau) * p.fs) + 2)
         if i1 > i0:
             tt = t[i0:i1] - t0
-            out[i0:i1] = amp * np.exp(-tt ** 2 / (2.0 * tau ** 2)) * np.sin(2.0 * np.pi * p.f0 * tt)
+            carrier = np.sin(2.0 * np.pi * p.f0 * tt + np.radians(p.carrier_phase))
+            out[i0:i1] = amp * np.exp(-tt ** 2 / (2.0 * tau ** 2)) * carrier
         return out
 
     def _gain_scale(self, channel):
@@ -256,15 +319,25 @@ _PANEL_FIELDS = (
     ('z0', 'z₀', 'mm', -1000.0, 1000.0, 1, 1.0),
     ('c_w', 'c_w', 'm/s', 1300.0, 1700.0, 1, 1.0),
     ('thickness', 'Thickness', 'mm', 0.1, 100.0, 2, 0.5),
+    ('back_ratio', 'Back / front echo', '', 0.0, 10.0, 2, 0.1),
+    ('carrier_phase', 'Carrier phase', '°', -180.0, 180.0, 0, 15.0),
     ('f0', 'f₀', 'MHz', 0.5, 50.0, 2, 0.5),
     ('A0', 'A₀ (FS = 0.5)', '', 0.0, 2.0, 3, 0.01),
     ('snr_db', 'SNR', 'dB', -20.0, 100.0, 1, 1.0),
 )
 
 
+# (field, label) of the boolean fields shown as check boxes.
+_PANEL_FLAGS = (
+    ('invert_front', 'Invert front-face echo'),
+    ('invert_back', 'Invert back-wall echo'),
+    ('invert_reverb', 'Invert reverberation'),
+)
+
+
 def make_params_widget(sedaq: SimSeDaq, parent=None):
     """QGroupBox editing sedaq.params in place; every change applies at once."""
-    from PyQt5.QtWidgets import QDoubleSpinBox, QFormLayout, QGroupBox
+    from PyQt5.QtWidgets import QCheckBox, QDoubleSpinBox, QFormLayout, QGroupBox
 
     box = QGroupBox('Debug: synthetic SeDaq model (simulator only)', parent)
     form = QFormLayout(box)
@@ -282,4 +355,9 @@ def make_params_widget(sedaq: SimSeDaq, parent=None):
             setattr(sedaq.params, name, value * scale)
         spin.valueChanged.connect(_apply)
         form.addRow(label + ':', spin)
+    for name, label in _PANEL_FLAGS:
+        chk = QCheckBox(label)
+        chk.setChecked(bool(getattr(sedaq.params, name)))
+        chk.toggled.connect(lambda on, name=name: setattr(sedaq.params, name, bool(on)))
+        form.addRow(chk)
     return box

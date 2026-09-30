@@ -1,6 +1,6 @@
 # Especificación: pestaña Escáner en ECOS
 
-Estado: aprobada. Fase 1 implementada y probada en hardware (21–24/09). Última revisión: 2026-09-25.
+Estado: aprobada. Fase 1 implementada y probada en hardware (21–24/09). Fase 3 (foco) cerrada tras las pruebas en hardware (30/09). Última revisión: 2026-09-30.
 
 ## 1. Contexto
 
@@ -95,22 +95,34 @@ Al lanzar una herramienta, la gráfica grande pasa automáticamente a la pestañ
 - R lo controla el usuario, sin restricciones adicionales en la GUI.
 
 ### 5.4 Foco
-- Parámetros: rango ±N mm en el eje del haz, alrededor de la posición actual; paso grueso; paso fino; número de promedios; ventana temporal de búsqueda del eco.
-- **La ventana debe seguir al eco.** Al moverse 1 mm en el eje del haz, el eco se desplaza 2/c_w ≈ 1,33 µs. Opciones: ventana ancha con búsqueda del máximo, o ventana que se recoloca según el tiempo de vuelo previsto.
-- Medida: pico de la envolvente del eco en PE.
-- Algoritmo:
+- Parámetros: rango ±N mm en el eje del haz, alrededor de la posición actual; paso grueso; barrido fino opcional (casilla, rango ± y paso); promedios (100 por defecto) y asentamiento (5000 ms por defecto), los dos medidos en el equipo real el 30/09; margen de borde de ventana; banda de seguimiento y umbral del eco frontal; muestra de emisión. La ventana de búsqueda es Smin–Smax de la pestaña de adquisición, que el foco solo lee.
+- **La ventana debe seguir al eco.** Al moverse 1 mm en el eje del haz, el eco se desplaza 2/c_w ≈ 1,33 µs. Se resuelve con el seguimiento del eco frontal (punto siguiente) dentro de una Smin–Smax ancha, con aviso si el eco se pega a un borde.
+- **Tiempo estimado** antes de empezar, actualizado al cambiar los parámetros: por punto, movimiento (6,7 mm/s, medido a velocidad 100) + asentamiento + promedios × duración de un `GetAScan()`. Esa duración la cronometra `ecos_gui.py` en cada adquisición (media móvil); hasta la primera se supone 20 ms y se indica.
+- Medida: pico de la envolvente del **eco de la cara frontal** en PE. Con muestras finas caen en Smin–Smax los ecos de las dos caras y el trasero puede ser el mayor: el máximo global salta de uno a otro a lo largo del barrido. Se sigue el frontal con `acquisition/echo_tracking.py` (29/09): en el primer punto, el primer pico de la envolvente que supera un umbral, no el mayor; en los siguientes, el máximo en una banda estrecha alrededor de t_previo + 2·Δx/c_w (signo según el lado PE). Si aparece un eco claro antes de la banda, se re-engancha a él y se re-miden los puntos previos. El A-scan marca en cada punto el eco usado.
+- Algoritmo (cerrado el 30/09 tras las pruebas en hardware):
   1. Barrido grueso en el rango.
-  2. Barrido fino alrededor del máximo.
-  3. Ajuste parabólico de la amplitud en dB con 3–5 puntos alrededor del máximo.
-  4. Mover al óptimo.
+  2. Ajuste parabólico de la amplitud en dB sobre los puntos **del barrido grueso** que están a menos de 3 dB del máximo (el tramo contiguo alrededor de él, mínimo 3 puntos; si hay menos dentro de 3 dB se toman el máximo y sus vecinos y se avisa de que el paso grueso es grande para esa zona focal). Mínimos cuadrados ponderados: el ruido de cada punto se estima con su contraste de envolvente (suelo de ruido de Rayleigh) y se infla con el χ² reducido cuando hay grados de libertad.
+  3. Se informa del óptimo ± 1σ del vértice, del residuo RMS del ajuste (dB) y de la **zona focal**, el tramo a menos de 1 dB del máximo según la parábola, que también se sombrea en la gráfica.
+  4. **Curva demasiado plana**: si el ajuste no es cóncavo o la incertidumbre 1σ del vértice supera medio paso grueso, se avisa de que no se puede determinar el óptimo y no se mueve.
+  5. **Tiempo de vuelo en el óptimo**: recta de ToF frente a posición sobre los puntos gruesos con eco claro (pico de envolvente interpolado bajo la muestra, ponderado por contraste), evaluada en el óptimo y referida al instante de emisión. Se da en muestras, µs y mm desde el transductor (c_w·t/2). La muestra de emisión es 0 por defecto, la convención de ECOS (el registro empieza en el disparo), y es configurable si el hardware tiene retardo.
+  6. **Comprobación de la pendiente**: la de esa recta se muestra junto a la teórica 2/c_w, con el signo del lado PE. Con signo contrario se avisa de revisar el lado PE; con más de un 10 % de desviación, de revisar c_w y que el eco seguido sea el frontal.
+  7. Barrido fino **opcional** (desactivado por defecto), ± un rango configurable alrededor del óptimo. Solo para inspección: **no entra en el ajuste**. Se informa de su máximo y de su desfase medio respecto a la parábola gruesa.
+  8. Mover al óptimo.
+- **c_w** se lee de los PT100 al lanzar el foco, como en el resto de ECOS (`water_temp2sos` sobre T1 y T2, su media; se actualiza también el estado y la etiqueta de temperatura). Nunca se abre el diálogo manual, porque es modal. Si los PT100 fallan se usa la última lectura, y si no hay ninguna, 1480 m/s. El origen del valor se muestra siempre. Con el SeDaq sintético se usa su propio c_w.
+- **Sesgo de +0,2 dB entre barrido fino y grueso** (hardware, 30/09): en la misma posición, el barrido fino mide unos 0,2 dB más que el grueso. Mezclar los dos barridos en un ajuste deforma la parábola, y por eso el óptimo sale solo del grueso. El origen del sesgo no está caracterizado. El desfase medio del fino respecto al ajuste grueso se informa en cada ejecución para seguirlo.
+- **Referencia pendiente**: la calibración del foco con un **reflector pequeño** (bola o punta de hilo en el eje) queda pendiente como método de referencia. Sirve para validar el foco hallado sobre la cara plana de la muestra, que integra toda la sección del haz, y la zona focal.
 - Si el máximo cae en el borde del rango, avisar («amplía el rango») y no moverse.
 - El rango se recorta a los límites de la sesión, avisando de ello.
-- Gráfica: amplitud frente a posición, con el ajuste y el óptimo marcados.
-- **No guarda nada.**
+- **Mensajes de eco perdido y de ventana estrecha, separados**:
+  - Eco pegado a un borde de Smin–Smax: la ventana es estrecha, hay que ampliarla.
+  - Eco frontal perdido (su posición prevista queda fuera de Smin–Smax): se sugiere revisar el lado PE, porque con el lado equivocado la predicción va en sentido contrario al eco. Si en la ventana sigue habiendo un eco claro lejos de la predicción, el mensaje lo dice y apunta directamente al lado PE.
+  - Si el eco se re-engancha dos o más veces en el barrido grueso, también se sugiere revisar el lado PE.
+- Gráfica: amplitud frente a posición, con el ajuste, el óptimo y la zona focal marcados. El estado final lista el informe: óptimo ± σ, ajuste, zona focal, ToF y pendiente.
+- **No guarda resultados.** Solo un volcado de depuración opcional (casilla, activada por defecto, 30/09): un `.npz` por ejecución en `data/focus_debug/` (local, fuera de git) con, por punto, la posición, el registro PE, el array de la ventana y su envolvente, el pico elegido, su valor lineal y en dB, Smin–Smax, la banda y el motivo de la selección. Formato en `FocusDebugDump` (`focus_tool.py`).
 
 ### 5.5 Planitud
 - Parámetros: rango ±N mm en el eje lateral, rango ±M mm en Z (ambos alrededor del centro), paso, promedios y tolerancia en grados.
-- Mide dos líneas, lateral y Z, con el tiempo de vuelo de la cara de la muestra en PE. Estimador de ECOS.
+- Mide dos líneas, lateral y Z, con el tiempo de vuelo de la cara de la muestra en PE. Estimador de ECOS, sobre el eco frontal localizado con el mismo seguimiento que el foco (`echo_tracking.FrontEchoTracker`, pasando la posición del eje del haz, que no cambia: la banda absorbe el desplazamiento por la inclinación).
 - Ajuste lineal del tiempo de vuelo frente a la posición en cada línea. Ángulo θ = atan(c_w · Δt / (2 · Δx)), con c_w calculada a partir de los PT100.
 - Gráfica: las dos líneas con su ajuste, el ángulo de cada eje y un indicador verde o rojo según la tolerancia. Leyenda: inclinación lateral → corregir con R; inclinación en Z → corregir con el tilt manual.
 - Botón Repetir, para iterar mientras se corrige.
@@ -189,14 +201,15 @@ Cada fase termina con prueba en hardware y commit.
 
 ## 8. Puntos abiertos
 
-- **Duración real de `GetAScan()`**, con y sin promediado, para el `RecLen` que use el escáner. Hay que medirla en el hardware: de ella dependen el número de promedios y el tiempo estimado de un barrido.
-- **Tiempo de asentamiento tras un movimiento.** No hay ningún valor de referencia; hay que caracterizar la vibración residual del soporte en el equipo real.
+- **Calibración del foco con reflector pequeño** como método de referencia (sección 5.4): pendiente.
+- **Origen del sesgo de +0,2 dB** entre barrido fino y grueso en la misma posición (sección 5.4).
 - Confirmar que `import ECOS_US_ToolBox` funciona en el Python de la máquina de adquisición (sección 3).
 - Estimador de tiempo de vuelo que se reutiliza de ECOS: `LongVelocity_Thickness` usa `CalcToFAscanCosine_XCRFFT`, que es el candidato.
 - `BITS_OPTIONS` en `ecos_gui.py` parece código muerto: el cuantizador está fijo a 1024 en `_update_plots` y `_acquire_ch_avg`. Aclararlo si el foco necesita conocer la resolución real del ADC.
 - Relación entre el parámetro de velocidad y los mm/s de cada eje: calibrar si se necesita una velocidad concreta.
 
 ### Resueltos
+- Tiempo de asentamiento y número de promedios: medidos en el equipo real, 5000 ms y 100 (30/09). La duración de `GetAScan()` se cronometra en ejecución para el tiempo estimado.
 - Formato y ubicación del guardado de barridos: sección 5.6 (25/09).
 - Hilo del secuenciador: dirigido por eventos en el hilo de la GUI, sección 3 (25/09).
 - scipy: no hay que portar nada, sección 3 (25/09).

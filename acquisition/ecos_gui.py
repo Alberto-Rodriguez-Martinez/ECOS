@@ -813,7 +813,7 @@ class EcosGUI(QMainWindow):
             return
         try:
             quant = 1024
-            self._sedaq.GetAScan()
+            self._timed_get_ascan()
             ch1 = self._raw_to_float(self._sedaq.DataADC1, self._reclen, quant)
             ch2 = self._raw_to_float(self._sedaq.DataADC2, self._reclen, quant)
             self._plot_ascans(ch1, ch2)
@@ -1162,7 +1162,7 @@ class EcosGUI(QMainWindow):
                     f"{tries} attempts (all-zero signals; is the digitizer connected?)"
                 )
             tries += 1
-            self._sedaq.GetAScan()
+            self._timed_get_ascan()
             sigs = {
                 ch: self._raw_to_float(
                     self._sedaq.DataADC1 if ch == 1 else self._sedaq.DataADC2,
@@ -1175,6 +1175,14 @@ class EcosGUI(QMainWindow):
                 accs[ch] += sig
             n += 1
         return [accs[ch] / avg_n for ch in channels]
+
+    def _timed_get_ascan(self):
+        """GetAScan(), keeping a running mean of its duration (scanner time estimates)."""
+        t0 = time.perf_counter()
+        self._sedaq.GetAScan()
+        dt = time.perf_counter() - t0
+        prev = getattr(self, '_t_ascan', None)
+        self._t_ascan = dt if prev is None else 0.9 * prev + 0.1 * dt
 
     def _acquire_ch_avg(self, channel, smin, smax):
         """Average N A-scans from channel 1 or 2 and return the windowed slice."""
@@ -1240,8 +1248,14 @@ class EcosGUI(QMainWindow):
         # Focus (phase 3): reads Smin–Smax of the Acquisition tab, never sets it.
         self._focus_tool = FocusTool(seq, panel, self._get_smin_smax, self._plot_scan,
                                      show_plot_fn=self._show_scanner_plot,
-                                     cw_fn=lambda: self._state.Cw_mean, parent=self)
+                                     cw_fn=self._scanner_water_cw,
+                                     acq_time_fn=lambda: getattr(self, '_t_ascan', None),
+                                     parent=self)
         panel.add_tool_widget(FocusGroup(self._focus_tool, seq, self._get_smin_smax))
+        # Which echo each point measured (front-echo tracking), marked on the A-scan.
+        self._echo_mark = None
+        self._focus_tool.echo_used.connect(self._mark_echo)
+        self._focus_tool.done.connect(lambda _moved: self._clear_echo_mark())
 
         if isinstance(self._sedaq, SimSeDaq):
             panel.scanner_state_changed.connect(self._push_scanner_state_to_sim)
@@ -1250,6 +1264,94 @@ class EcosGUI(QMainWindow):
         if panel.uses_simulator:
             panel.add_tool_widget(self._build_test_sequence_group())
             seq.point_done.connect(self._on_test_point)
+
+    _ECHO_MARK_TEXT = {
+        'first':   "front echo · first peak",
+        'tracked': "front echo · tracked",
+        'relock':  "front echo · re-locked (earlier echo found)",
+        'none':    "no clear echo · window max",
+        'max':     "window max",
+    }
+
+    def _mark_echo(self, m):
+        """Mark on the A-scan the echo measured on the current point: dashed
+        line at its envelope peak, shaded band searched around the prediction
+        and a label with how it was chosen. The A-scan of the point is already
+        drawn (the sequencer acquires, then measures)."""
+        if self._echo_mark is None:
+            col = (0, 220, 120)
+            band = pg.LinearRegionItem(values=(0, 1), movable=False,
+                                       brush=pg.mkBrush(0, 220, 120, 40))
+            band.setZValue(-5)
+            peak = pg.InfiniteLine(angle=90, movable=False,
+                                   pen=pg.mkPen(col, width=2, style=Qt.DashLine))
+            label = pg.TextItem(anchor=(0, 0), color=col)
+            for item in (band, peak, label):
+                self._plot_zoom.addItem(item)
+            self._echo_mark = (band, peak, label)
+        band, peak, label = self._echo_mark
+        x = float(self._samples_to_unit(m.index))
+        peak.setPos(x)
+        if m.band is not None:
+            band.setRegion((float(self._samples_to_unit(m.band[0])),
+                            float(self._samples_to_unit(m.band[1]))))
+            band.show()
+        else:
+            band.hide()
+        text = self._ECHO_MARK_TEXT.get(m.mode, m.mode)
+        if m.outside:
+            text += " · predicted outside Smin–Smax"
+        elif m.at_edge:
+            text += " · at a window edge"
+        if m.saturated:
+            text += " · saturated"
+        label.setText(text, color=(235, 60, 60) if m.flagged else (0, 220, 120))
+        label.setPos(x, SIGNAL_YMAX)
+        peak.show()
+        label.show()
+
+    def _clear_echo_mark(self):
+        if self._echo_mark is not None:
+            for item in self._echo_mark:
+                item.hide()
+
+    def _scanner_water_cw(self):
+        """
+        c_w for the scanner tools, read from the PT100s when a tool starts, as
+        the rest of ECOS does (water_temp2sos on T1 and T2, their mean; the
+        state and the temperature label are updated too). Never the manual
+        dialog: it is modal and a sequence must not block on it. Returns
+        (c_w, source), or None (the tool then uses its nominal value).
+        With the synthetic SeDaq the echoes follow its own c_w, so that one.
+        """
+        if isinstance(self._sedaq, SimSeDaq):
+            return self._sedaq.params.c_w, "synthetic SeDaq"
+        st = self._state
+        if _HW_AVAILABLE:
+            arduino = None
+            try:
+                arduino = self._open_seq_arduino()
+                T1, T2 = arduino.getTemperatures()
+                if T1 is None and T2 is None:
+                    raise ValueError("no temperature data received from Arduino")
+                T1 = T1 if T1 is not None else T2
+                T2 = T2 if T2 is not None else T1
+                st.T1, st.T2 = T1, T2
+                st.Cw1, st.Cw2 = water_temp2sos(T1), water_temp2sos(T2)
+                st.Cw_mean = (st.Cw1 + st.Cw2) / 2.0
+                self._update_temp_label()
+                return st.Cw_mean, f"PT100 T1 = {T1:.2f} °C, T2 = {T2:.2f} °C"
+            except Exception as e:
+                print(f"[scanner c_w] PT100 read failed: {e}")
+            finally:
+                if arduino is not None:
+                    try:
+                        arduino.close()
+                    except Exception:
+                        pass
+        if st.Cw_mean:
+            return st.Cw_mean, "last temperature reading, PT100 unavailable now"
+        return None
 
     def _push_scanner_state_to_sim(self):
         """Synthetic SeDaq: echoes follow the (simulated) scanner position."""
@@ -1317,12 +1419,12 @@ class EcosGUI(QMainWindow):
         self._spin_test_span.setValue(10.0)
         self._spin_test_span.setSuffix(" mm")
         self._spin_test_settle = QSpinBox()
-        self._spin_test_settle.setRange(0, 5000)
-        self._spin_test_settle.setValue(DEFAULT_SETTLE_MS)   # pending measurement
+        self._spin_test_settle.setRange(0, 60000)
+        self._spin_test_settle.setValue(DEFAULT_SETTLE_MS)
         self._spin_test_settle.setSuffix(" ms")
         self._spin_test_avg = QSpinBox()
-        self._spin_test_avg.setRange(1, 200)
-        self._spin_test_avg.setValue(DEFAULT_AVG_N)          # pending measurement
+        self._spin_test_avg.setRange(1, 10000)
+        self._spin_test_avg.setValue(DEFAULT_AVG_N)
         form.addRow("Points along lateral axis:", self._spin_test_n)
         form.addRow("Span (centred here):", self._spin_test_span)
         form.addRow("Settle:", self._spin_test_settle)

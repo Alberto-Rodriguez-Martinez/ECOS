@@ -6,117 +6,110 @@ ECOS project - Universidad Miguel Hernandez - Dpto. Ingenieria de Comunicaciones
 See task_scanner_phase3.md section 2 and scanner_tab_spec.md section 5.4.
 
 Measure per point: peak of the envelope (ECOS_US_ToolBox.Envelope, Hilbert)
-of the pulse-echo channel INSIDE the acquisition window Smin–Smax that the
-user already set on the Acquisition tab. Never over the whole record: the
-excitation main bang, reverberations and other echoes live outside it. The
-tool only reads that window; it never changes it.
+of the FRONT-FACE echo of the pulse-echo channel, INSIDE the acquisition
+window Smin–Smax that the user already set on the Acquisition tab. Never over
+the whole record: the excitation main bang, reverberations and other echoes
+live outside it. The tool only reads that window; it never changes it.
+With a thin sample the back-face echo falls inside the window too, and may be
+the larger: the front echo is followed with echo_tracking.FrontEchoTracker
+(first peak above a threshold on the first point, then the maximum in a narrow
+band around t_prev + 2·Δx/c_w). One tracker for the whole run, so the anchor
+carries over from the coarse to the fine sweep. The echo used on each point is
+emitted (echo_used) so the GUI can mark it on the A-scan.
 
-Algorithm:
+Algorithm (closed after the hardware tests, 30/09):
     1. coarse sweep over ±range around the current beam position, clipped to
        the session limits (with a notice);
-    2. fine sweep over ±coarse_step around the coarse maximum;
-    3. parabola fitted to the amplitude IN dB on 3–5 points around the fine
-       maximum (near the focus the axial profile is close to a Gaussian, and a
-       Gaussian in log is a parabola);
-    4. move to the optimum — unless the maximum sits on the edge of the range
-       ("widen the range"), or the echo touched an edge of the window or
-       saturated on any point used for the result. In those cases the scanner
-       goes back to the beam-axis position it had before the sweep.
+    2. parabola fitted to the amplitude IN dB on the coarse points within
+       FIT_WINDOW_DB (3 dB) of the maximum — the contiguous run around it, at
+       least 3 points. Near the focus the axial profile is close to a Gaussian
+       and a Gaussian in log is a parabola. Weighted least squares: the noise
+       of each point comes from its envelope contrast (Rayleigh noise floor),
+       inflated by the reduced χ² when there are degrees of freedom. Reported:
+       vertex ± 1σ, RMS residual (dB) and the focal zone, the span within
+       FOCAL_ZONE_DB (1 dB) of the vertex;
+    3. the curve is "too flat" when the fit is not concave or the vertex 1σ
+       exceeds FLAT_SIGMA_FRACTION of the coarse step: warned, no move;
+    4. time of flight at the optimum from a straight line ToF(x) fitted on the
+       coarse points with a clear echo (sub-sample envelope peaks), referenced
+       to the emission instant (sample `emission_sample` of the record, 0 in
+       ECOS: the record starts at the trigger): samples, µs and mm from the
+       transducer (c_w·t/2). Its slope is shown next to the theoretical 2/c_w
+       as a check (a reversed sign means the PE side is wrong);
+    5. optional fine sweep, ±fine_range around the optimum: for inspection only,
+       NOT used in the fit (a +0.2 dB bias between fine and coarse sweeps at
+       the same position was measured on the hardware; spec 5.4). Its maximum
+       and its mean offset from the coarse fit are reported;
+    6. move to the optimum — unless the maximum sits on the edge of the range
+       ("widen the range"), the curve is too flat, or the echo touched an edge
+       of the window, was lost or saturated on a coarse point. In those cases
+       the scanner goes back to the beam-axis position it had before the sweep.
 STOP is the exception: after a STOP nothing moves any more, the tool only
 reports where the scanner is. After a fault (e.g. a rejected move) it does
 not move either.
 Every phase (coarse, fine, final move or return) is one run of the phase-2
-ScanSequencer; there is no loop here. Nothing is saved.
+ScanSequencer; there is no loop here. Only the optional debug dump is saved.
 
-The echo moves 2/c_w ≈ 1.33 µs per mm along the beam axis. If Smin–Smax is
-too narrow for the range, the echo leaves the window. Checked on every point
-as it arrives, reported at once and marked on the plot (point_flags):
+The echo moves 2/c_w ≈ 1.33 µs per mm along the beam axis. Checked on every
+point as it arrives, reported at once and marked on the plot (point_flags):
     - 'edge': the envelope peak is pinned within the edge margin (a fraction
-      of the window width) of Smin or Smax — the echo is half out. Only when
-      the peak stands clearly above the noise (EDGE_MIN_CONTRAST): a noise
-      peak can land on an edge by chance;
-    - 'outside': the echo is predicted outside the window. Once the echo has
-      left, only noise remains and its peak can fall anywhere, so the pinned
-      test alone misses it. The prediction takes the strongest point with a
-      clear echo as reference and moves it 2/c_w per mm, with the sign given
-      by the PE side (spec section 2);
-    - 'saturated': the signal reaches full scale inside the window.
+      of the window width) of Smin or Smax — the echo is half out: the window
+      is too narrow. Only when the peak stands clearly above the noise
+      (EDGE_MIN_CONTRAST): a noise peak can land on an edge by chance;
+    - 'outside': the front echo is LOST — its predicted position is outside
+      the window. Either the echo really left a narrow window, or the
+      prediction runs the wrong way because the PE side is wrong (then a clear
+      echo is usually still inside the window: echo_elsewhere). The message
+      says which is likelier and suggests checking the PE side. The prediction
+      takes the strongest point with a clear echo as reference and moves it
+      2/c_w per mm, with the sign given by the PE side (spec section 2); the
+      tracker also sets it directly when its prediction band is out;
+    - 'saturated': the signal reaches full scale around the echo used.
 A coarse curve with any marked point is incomplete (the true maximum may be
-hidden where the echo was out): the tool then stops before the fine sweep and
-does not move.
+hidden where the echo was out): the tool then does not move.
 
-The pure part (window_peak, sweep_positions, FocusPlan) has no Qt dependency
-and is what test_focus_tool.py exercises against sim_sedaq.SimSeDaq.
+The pure part (window_peak, sweep_positions, fit_focus_db, fit_tof_line,
+FocusPlan, estimate_duration_s) has no Qt dependency and is what
+test_focus_tool.py exercises against sim_sedaq.SimSeDaq.
 """
 from __future__ import annotations
 
+import json
 import math
 import os
-import sys
+import time
 from dataclasses import dataclass, field
 from typing import List, Optional
 
 import numpy as np
 
-_TOOLS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'tools')
-if _TOOLS_DIR not in sys.path:
-    sys.path.append(_TOOLS_DIR)
-from ECOS_US_ToolBox import Envelope  # noqa: E402
-
-from scan_sequencer import DEFAULT_AVG_N, DEFAULT_SETTLE_MS  # noqa: E402
+from echo_tracking import (  # window_peak, PeakMeasure: re-exported for ecos_gui and tests
+    ACQ_FS, C_W_NOMINAL, CONFIDENT_CONTRAST, DEFAULT_BAND_SAMPLES, DEFAULT_BAND_US,
+    DEFAULT_EDGE_MARGIN, DEFAULT_THRESHOLD, MIN_WINDOW_SAMPLES, FrontEchoTracker,
+    PeakMeasure, band_samples, echo_samples_per_mm, window_peak,
+)
+from scan_sequencer import DEFAULT_AVG_N, DEFAULT_SETTLE_MS
 
 PE_CHANNEL = 2                 # ecos_gui.py: s_PE is Ch2
 DEFAULT_HALF_RANGE_MM = 5.0
 DEFAULT_COARSE_MM = 1.0
 DEFAULT_FINE_MM = 0.2
-DEFAULT_EDGE_MARGIN = 0.05     # fraction of the window width
-FIT_POINTS = 5                 # points around the maximum for the parabola (3–5)
-SATURATION_LEVEL = 0.49        # |amplitude| in ecos_gui units (full scale ±0.5)
-CONFIDENT_CONTRAST = 8.0       # envelope peak / median envelope: a clear echo (prediction reference)
-EDGE_MIN_CONTRAST = 6.0        # below this the peak is noise and where it falls means nothing
-C_W_NOMINAL = 1480.0           # m/s, when no temperature has been read
-ACQ_FS = 100e6                 # Hz
-MIN_WINDOW_SAMPLES = 16
+DEFAULT_FINE_RANGE_MM = 1.0    # optional fine sweep: ± around the optimum
+DEFAULT_EMISSION_SAMPLE = 0    # record sample of the emission instant (ECOS: the trigger)
+FIT_WINDOW_DB = 3.0            # coarse points within this of the maximum go into the fit
+FOCAL_ZONE_DB = 1.0            # focal zone: span within this of the vertex
+FLAT_SIGMA_FRACTION = 0.5      # vertex 1σ above this × coarse step: curve too flat
+SLOPE_TOLERANCE = 0.10         # ToF slope vs 2/c_w: warn beyond ±10 %
+MOVE_MM_S = 6.7                # beam-axis speed at speed = 100 (spec 1, measured 21/09)
+DEFAULT_ACQ_S = 0.02           # one GetAScan() when it has not been timed yet
+RAYLEIGH_SIGMA = 1.0 / math.sqrt(2.0 * math.log(2.0))   # noise σ / median of its envelope
+DB_PER_NEPER = 20.0 / math.log(10.0)
 POSITION_DECIMALS = 2          # X/Y resolve 0.01 mm
 
 
 # ===========================================================================
 #  Pure helpers
 # ===========================================================================
-@dataclass
-class PeakMeasure:
-    amp: float            # envelope peak inside the window
-    index: int            # absolute sample index of the peak
-    at_edge: bool         # a clear peak within the edge margin of Smin or Smax
-    saturated: bool       # the raw signal reaches full scale inside the window
-    contrast: float = float('inf')   # peak / median of the envelope in the window
-
-    @property
-    def flagged(self):
-        return self.at_edge or self.saturated
-
-
-def window_peak(sig, smin, smax, edge_margin=DEFAULT_EDGE_MARGIN):
-    """Envelope peak of sig[smin:smax] (never the whole record)."""
-    seg = np.asarray(sig[smin:smax], dtype=float)
-    if len(seg) < MIN_WINDOW_SAMPLES:
-        raise ValueError(f'window Smin–Smax too short ({len(seg)} samples)')
-    env = Envelope(seg)
-    k = int(np.argmax(env))
-    med = float(np.median(env))
-    contrast = float(env[k]) / med if med > 0 else float('inf')
-    margin = max(1, int(round(edge_margin * len(seg))))
-    at_edge = (k < margin or k >= len(seg) - margin) and contrast >= EDGE_MIN_CONTRAST
-    saturated = bool(np.max(np.abs(seg)) >= SATURATION_LEVEL)
-    return PeakMeasure(float(env[k]), smin + k, at_edge, saturated, contrast)
-
-
-def echo_samples_per_mm(pe_side, c_w=C_W_NOMINAL, fs=ACQ_FS):
-    """Signed shift of the front echo, in samples, per +1 mm on the beam axis."""
-    sign = 1.0 if pe_side == 'origin' else -1.0
-    return sign * 2e-3 / c_w * fs
-
-
 def point_flags(xs, measures, window, edge_margin=DEFAULT_EDGE_MARGIN, samples_per_mm=None):
     """
     Per point, the reasons its measure cannot be trusted: a list of lists among
@@ -130,6 +123,8 @@ def point_flags(xs, measures, window, edge_margin=DEFAULT_EDGE_MARGIN, samples_p
         f = []
         if m.at_edge:
             f.append('edge')
+        if m.outside:
+            f.append('outside')
         if m.saturated:
             f.append('saturated')
         flags.append(f)
@@ -142,7 +137,8 @@ def point_flags(xs, measures, window, edge_margin=DEFAULT_EDGE_MARGIN, samples_p
     r = max(clear, key=lambda k: measures[k].amp)
     for k, x in enumerate(xs):
         predicted = measures[r].index + samples_per_mm * (x - xs[r])
-        if not (smin + margin <= predicted < smax - margin) and 'edge' not in flags[k]:
+        if (not (smin + margin <= predicted < smax - margin)
+                and 'edge' not in flags[k] and 'outside' not in flags[k]):
             flags[k].append('outside')
     return flags
 
@@ -154,16 +150,44 @@ def _upper_first(text):
 def describe_flags(flags):
     text = []
     if 'edge' in flags:
-        text.append('echo at an edge of Smin–Smax')
+        text.append('echo pinned at an edge of Smin–Smax')
     if 'outside' in flags:
-        text.append('echo outside Smin–Smax')
+        text.append('front echo lost (predicted outside Smin–Smax)')
     if 'saturated' in flags:
         text.append('signal saturated')
     return ', '.join(text)
 
 
+def flag_fixes(kinds, echo_elsewhere=False):
+    """What to do about the flags: one sentence per cause."""
+    fix = []
+    if 'edge' in kinds:
+        fix.append('The window is too narrow for the range: widen Smin–Smax on the '
+                   'Acquisition tab.')
+    if 'outside' in kinds:
+        if echo_elsewhere:
+            fix.append('A clear echo is still inside the window away from the prediction: '
+                       'the tracking ran the wrong way, check the PE side in the session '
+                       'settings (and c_w).')
+        else:
+            fix.append('Check the PE side in the session settings (with the wrong side the '
+                       'prediction moves opposite to the echo); if it is right, the echo left '
+                       'the window: widen Smin–Smax.')
+    if 'saturated' in kinds:
+        fix.append('Lower the gain.')
+    return ' '.join(fix)
+
+
 def to_db(amp):
     return 20.0 * math.log10(max(float(amp), 1e-12))
+
+
+def sigma_db(measure):
+    """1σ of the measured amplitude in dB, from the noise floor of its window."""
+    c = measure.contrast
+    if not (c > 0) or math.isinf(c):
+        return 0.01
+    return max(DB_PER_NEPER * RAYLEIGH_SIGMA / c, 1e-3)
 
 
 def sweep_positions(center, half_range, step, limit):
@@ -186,13 +210,161 @@ def sweep_positions(center, half_range, step, limit):
     return xs, clipped
 
 
+def format_duration(seconds):
+    seconds = int(round(seconds))
+    if seconds < 60:
+        return f'{seconds} s'
+    m, s = divmod(seconds, 60)
+    if m < 60:
+        return f'{m} min {s:02d} s'
+    h, m = divmod(m, 60)
+    return f'{h} h {m:02d} min'
+
+
+def estimate_duration_s(positions, start, settle_ms, avg_n, acq_s=DEFAULT_ACQ_S,
+                        move_mm_s=MOVE_MM_S):
+    """Moves (at move_mm_s) + settle + avg_n acquisitions per point, from `start`."""
+    total, prev = 0.0, float(start)
+    for x in positions:
+        total += abs(x - prev) / move_mm_s + settle_ms / 1000.0 + avg_n * acq_s
+        prev = x
+    return total
+
+
 @dataclass
 class FitResult:
     x_opt: float
     db_opt: float
-    coeffs: Optional[tuple]      # (a, b, c) of the dB parabola, None on fallback
+    coeffs: Optional[tuple]      # (a, b, c) of the dB parabola in x, None when not concave
     fit_x: List[float]
     note: str = ''
+    fit_db: List[float] = field(default_factory=list)
+    sigma_x: float = float('nan')        # 1σ of the vertex [mm]
+    rms_db: float = float('nan')         # RMS residual of the fit [dB]
+    zone: Optional[tuple] = None         # (lo, hi) within FOCAL_ZONE_DB of the vertex [mm]
+    concave: bool = True
+
+    @property
+    def n_points(self):
+        return len(self.fit_x)
+
+    @property
+    def zone_width(self):
+        return self.zone[1] - self.zone[0] if self.zone else float('nan')
+
+
+def fit_select(amps, window_db=FIT_WINDOW_DB):
+    """Indices of the contiguous run around the maximum within window_db of it (≥ 3 if possible)."""
+    dbs = [to_db(a) for a in amps]
+    i = int(np.argmax(dbs))
+    lo = hi = i
+    while lo > 0 and dbs[lo - 1] >= dbs[i] - window_db:
+        lo -= 1
+    while hi < len(dbs) - 1 and dbs[hi + 1] >= dbs[i] - window_db:
+        hi += 1
+    while hi - lo + 1 < 3 and (lo > 0 or hi < len(dbs) - 1):
+        if lo > 0:
+            lo -= 1
+        if hi - lo + 1 < 3 and hi < len(dbs) - 1:
+            hi += 1
+    return list(range(lo, hi + 1))
+
+
+def fit_focus_db(xs, amps, sigmas_db=None, window_db=FIT_WINDOW_DB):
+    """
+    Weighted parabola on 20·log10(amp) over the points within window_db of the
+    maximum (fit_select). sigmas_db: 1σ per point (dB); None = equal weights.
+    """
+    idx = fit_select(amps, window_db)
+    x = np.array([xs[k] for k in idx], dtype=float)
+    y = np.array([to_db(amps[k]) for k in idx])
+    s = (np.ones(len(idx)) if sigmas_db is None
+         else np.array([sigmas_db[k] for k in idx], dtype=float))
+    n_within = sum(1 for a in amps if to_db(a) >= max(to_db(b) for b in amps) - window_db)
+    note = ''
+    if n_within < 3:
+        note = (f'only {n_within} point(s) within {window_db:g} dB of the maximum: fitted on it '
+                f'and its neighbours; the coarse step is large for this focal zone')
+    i_max = int(np.argmax(amps))
+    if len(x) < 3:
+        return FitResult(xs[i_max], to_db(amps[i_max]), None, list(x), 'fewer than 3 points',
+                         list(y), concave=False)
+    x0 = float(x.mean())
+    u = x - x0
+    M = np.column_stack([u * u, u, np.ones_like(u)])
+    W = 1.0 / (s * s)
+    cov = np.linalg.inv(M.T @ (M * W[:, None]))
+    A, B, C = cov @ (M.T @ (W * y))
+    r = y - M @ np.array([A, B, C])
+    dof = len(x) - 3
+    if dof > 0:
+        cov = cov * max(1.0, float(np.sum(W * r * r)) / dof)
+    rms = float(np.sqrt(np.mean(r * r)))
+    a, b, c = A, B - 2.0 * A * x0, A * x0 * x0 - B * x0 + C
+    if A >= 0:
+        return FitResult(xs[i_max], to_db(amps[i_max]), None, list(x), 'fit is not concave',
+                         list(y), rms_db=rms, concave=False)
+    v = x0 - B / (2.0 * A)
+    g = np.array([B / (2.0 * A * A), -1.0 / (2.0 * A), 0.0])
+    sigma_v = float(math.sqrt(max(float(g @ cov @ g), 0.0)))
+    w = math.sqrt(FOCAL_ZONE_DB / -A)
+    db_v = float(C - B * B / (4.0 * A))
+    if not (x[0] <= v <= x[-1]):
+        note = (note + '; ' if note else '') + 'fit vertex outside the fitted points'
+    return FitResult(float(v), db_v, (a, b, c), list(x), note, list(y), sigma_v, rms,
+                     (float(v - w), float(v + w)))
+
+
+@dataclass
+class TofResult:
+    samples: float               # at the optimum, from the emission instant
+    us: float
+    mm: float                    # c_w·t/2: distance transducer → front face
+    slope: float                 # measured ToF slope [samples/mm]
+    slope_theory: Optional[float]   # 2/c_w with the PE-side sign [samples/mm]
+    rms_samples: float
+    n_points: int
+    c_w: float
+    fs: float
+
+    @property
+    def slope_us_mm(self):
+        return self.slope / self.fs * 1e6
+
+    @property
+    def theory_us_mm(self):
+        return None if self.slope_theory is None else self.slope_theory / self.fs * 1e6
+
+    @property
+    def slope_error(self):
+        """Relative deviation of the slope from 2/c_w (signed), None without theory."""
+        if not self.slope_theory:
+            return None
+        return self.slope / self.slope_theory - 1.0
+
+
+def fit_tof_line(xs, measures, x_opt, c_w=C_W_NOMINAL, slope_theory=None,
+                 emission_sample=DEFAULT_EMISSION_SAMPLE, fs=ACQ_FS):
+    """
+    Straight line ToF(x) on the points with a clear, unflagged echo (sub-sample
+    envelope peaks), evaluated at x_opt and referenced to the emission sample.
+    Weighted by the envelope contrast: the timing jitter of a peak scales as
+    1/SNR, so the out-of-focus points (contrast ~10) must not weigh as much as
+    those near the focus (contrast ~100s). None with fewer than 2 such points.
+    """
+    pts = [(x, m.index_frac if m.index_frac == m.index_frac else float(m.index), m.contrast)
+           for x, m in zip(xs, measures) if m.confident and not m.flagged]
+    if len(pts) < 2:
+        return None
+    x = np.array([p[0] for p in pts])
+    t = np.array([p[1] for p in pts])
+    w = np.array([p[2] if np.isfinite(p[2]) else 1e3 for p in pts])
+    slope, icept = np.polyfit(x, t, 1, w=w)
+    rms = float(np.sqrt(np.mean((t - (icept + slope * x)) ** 2)))
+    samples = float(icept + slope * x_opt - emission_sample)
+    us = samples / fs * 1e6
+    return TofResult(samples, us, c_w * samples / fs / 2.0 * 1e3, float(slope), slope_theory,
+                     rms, len(pts), c_w, fs)
 
 
 @dataclass
@@ -201,44 +373,39 @@ class FocusOutcome:
     text: str
     fit: Optional[FitResult] = None
     notices: List[str] = field(default_factory=list)
-
-
-def fit_parabola_db(xs, amps, i_max, n_points=FIT_POINTS):
-    """Parabola on 20·log10(amp) over up to n_points centred on i_max (at least 3)."""
-    half = n_points // 2
-    lo, hi = max(0, i_max - half), min(len(xs), i_max + half + 1)
-    x = np.asarray(xs[lo:hi], dtype=float)
-    y = np.array([to_db(a) for a in amps[lo:hi]])
-    if len(x) < 3:
-        return FitResult(xs[i_max], to_db(amps[i_max]), None, list(x),
-                         'fewer than 3 points: optimum = measured maximum')
-    a, b, c = np.polyfit(x, y, 2)
-    if a >= 0:
-        return FitResult(xs[i_max], to_db(amps[i_max]), None, list(x),
-                         'fit is not concave: optimum = measured maximum')
-    xv = -b / (2.0 * a)
-    if not (x[0] <= xv <= x[-1]):
-        return FitResult(xs[i_max], to_db(amps[i_max]), None, list(x),
-                         'fit vertex outside the fitted points: optimum = measured maximum')
-    return FitResult(float(xv), float(a * xv * xv + b * xv + c), (a, b, c), list(x))
+    tof: Optional[TofResult] = None
+    report: List[str] = field(default_factory=list)   # result lines (fit, zone, ToF, slope)
 
 
 class FocusPlan:
     """
     Decisions of the focus search, without Qt or hardware:
         plan = FocusPlan(center, half_range, coarse, fine, limit, window, ...)
-        plan.coarse_positions                        -> measure them
-        plan.after_coarse(xs, measures)              -> (fine_positions, None) or (None, FocusOutcome)
-        plan.after_fine(xs, measures)                -> FocusOutcome
-    measures are PeakMeasure objects (window_peak).
+        plan.coarse_positions                  -> measure them
+        plan.after_coarse(xs, measures)        -> (fine_positions or None, FocusOutcome)
+                                                  fine_positions only when the fine
+                                                  sweep is enabled and the result moves
+        plan.after_fine(xs, measures)          -> FocusOutcome (the coarse one + fine notes)
+    fine (fine step) None: no fine sweep. measures are PeakMeasure objects,
+    normally from plan.tracker (the front-echo tracker of the run: new_sweep()
+    before each sweep, measure(sig, x) per point, and the sweep's measures from
+    tracker.measures, which a re-lock can revise).
     """
 
     def __init__(self, center, half_range, coarse_step, fine_step, limit,
-                 window, edge_margin=DEFAULT_EDGE_MARGIN, samples_per_mm=None):
-        if not (fine_step > 0 and coarse_step > 0 and half_range > 0):
+                 window, edge_margin=DEFAULT_EDGE_MARGIN, samples_per_mm=None,
+                 band=DEFAULT_BAND_SAMPLES, threshold=DEFAULT_THRESHOLD,
+                 fine_range=DEFAULT_FINE_RANGE_MM, c_w=C_W_NOMINAL, cw_source='nominal',
+                 emission_sample=DEFAULT_EMISSION_SAMPLE, fs=ACQ_FS):
+        if not (coarse_step > 0 and half_range > 0):
             raise ValueError('range and steps must be positive')
-        if fine_step >= coarse_step:
-            raise ValueError('the fine step must be smaller than the coarse step')
+        if fine_step is not None:
+            if not (fine_step > 0 and fine_range > 0):
+                raise ValueError('fine step and fine range must be positive')
+            if fine_step >= coarse_step:
+                raise ValueError('the fine step must be smaller than the coarse step')
+            if fine_step > fine_range:
+                raise ValueError('the fine step must not exceed the fine range')
         if coarse_step > half_range:
             raise ValueError('the coarse step must not exceed the range')
         if limit is None or limit <= 0:
@@ -246,11 +413,17 @@ class FocusPlan:
         self.center = float(center)
         self.half_range = float(half_range)
         self.coarse_step = float(coarse_step)
-        self.fine_step = float(fine_step)
+        self.fine_step = None if fine_step is None else float(fine_step)
+        self.fine_range = float(fine_range)
         self.limit = float(limit)
         self.window = window
         self.edge_margin = edge_margin
         self.samples_per_mm = samples_per_mm
+        self.c_w = float(c_w)
+        self.cw_source = cw_source
+        self.emission_sample = emission_sample
+        self.fs = fs
+        self.tracker = FrontEchoTracker(window, samples_per_mm, band, threshold, edge_margin)
         self.coarse_positions, self.clipped = sweep_positions(
             self.center, self.half_range, self.coarse_step, self.limit)
         self.notices = []
@@ -260,30 +433,37 @@ class FocusPlan:
                 f'{self.coarse_positions[0]:g}–{self.coarse_positions[-1]:g} mm.')
         if len(self.coarse_positions) < 3:
             raise ValueError('fewer than 3 coarse points inside the session limits')
+        self._coarse = None
 
     def flags(self, xs, measures):
         return point_flags(xs, measures, self.window, self.edge_margin, self.samples_per_mm)
 
-    def _flagged_outcome(self, xs, measures, fit=None):
-        bad = [(x, f) for x, f in zip(xs, self.flags(xs, measures)) if f]
+    def fine_positions_around(self, x):
+        return sweep_positions(x, self.fine_range, self.fine_step, self.limit)[0]
+
+    def _flagged_outcome(self, xs, measures):
+        flags = self.flags(xs, measures)
+        bad = [k for k, f in enumerate(flags) if f]
         if not bad:
             return None
-        kinds = sorted({k for _, f in bad for k in f})
-        what = describe_flags(kinds)
-        fix = []
-        if 'edge' in kinds or 'outside' in kinds:
-            fix.append('widen Smin–Smax on the Acquisition tab')
-        if 'saturated' in kinds:
-            fix.append('lower the gain')
-        pts = ', '.join(f'{x:g}' for x, _ in bad)
+        kinds = sorted({kind for k in bad for kind in flags[k]})
+        elsewhere = any(measures[k].echo_elsewhere for k in bad if 'outside' in flags[k])
+        pts = ', '.join(f'{xs[k]:g}' for k in bad)
         return FocusOutcome(
-            False, f'{what} at {len(bad)} point(s) ({pts} mm): the curve is incomplete. '
-                   f'{_upper_first(" and ".join(fix))}, then run again. Not moved to the optimum.',
-            fit, list(self.notices))
+            False, f'{_upper_first(describe_flags(kinds))} at {len(bad)} point(s) ({pts} mm): '
+                   f'the curve is incomplete. {flag_fixes(kinds, elsewhere)} Then run again. '
+                   'Not moved to the optimum.',
+            notices=list(self.notices))
 
     def after_coarse(self, xs, measures):
+        notices = list(self.notices)
+        relocks = len(self.tracker.relocks)
+        if relocks >= 2:
+            notices.append(f'The front echo re-locked {relocks} times in the coarse sweep: the '
+                           'prediction may run the wrong way. Check the PE side.')
         outcome = self._flagged_outcome(xs, measures)
         if outcome is not None:
+            outcome.notices = notices
             return None, outcome
         amps = [m.amp for m in measures]
         i = int(np.argmax(amps))
@@ -293,28 +473,192 @@ class FocusPlan:
                      'outside the working volume.' if self.clipped else '')
             return None, FocusOutcome(
                 False, f'Maximum on the {side} edge of the range ({xs[i]:g} mm): '
-                       f'widen the range. Not moved to the optimum.{extra}', notices=list(self.notices))
-        fine, _ = sweep_positions(xs[i], self.coarse_step, self.fine_step, self.limit)
-        return fine, None
-
-    def after_fine(self, xs, measures):
-        amps = [m.amp for m in measures]
-        fit = fit_parabola_db(xs, amps, int(np.argmax(amps)))
-        outcome = self._flagged_outcome(xs, measures, fit)
-        if outcome is not None:
-            return outcome
-        i = int(np.argmax(amps))
-        if i == 0 or i == len(xs) - 1:
-            return FocusOutcome(
-                False, f'Fine-sweep maximum on its edge ({xs[i]:g} mm): the coarse curve '
-                       'was misleading (noise?). Increase the averages. Not moved to the optimum.',
-                notices=list(self.notices))
+                       f'widen the range. Not moved to the optimum.{extra}', notices=notices)
+        fit = fit_focus_db(xs, amps, [sigma_db(m) for m in measures])
+        flat_limit = FLAT_SIGMA_FRACTION * self.coarse_step
+        if not fit.concave or not (fit.sigma_x <= flat_limit):
+            why = ('the fit is not concave' if not fit.concave else
+                   f'vertex {fit.x_opt:.2f} ± {fit.sigma_x:.2f} mm (1σ above '
+                   f'{flat_limit:.2f} mm)')
+            return None, FocusOutcome(
+                False, f'Curve too flat to determine the optimum: {why}. Widen the range, '
+                       'increase the averages or check that the transducer is focused. '
+                       'Not moved to the optimum.',
+                fit, notices, report=self._fit_lines(fit))
         x_opt = round(min(max(fit.x_opt, 0.0), self.limit), POSITION_DECIMALS)
         fit.x_opt = x_opt
-        text = f'Focus at {x_opt:.2f} mm ({fit.db_opt:.2f} dB).'
+        tof = fit_tof_line(xs, measures, x_opt, self.c_w, self.samples_per_mm,
+                           self.emission_sample, self.fs)
+        report = self._fit_lines(fit) + self._tof_lines(tof, notices)
+        text = f'Focus at {x_opt:.2f} ± {fit.sigma_x:.2f} mm ({fit.db_opt:.2f} dB).'
         if fit.note:
             text += f' ({fit.note})'
-        return FocusOutcome(True, text, fit, list(self.notices))
+        outcome = FocusOutcome(True, text, fit, notices, tof, report)
+        self._coarse = outcome
+        fine = self.fine_positions_around(x_opt) if self.fine_step is not None else None
+        return fine, outcome
+
+    def after_fine(self, xs, measures):
+        """Fine sweep: inspection only. The coarse outcome, with the fine-sweep notes."""
+        outcome = self._coarse
+        fit = outcome.fit
+        amps = [m.amp for m in measures]
+        i = int(np.argmax(amps))
+        a, b, c = fit.coeffs
+        offset = float(np.mean([to_db(amp) - (a * x * x + b * x + c) for x, amp in zip(xs, amps)]))
+        line = (f'Fine sweep (not used in the fit): maximum at {xs[i]:.2f} mm '
+                f'({xs[i] - fit.x_opt:+.2f} mm from the optimum), mean offset from the coarse '
+                f'fit {offset:+.2f} dB.')
+        flags = self.flags(xs, measures)
+        bad = [k for k, f in enumerate(flags) if f]
+        if bad:
+            kinds = sorted({kind for k in bad for kind in flags[k]})
+            line += f' {_upper_first(describe_flags(kinds))} at {len(bad)} fine point(s).'
+        outcome.report = list(outcome.report) + [line]
+        return outcome
+
+    def _fit_lines(self, fit):
+        lines = [f'Fit: {fit.n_points} coarse points within {FIT_WINDOW_DB:g} dB of the '
+                 f'maximum, RMS residual {fit.rms_db:.2f} dB, vertex 1σ {fit.sigma_x:.2f} mm.']
+        if fit.zone is not None:
+            lines.append(f'Focal zone (−{FOCAL_ZONE_DB:g} dB): {fit.zone[0]:.2f}–{fit.zone[1]:.2f} mm '
+                         f'({fit.zone_width:.2f} mm).')
+        return lines
+
+    def _tof_lines(self, tof, notices):
+        if tof is None:
+            notices.append('Time of flight not available: fewer than 2 points with a clear echo.')
+            return []
+        lines = [f'ToF at the optimum: {tof.samples:.1f} samples = {tof.us:.3f} µs = '
+                 f'{tof.mm:.2f} mm from the transducer (c_w = {tof.c_w:.1f} m/s, '
+                 f'{self.cw_source}; line on {tof.n_points} points, RMS {tof.rms_samples:.2f} '
+                 'samples).']
+        if tof.slope_theory is None:
+            lines.append(f'ToF slope {tof.slope:.1f} samples/mm ({tof.slope_us_mm:.4f} µs/mm).')
+            return lines
+        err = tof.slope_error
+        lines.append(f'ToF slope {tof.slope_us_mm:+.4f} µs/mm vs 2/c_w = {tof.theory_us_mm:+.4f} '
+                     f'µs/mm ({100.0 * err:+.1f} %).')
+        if tof.slope * tof.slope_theory < 0:
+            notices.append('The ToF slope has the opposite sign to 2/c_w: the echo moves the '
+                           'other way. Check the PE side in the session settings.')
+        elif abs(err) > SLOPE_TOLERANCE:
+            notices.append(f'The ToF slope differs from 2/c_w by {100.0 * err:+.0f} %: check c_w '
+                           '(temperature) and that the tracked echo is the front face.')
+        return lines
+
+# ===========================================================================
+#  Debug dump: one .npz per run with every measured point
+# ===========================================================================
+DEFAULT_DUMP_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                '..', 'data', 'focus_debug')   # data/ is local only (.gitignore)
+
+
+class FocusDebugDump:
+    """
+    Every point measured during one focus run (coarse, fine, and the one-point
+    'move' / 'return' phases), saved to one .npz. Arrays, index n = point in
+    measurement order, all loadable with np.load (no pickle):
+
+        phase             (n,) str    'coarse', 'fine', 'move', 'return'
+        x_beam            (n,)        beam-axis position [mm] where it was measured
+        record            (n, L)      full PE record of that acquisition (averaged,
+                                      ecos_gui float units, full scale ±0.5)
+        window_signal     (n, W)      the exact array the measure is computed on:
+                                      record[smin:smax] as float
+        envelope          (n, W)      its Hilbert envelope |hilbert(window_signal)|
+        peak_index        (n,)        chosen peak, absolute sample in record
+        peak_index_window (n,)        the same, relative to smin (index into envelope)
+        amp               (n,)        linear value = envelope[peak_index_window]
+        amp_db            (n,)        20·log10(amp)
+        smin, smax        (n,)        acquisition window
+        band_center       (n,)        tracking band centre, absolute sample (float):
+                                      the prediction t_prev + 2·Δx/c_w for 'tracked',
+                                      the chosen peak for 'first' / 'relock', NaN for 'none'
+        band_lo, band_hi  (n,)        band actually searched, absolute (−1 if none)
+        mode              (n,) str    selection reason: 'first' (first peak above the
+                                      threshold), 'tracked' (band around the prediction),
+                                      'relock' (earlier echo found, re-engaged), 'none'
+                                      (no clear echo, window maximum)
+        mode_at_measure   (n,) str    the reason when the point was measured; differs
+                                      from mode when a later re-lock re-measured it
+        revised           (n,) bool   mode/value changed by a later re-lock
+        contrast          (n,)        peak / median of the envelope
+        flags             (n,) str    'edge', 'outside', 'saturated', comma separated
+        meta_json         ()   str    run parameters and result (JSON)
+    With a re-lock the earlier points of that sweep hold the revised measure
+    (the one the curve and the result used); their window/envelope do not change.
+    """
+
+    def __init__(self, meta=None):
+        self.meta = dict(meta or {})
+        self.entries = []
+
+    def __len__(self):
+        return len(self.entries)
+
+    def add(self, phase, x, measure, seg, env, record, window):
+        self.entries.append(dict(
+            phase=phase, x=float(x), measure=measure, mode_at_measure=measure.mode,
+            amp_at_measure=measure.amp, seg=np.array(seg, dtype=float),
+            env=np.array(env, dtype=float), record=np.array(record, dtype=float),
+            smin=int(window[0]), smax=int(window[1]), flags=''))
+
+    def revise(self, start, measures, flags=None):
+        """Measures (and flags) of the current sweep, which starts at entry `start`."""
+        for k, m in enumerate(measures):
+            self.entries[start + k]['measure'] = m
+            if flags is not None:
+                self.entries[start + k]['flags'] = ','.join(flags[k])
+
+    def arrays(self):
+        e = self.entries
+        ms = [d['measure'] for d in e]
+
+        def band_center(m):
+            if m.predicted is not None:
+                return float(m.predicted)
+            return float(m.index) if m.band is not None else float('nan')
+
+        return dict(
+            phase=np.array([d['phase'] for d in e]),
+            x_beam=np.array([d['x'] for d in e]),
+            record=np.stack([d['record'] for d in e]),
+            window_signal=np.stack([d['seg'] for d in e]),
+            envelope=np.stack([d['env'] for d in e]),
+            peak_index=np.array([m.index for m in ms], dtype=np.int64),
+            peak_index_window=np.array([m.index - d['smin'] for m, d in zip(ms, e)],
+                                       dtype=np.int64),
+            amp=np.array([m.amp for m in ms]),
+            amp_db=np.array([to_db(m.amp) for m in ms]),
+            smin=np.array([d['smin'] for d in e], dtype=np.int64),
+            smax=np.array([d['smax'] for d in e], dtype=np.int64),
+            band_center=np.array([band_center(m) for m in ms]),
+            band_lo=np.array([m.band[0] if m.band else -1 for m in ms], dtype=np.int64),
+            band_hi=np.array([m.band[1] if m.band else -1 for m in ms], dtype=np.int64),
+            mode=np.array([m.mode for m in ms]),
+            mode_at_measure=np.array([d['mode_at_measure'] for d in e]),
+            revised=np.array([m.mode != d['mode_at_measure'] or m.amp != d['amp_at_measure']
+                              for m, d in zip(ms, e)]),
+            contrast=np.array([m.contrast for m in ms]),
+            flags=np.array([d['flags'] for d in e]),
+            meta_json=np.array(json.dumps(self.meta, default=str)),
+        )
+
+    def save(self, directory=DEFAULT_DUMP_DIR, stamp=None):
+        """Write focus_debug_<stamp>.npz (never overwrites). Returns the path."""
+        if not self.entries:
+            raise ValueError('no points measured: nothing to dump')
+        directory = os.path.abspath(directory)
+        os.makedirs(directory, exist_ok=True)
+        stamp = stamp or time.strftime('%Y%m%d_%H%M%S')
+        path = os.path.join(directory, f'focus_debug_{stamp}.npz')
+        k = 1
+        while os.path.exists(path):
+            path = os.path.join(directory, f'focus_debug_{stamp}_{k}.npz')
+            k += 1
+        np.savez(path, **self.arrays())
+        return path
 
 
 # ===========================================================================
@@ -323,7 +667,7 @@ class FocusPlan:
 import pyqtgraph as pg  # noqa: E402
 from PyQt5.QtCore import QObject, Qt, QTimer, pyqtSignal  # noqa: E402
 from PyQt5.QtWidgets import (  # noqa: E402
-    QDoubleSpinBox, QFormLayout, QGroupBox, QLabel, QPushButton, QSpinBox,
+    QCheckBox, QDoubleSpinBox, QFormLayout, QGroupBox, QLabel, QPushButton, QSpinBox,
 )
 
 _COL_COARSE = (150, 150, 150)
@@ -331,6 +675,7 @@ _COL_FINE = (80, 160, 255)
 _COL_FLAG = (235, 60, 60)
 _COL_FIT = (255, 200, 0)
 _COL_OPT = (0, 220, 120)
+_COL_ZONE = (0, 220, 120, 40)
 
 
 class FocusPlot:
@@ -358,22 +703,26 @@ class FocusPlot:
                             symbolBrush=_COL_FLAG, symbolPen=pg.mkPen(_COL_FLAG, width=2)),
         }
 
-    def add_point(self, phase, x, db):
-        xs, ys = self._data[phase]
-        xs.append(x)
-        ys.append(db)
-        self._curves[phase].setData(xs, ys)
+    def set_points(self, phase, xs, dbs):
+        """The whole phase each time: a re-lock of the tracker revises earlier points."""
+        self._data[phase] = (list(xs), list(dbs))
+        self._curves[phase].setData(list(xs), list(dbs))
 
     def set_flagged(self, points):
         """points: [(x, dB)] of the measures that cannot be trusted (red crosses)."""
         self._curves['flag'].setData([p[0] for p in points], [p[1] for p in points])
 
     def show_fit(self, fit):
+        """Parabola (coarse points within 3 dB), optimum and focal zone (−1 dB, shaded)."""
         if fit.coeffs is not None:
             a, b, c = fit.coeffs
             span = fit.fit_x[-1] - fit.fit_x[0]
             xx = np.linspace(fit.fit_x[0] - 0.25 * span, fit.fit_x[-1] + 0.25 * span, 100)
             self._pw.plot(xx, a * xx * xx + b * xx + c, pen=pg.mkPen(_COL_FIT, width=2))
+        if fit.zone is not None:
+            zone = pg.LinearRegionItem(values=fit.zone, movable=False, brush=pg.mkBrush(*_COL_ZONE))
+            zone.setZValue(-10)
+            self._pw.addItem(zone)
         self._pw.plot([fit.x_opt], [fit.db_opt], pen=None, symbol='star', symbolSize=16,
                       symbolBrush=_COL_OPT, symbolPen=None)
         self._pw.addItem(pg.InfiniteLine(pos=fit.x_opt, angle=90,
@@ -389,22 +738,34 @@ class FocusTool(QObject):
     current sequence and nothing else runs: no move to the optimum, no return;
     the current position is reported.
 
-    Signals: status(str) progress/result text, warning(str) window-edge or
-    saturation notices (emitted as soon as a point shows it), done(bool moved).
+    Signals: status(str) progress/result text, warning(str) window-edge,
+    saturation or re-lock notices (emitted as soon as a point shows it),
+    echo_used(PeakMeasure) the echo measured on each point (to mark it on the
+    A-scan), done(bool moved). The final status carries the result report
+    (fit, focal zone, ToF, slope check); the notices go out as warnings.
+
+    Debug dump (run(debug_dump=True)): every measured point goes to a
+    FocusDebugDump, written as one .npz when the run ends, however it ends
+    (result, STOP, fault). Its path is in last_dump_path and in the final status.
     """
     status = pyqtSignal(str)
     warning = pyqtSignal(str)
+    echo_used = pyqtSignal(object)
     done = pyqtSignal(bool)
 
     def __init__(self, sequencer, panel, window_fn, plot_widget, show_plot_fn=None,
-                 cw_fn=None, parent=None):
+                 cw_fn=None, dump_dir=None, acq_time_fn=None, parent=None):
         """
         sequencer     ScanSequencer (phase 2), used as is
         panel         ScannerPanel (role_axis, pe_side, current_coords, axis_limit,
                       sequence_blocker, validate_position)
         window_fn     () -> (smin, smax): the Acquisition tab window, read only
-        cw_fn         () -> water speed of sound [m/s] or None (C_W_NOMINAL); only
-                      used to predict where the echo moves
+        cw_fn         () -> (c_w [m/s], source text) from the PT100s, or a bare c_w,
+                      or None (C_W_NOMINAL). Read once at the start of each run; used
+                      for the echo prediction, the ToF in mm and the 2/c_w check
+        dump_dir      folder of the debug dumps (default data/focus_debug)
+        acq_time_fn   () -> seconds of one GetAScan() as timed by the host, or None
+                      (DEFAULT_ACQ_S); for the time estimate only
         """
         super().__init__(parent)
         self._seq = sequencer
@@ -413,8 +774,12 @@ class FocusTool(QObject):
         self._plot = FocusPlot(plot_widget)
         self._show_plot = show_plot_fn
         self._cw_fn = cw_fn
+        self._acq_time_fn = acq_time_fn
         self._phase = None
         self.last_outcome = None
+        self._dump_dir = dump_dir or DEFAULT_DUMP_DIR
+        self._dump = None
+        self.last_dump_path = None
         sequencer.point_done.connect(self._on_point)
         sequencer.finished.connect(self._on_finished)
 
@@ -422,9 +787,60 @@ class FocusTool(QObject):
     def running(self):
         return self._phase is not None
 
-    def run(self, half_range, coarse, fine, avg_n=DEFAULT_AVG_N,
-            settle_ms=DEFAULT_SETTLE_MS, edge_margin=DEFAULT_EDGE_MARGIN):
-        """Start the search. Returns None if started, else the reason it could not."""
+    def _resolve_cw(self):
+        """(c_w, source): the host's PT100 reading, else nominal."""
+        value = self._cw_fn() if self._cw_fn else None
+        source = 'PT100'
+        if isinstance(value, tuple):
+            value, source = value
+        if not value:
+            return C_W_NOMINAL, 'nominal, no PT100 reading'
+        return float(value), source
+
+    def acq_time_s(self):
+        """(seconds per GetAScan, timed?)"""
+        t = self._acq_time_fn() if self._acq_time_fn else None
+        return (float(t), True) if t else (DEFAULT_ACQ_S, False)
+
+    def estimate(self, half_range, coarse, fine=None, fine_range=DEFAULT_FINE_RANGE_MM,
+                 avg_n=DEFAULT_AVG_N, settle_ms=DEFAULT_SETTLE_MS):
+        """
+        (seconds, text) of a run with these parameters from the current position,
+        before starting it: coarse sweep, optional fine sweep (assumed centred)
+        and the final move. (None, reason) when it cannot be estimated.
+        """
+        try:
+            axis = self._panel.role_axis('beam')
+            start = float(self._panel.current_coords()[axis])
+            xs, _ = sweep_positions(start, half_range, coarse, self._panel.axis_limit(axis))
+        except Exception as e:
+            return None, f'Estimate not available ({e}).'
+        if len(xs) < 3 or coarse <= 0:
+            return None, 'Estimate not available.'
+        acq_s, timed = self.acq_time_s()
+        points = list(xs)
+        center = 0.5 * (xs[0] + xs[-1])
+        n_fine = 0
+        if fine:
+            fine_xs = sweep_positions(center, fine_range, fine, 1e9)[0]
+            n_fine = len(fine_xs)
+            points += fine_xs
+        points.append(center)                       # final move (or return)
+        total = estimate_duration_s(points, start, settle_ms, avg_n, acq_s)
+        parts = f'coarse {len(xs)} pts' + (f' + fine {n_fine} pts' if fine else '') + ' + final move'
+        acq = f'{acq_s * 1e3:.0f} ms/A-scan {"timed" if timed else "assumed"}'
+        return total, (f'Estimated time ≈ {format_duration(total)} ({parts}; per point '
+                       f'{settle_ms / 1000.0:g} s settle + {avg_n} × {acq}, moves at '
+                       f'{MOVE_MM_S:g} mm/s).')
+
+    def run(self, half_range, coarse, fine=None, avg_n=DEFAULT_AVG_N,
+            settle_ms=DEFAULT_SETTLE_MS, edge_margin=DEFAULT_EDGE_MARGIN,
+            band_us=DEFAULT_BAND_US, threshold=DEFAULT_THRESHOLD, debug_dump=True,
+            fine_range=DEFAULT_FINE_RANGE_MM, emission_sample=DEFAULT_EMISSION_SAMPLE):
+        """
+        Start the search. fine: fine step [mm], None = no fine sweep (it is for
+        inspection only). Returns None if started, else the reason it could not.
+        """
         if self._phase is not None or self._seq.active:
             return 'A sequence is already running.'
         reason = self._panel.sequence_blocker()
@@ -434,35 +850,56 @@ class FocusTool(QObject):
         smin, smax = self._window_fn()
         if smax - smin < MIN_WINDOW_SAMPLES:
             return f'Acquisition window Smin–Smax too short ({smin}–{smax}).'
-        c_w = (self._cw_fn() if self._cw_fn else None) or C_W_NOMINAL
+        estimate = self.estimate(half_range, coarse, fine, fine_range, avg_n, settle_ms)[1]
+        c_w, cw_source = self._resolve_cw()
         try:
             plan = FocusPlan(self._panel.current_coords()[axis], half_range, coarse, fine,
                              self._panel.axis_limit(axis), (smin, smax), edge_margin,
-                             echo_samples_per_mm(self._panel.pe_side(), c_w))
+                             echo_samples_per_mm(self._panel.pe_side(), c_w),
+                             band_samples(band_us), threshold, fine_range, c_w, cw_source,
+                             emission_sample)
         except ValueError as e:
             return str(e)
         self._axis, self._plan = axis, plan
         self._start_x = round(float(self._panel.current_coords()[axis]), POSITION_DECIMALS)
-        self._window = (smin, smax)
-        self._avg_n, self._settle_ms, self._margin = avg_n, settle_ms, edge_margin
+        self._avg_n, self._settle_ms = avg_n, settle_ms
         self.last_outcome = None
+        self.last_dump_path = None
+        self._dump = FocusDebugDump(dict(
+            started=time.strftime('%Y-%m-%dT%H:%M:%S'), beam_axis=axis,
+            pe_side=self._panel.pe_side(), start_x=self._start_x, smin=smin, smax=smax,
+            half_range_mm=half_range, coarse_mm=coarse, fine_mm=fine, avg_n=avg_n,
+            settle_ms=settle_ms, edge_margin=edge_margin, band_us=band_us,
+            band_samples=plan.tracker.band, threshold=threshold, c_w=c_w,
+            samples_per_mm=plan.samples_per_mm, fs=ACQ_FS, pe_channel=PE_CHANNEL,
+            coarse_positions=plan.coarse_positions, notices=plan.notices,
+        )) if debug_dump else None
         self._plot.reset(axis)
         for text in plan.notices:
             self.warning.emit(text)
         reason = self._start_phase('coarse', plan.coarse_positions)
-        if reason is None and self._show_plot is not None:
-            self._show_plot()
+        if reason is None:
+            self.status.emit(f'Focus: coarse sweep, {len(plan.coarse_positions)} points '
+                             f'(c_w = {c_w:.1f} m/s, {cw_source}). {estimate}')
+            if self._show_plot is not None:
+                self._show_plot()
         return reason
 
     # -- phases ----------------------------------------------------------------
     def _measure(self, ch1, ch2):
+        # Called by the sequencer after the move: current_coords() is the point.
         sig = ch2 if PE_CHANNEL == 2 else ch1
-        return window_peak(sig, self._window[0], self._window[1], self._margin)
+        x = self._panel.current_coords()[self._axis]
+        if self._dump is not None:
+            self._last_record = np.array(sig, dtype=float)
+        return self._plan.tracker.measure(sig, x)
 
     def _start_phase(self, phase, xs):
         self._phase = phase
         self._xs, self._measures = [], []
         self._warned = set()
+        self._plan.tracker.new_sweep()
+        self._dump_start = len(self._dump) if self._dump is not None else 0
         n = len(xs)
         if phase == 'move':
             self.status.emit(f'Focus: moving to {xs[0]:.2f} mm…')
@@ -482,28 +919,37 @@ class FocusTool(QObject):
             return
         x = float(coords.get(self._axis, float('nan')))
         self._xs.append(x)
-        self._measures.append(value)
+        self._measures = list(self._plan.tracker.measures)   # a re-lock revises earlier points
+        if self._dump is not None:
+            seg, env = self._plan.tracker.point_signals(-1)
+            self._dump.add(self._phase, x, value, seg, env, self._last_record, self._plan.window)
+            self._dump.revise(self._dump_start, self._measures)
+        self.echo_used.emit(value)
         if self._phase in ('move', 'return'):
             return
-        self._plot.add_point(self._phase, x, to_db(value.amp))
+        self._plot.set_points(self._phase, self._xs, [to_db(m.amp) for m in self._measures])
+        if value.mode == 'relock':
+            self.warning.emit(
+                f'Front echo re-locked at {x:g} mm: an earlier echo appeared, the one '
+                f'followed so far was a later one (back face?). The previous points of the '
+                f'{self._phase} sweep were re-measured on the front echo.')
         # Checked on every point, not only at the end: a new reference can also
         # flag earlier points, so the whole phase is re-evaluated.
         flags = self._plan.flags(self._xs, self._measures)
+        if self._dump is not None:
+            self._dump.revise(self._dump_start, self._measures, flags)
         self._plot.set_flagged([(self._xs[k], to_db(self._measures[k].amp))
                                 for k, f in enumerate(flags) if f])
         new = [k for k, f in enumerate(flags) if f and k not in self._warned]
         if new:
             self._warned.update(new)
             kinds = sorted({kind for k in new for kind in flags[k]})
-            fix = []
-            if 'edge' in kinds or 'outside' in kinds:
-                fix.append('widen Smin–Smax')
-            if 'saturated' in kinds:
-                fix.append('lower the gain')
+            elsewhere = any(self._measures[k].echo_elsewhere for k in new
+                            if 'outside' in flags[k])
             pts = ', '.join(f'{self._xs[k]:g}' for k in new)
-            self.warning.emit(f'{describe_flags(kinds)} at {pts} mm '
-                              f'({len(self._warned)} marked point(s) in the {self._phase} sweep): '
-                              f'{" and ".join(fix)}.')
+            self.warning.emit(f'{_upper_first(describe_flags(kinds))} at {pts} mm '
+                              f'({len(self._warned)} marked point(s) in the {self._phase} sweep). '
+                              f'{flag_fixes(kinds, elsewhere)}')
 
     def _on_finished(self, status, text):
         if self._phase is None:
@@ -525,29 +971,33 @@ class FocusTool(QObject):
         phase, xs, measures = self._phase, self._xs, self._measures
         if phase == 'coarse':
             fine, outcome = self._plan.after_coarse(xs, measures)
-            if outcome is not None:
-                self._return_to_start(outcome.text, outcome)
-                return
-            reason = self._start_phase('fine', fine)
-            if reason:
-                self._end(False, f'Focus: fine sweep could not start: {reason}')
-        elif phase == 'fine':
-            outcome = self._plan.after_fine(xs, measures)
             self.last_outcome = outcome
             if outcome.fit is not None:
                 self._plot.show_fit(outcome.fit)
             if not outcome.move:
                 self._return_to_start(outcome.text, outcome)
                 return
-            reason = self._start_phase('move', [outcome.fit.x_opt])
-            if reason:
-                self._end(False, f'{outcome.text} Could not move there: {reason}', outcome)
+            if fine:
+                reason = self._start_phase('fine', fine)
+                if reason:
+                    self._end(False, f'{outcome.text} Fine sweep could not start: {reason}',
+                              outcome)
+                return
+            self._start_move(outcome)
+        elif phase == 'fine':
+            self._start_move(self._plan.after_fine(xs, measures))
         elif phase == 'move':
             outcome = self.last_outcome
             self._end(True, f'{outcome.text} Moved there.', outcome)
         else:   # 'return'
             self._end(False, f'{self._return_text} Back at the start position '
                              f'({self._axis} = {self._start_x:.2f} mm).', self.last_outcome)
+
+    def _start_move(self, outcome):
+        self.last_outcome = outcome
+        reason = self._start_phase('move', [outcome.fit.x_opt])
+        if reason:
+            self._end(False, f'{outcome.text} Could not move there: {reason}', outcome)
 
     def _return_to_start(self, text, outcome):
         """No move to the optimum: back to the beam position held before the sweep."""
@@ -562,8 +1012,31 @@ class FocusTool(QObject):
         self._phase = None
         if outcome is not None:
             self.last_outcome = outcome
+            for notice in outcome.notices:
+                if notice not in self._plan.notices:       # those went out at the start
+                    self.warning.emit(notice)
+            if outcome.report:
+                text = '\n'.join([text] + outcome.report)
+        text += self._save_dump(moved, text)
         self.status.emit(text)
         self.done.emit(moved)
+
+    def _save_dump(self, moved, text):
+        """Write the debug dump of the run; returns the text to append to the status."""
+        dump, self._dump = self._dump, None
+        if dump is None or not len(dump):
+            return ''
+        fit = self.last_outcome.fit if self.last_outcome is not None else None
+        dump.meta.update(result=text, moved=moved,
+                         x_opt=fit.x_opt if fit is not None else None,
+                         db_opt=fit.db_opt if fit is not None else None,
+                         fit_coeffs=list(fit.coeffs) if fit is not None and fit.coeffs else None)
+        try:
+            self.last_dump_path = dump.save(self._dump_dir)
+        except Exception as e:
+            self.warning.emit(f'Focus debug dump not saved: {e}')
+            return ''
+        return f' Debug dump: {self.last_dump_path}'
 
 
 class FocusGroup(QGroupBox):
@@ -587,30 +1060,67 @@ class FocusGroup(QGroupBox):
 
         self._spin_range = dspin(0.1, 100.0, DEFAULT_HALF_RANGE_MM, 2, 0.5, ' mm')
         self._spin_coarse = dspin(0.02, 20.0, DEFAULT_COARSE_MM, 2, 0.1, ' mm')
+        self._chk_fine = QCheckBox('Fine sweep around the optimum (inspection only)')
+        self._chk_fine.setChecked(False)
+        self._chk_fine.setToolTip('Not used in the fit: the optimum comes from the coarse '
+                                  'points within 3 dB of the maximum (a +0.2 dB bias between '
+                                  'fine and coarse sweeps was measured).')
+        self._spin_fine_range = dspin(0.02, 20.0, DEFAULT_FINE_RANGE_MM, 2, 0.1, ' mm')
         self._spin_fine = dspin(0.01, 10.0, DEFAULT_FINE_MM, 2, 0.05, ' mm')
         self._spin_avg = QSpinBox()
-        self._spin_avg.setRange(1, 1000)
+        self._spin_avg.setRange(1, 10000)
         self._spin_avg.setValue(DEFAULT_AVG_N)
-        self._spin_avg.setToolTip('Default pending measurement on the real equipment.')
+        self._spin_avg.setToolTip('Measured on the real equipment (30/09).')
         self._spin_settle = QSpinBox()
-        self._spin_settle.setRange(0, 10000)
+        self._spin_settle.setRange(0, 60000)
         self._spin_settle.setValue(DEFAULT_SETTLE_MS)
         self._spin_settle.setSuffix(' ms')
-        self._spin_settle.setToolTip('Default pending measurement on the real equipment.')
+        self._spin_settle.setToolTip('Measured on the real equipment (30/09).')
+        self._spin_emission = QSpinBox()
+        self._spin_emission.setRange(0, 100000)
+        self._spin_emission.setValue(DEFAULT_EMISSION_SAMPLE)
+        self._spin_emission.setSuffix(' samples')
+        self._spin_emission.setToolTip('Record sample of the emission instant, the time origin '
+                                       'of the reported ToF. 0: the record starts at the '
+                                       'trigger, as everywhere in ECOS.')
         self._spin_margin = dspin(0.0, 25.0, DEFAULT_EDGE_MARGIN * 100, 1, 1.0, ' %')
         self._spin_margin.setToolTip('An envelope peak this close to Smin or Smax '
                                      '(fraction of the window width) is flagged.')
         form.addRow('Range (beam, ±):', self._spin_range)
         form.addRow('Coarse step:', self._spin_coarse)
+        form.addRow(self._chk_fine)
+        form.addRow('Fine range (±):', self._spin_fine_range)
         form.addRow('Fine step:', self._spin_fine)
         form.addRow('Averages:', self._spin_avg)
         form.addRow('Settle:', self._spin_settle)
+        form.addRow('Emission at:', self._spin_emission)
         form.addRow('Window edge margin:', self._spin_margin)
+        self._spin_band = dspin(0.05, 10.0, DEFAULT_BAND_US, 2, 0.05, ' µs')
+        self._spin_band.setToolTip('Front echo: after the first point, its maximum is searched '
+                                   'only within ± this of the predicted t_prev + 2·Δx/c_w. '
+                                   'Keep it below the front/back echo separation.')
+        self._spin_threshold = dspin(1.0, 90.0, DEFAULT_THRESHOLD * 100, 0, 1.0, ' %')
+        self._spin_threshold.setToolTip('Front echo on the first point: the first envelope peak '
+                                        'above this fraction of the window maximum (and clearly '
+                                        'above the noise), not the largest one.')
+        form.addRow('Tracking band (±):', self._spin_band)
+        form.addRow('Front-echo threshold:', self._spin_threshold)
+        self._chk_dump = QCheckBox('Save debug dump (.npz, data/focus_debug)')
+        self._chk_dump.setChecked(True)
+        self._chk_dump.setToolTip('One file per run: per point the PE record, the window '
+                                  'array and envelope the measure used, the chosen peak, '
+                                  'its value (linear and dB), the band and the reason.')
+        form.addRow(self._chk_dump)
 
         self._lbl_window = QLabel()
         self._lbl_window.setWordWrap(True)
         self._lbl_window.setStyleSheet('color: gray;')
         form.addRow(self._lbl_window)
+
+        self._lbl_estimate = QLabel()
+        self._lbl_estimate.setWordWrap(True)
+        self._lbl_estimate.setStyleSheet('color: gray;')
+        form.addRow(self._lbl_estimate)
 
         self._btn_run = QPushButton('Run focus')
         self._btn_run.clicked.connect(self._on_run)
@@ -627,7 +1137,29 @@ class FocusGroup(QGroupBox):
         tool.status.connect(self._lbl_status.setText)
         tool.warning.connect(self._on_warning)
         sequencer.state_changed.connect(lambda st: self._btn_run.setEnabled(st == 'idle'))
+        for spin in (self._spin_range, self._spin_coarse, self._spin_fine,
+                     self._spin_fine_range, self._spin_avg, self._spin_settle):
+            spin.valueChanged.connect(self._refresh_estimate)
+        self._chk_fine.toggled.connect(self._on_fine_toggled)
+        self._on_fine_toggled(self._chk_fine.isChecked())
         self._refresh_window_label()
+
+    def _on_fine_toggled(self, on):
+        self._spin_fine.setEnabled(on)
+        self._spin_fine_range.setEnabled(on)
+        self._refresh_estimate()
+
+    def _refresh_estimate(self, *_):
+        """Estimated duration before starting (also refreshed when the panel is shown)."""
+        _, text = self._tool.estimate(
+            self._spin_range.value(), self._spin_coarse.value(),
+            self._spin_fine.value() if self._chk_fine.isChecked() else None,
+            self._spin_fine_range.value(), self._spin_avg.value(), self._spin_settle.value())
+        self._lbl_estimate.setText(text)
+
+    def showEvent(self, event):
+        self._refresh_estimate()
+        super().showEvent(event)
 
     def _refresh_window_label(self):
         try:
@@ -642,10 +1174,16 @@ class FocusGroup(QGroupBox):
 
     def _on_run(self):
         self._refresh_window_label()
+        self._refresh_estimate()
         self._lbl_warn.setText('')
         reason = self._tool.run(
-            self._spin_range.value(), self._spin_coarse.value(), self._spin_fine.value(),
-            self._spin_avg.value(), self._spin_settle.value(),
-            self._spin_margin.value() / 100.0)
+            self._spin_range.value(), self._spin_coarse.value(),
+            fine=self._spin_fine.value() if self._chk_fine.isChecked() else None,
+            avg_n=self._spin_avg.value(), settle_ms=self._spin_settle.value(),
+            edge_margin=self._spin_margin.value() / 100.0, band_us=self._spin_band.value(),
+            threshold=self._spin_threshold.value() / 100.0,
+            debug_dump=self._chk_dump.isChecked(),
+            fine_range=self._spin_fine_range.value(),
+            emission_sample=self._spin_emission.value())
         if reason:
             self._lbl_status.setText(reason)
