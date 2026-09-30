@@ -1,6 +1,6 @@
 # Especificación: pestaña Escáner en ECOS
 
-Estado: aprobada. Fase 1 implementada y probada en hardware (21–24/09). Fase 3 (foco) cerrada tras las pruebas en hardware (30/09). Última revisión: 2026-09-30.
+Estado: aprobada. Fase 1 implementada y probada en hardware (21–24/09). Fase 3 (foco) cerrada tras las pruebas en hardware (30/09). Fase 4 (planitud) implementada y probada con el SeDaq sintético, pendiente de prueba en hardware. Última revisión: 2026-09-30.
 
 ## 1. Contexto
 
@@ -23,7 +23,7 @@ Escáner XYZR (controlador SE SC-03-00) para posicionar muestras de PVA dentro d
 - `Ctrl+C` / `SSF` detiene el movimiento en seco; el contador queda en la posición real.
 - Cortar la tensión del controlador: la **posición se conserva**, los **límites vuelven a 10000 pasos** (100/100/50 mm, 18000°). Reabrir el puerto serie no afecta.
 - El constructor de `Scanner` tarda ~4 s (≈20 órdenes). Solo una vez por sesión.
-- **Eje R** (verificado el 23/09): `uStepR = 1.8` es correcto (200 pasos = una vuelta) y el contador es **circular** (al completar la vuelta vuelve a 0). `SPR` **no tiene efecto** sobre R. Con el soporte de muestras montado, un giro continuo **pierde pasos**; paso a paso (órdenes de 1,8° sueltas) gira bien. Por eso todo movimiento de R se trocea en pasos con una pausa configurable. Antes de usar R para corregir la orientación en la planitud, hay que comprobar su repetibilidad con la carga real.
+- **Eje R** (verificado el 23/09): `uStepR = 1.8` es correcto (200 pasos = una vuelta) y el contador es **circular** (al completar la vuelta vuelve a 0). `SPR` **no tiene efecto** sobre R. Con el soporte de muestras montado, un giro continuo **pierde pasos**; paso a paso (órdenes de 1,8° sueltas) gira bien. Por eso todo movimiento de R se trocea en pasos con una pausa configurable. **R no se usa para corregir la planitud**: 1,8° por paso es insuficiente. Queda para orientar la pieza de forma gruesa (fase 4).
 
 ## 2. Conceptos
 
@@ -121,12 +121,34 @@ Al lanzar una herramienta, la gráfica grande pasa automáticamente a la pestañ
 - **No guarda resultados.** Solo un volcado de depuración opcional (casilla, activada por defecto, 30/09): un `.npz` por ejecución en `data/focus_debug/` (local, fuera de git) con, por punto, la posición, el registro PE, el array de la ventana y su envolvente, el pico elegido, su valor lineal y en dB, Smin–Smax, la banda y el motivo de la selección. Formato en `FocusDebugDump` (`focus_tool.py`).
 
 ### 5.5 Planitud
-- Parámetros: rango ±N mm en el eje lateral, rango ±M mm en Z (ambos alrededor del centro), paso, promedios y tolerancia en grados.
-- Mide dos líneas, lateral y Z, con el tiempo de vuelo de la cara de la muestra en PE. Estimador de ECOS, sobre el eco frontal localizado con el mismo seguimiento que el foco (`echo_tracking.FrontEchoTracker`, pasando la posición del eje del haz, que no cambia: la banda absorbe el desplazamiento por la inclinación).
-- Ajuste lineal del tiempo de vuelo frente a la posición en cada línea. Ángulo θ = atan(c_w · Δt / (2 · Δx)), con c_w calculada a partir de los PT100.
-- Gráfica: las dos líneas con su ajuste, el ángulo de cada eje y un indicador verde o rojo según la tolerancia. Leyenda: inclinación lateral → corregir con R; inclinación en Z → corregir con el tilt manual.
-- Botón Repetir, para iterar mientras se corrige.
-- **No guarda nada.**
+Implementada en `acquisition/flatness_tool.py` (fase 4, `task_scanner_phase4.md`).
+
+- Parámetros:
+  - rango ±N mm en el eje lateral y ±M mm en Z, alrededor de la posición actual, con el paso de cada eje; por defecto ±10 mm con paso 1 mm, y ±5 mm con paso 0,5 mm;
+  - promedios y asentamiento, los de la fase 3 (100 y 5000 ms);
+  - tolerancia en grados (0,1° por defecto), banda de seguimiento y volcado de depuración.
+- Tiempo estimado antes de empezar, como en el foco.
+- Mide dos líneas de tiempo de vuelo del **eco frontal**, lateral y Z. **El eje del haz no se mueve.** Reutiliza el secuenciador de la fase 2 y el seguimiento de la fase 3 (`FrontEchoTracker`), con un tracker por línea (regla del primer pico en su primer punto) y siempre la misma posición del haz: la predicción es t_previo y la banda absorbe el desplazamiento por la inclinación. La línea Z se hace con el lateral en el centro. Al terminar, el escáner vuelve al centro; con STOP no se mueve y solo informa.
+- ToF de cada punto: pico de la envolvente interpolado bajo la muestra, desde la muestra de emisión.
+- **Ajuste**: recta ponderada de ToF frente a posición en cada línea. Los pesos son proporcionales al contraste², porque el jitter del pico escala con 1/SNR, y la escala absoluta sale de los residuos (n − 2 grados de libertad). Ángulo θ = atan(c_w · Δt / (2 · Δx)), con c_w de los PT100 por el mismo mecanismo que el foco.
+- **Resultado por eje**:
+  - el ángulo con su incertidumbre 1σ (propagada desde la pendiente) y el residuo RMS como desplazamiento de la cara, en µm;
+  - un indicador: verde (|θ| ≤ tolerancia), rojo (fuera), naranja (σ mayor que la mitad de la tolerancia, no se puede juzgar) o gris (sin resultado);
+  - si |θ| < 2σ, dice «no distinguible de 0» en lugar de dar un número con falsa precisión, y no propone corrección. Los decimales se ajustan a la σ.
+- **Convenio de signo** (el mismo del SeDaq sintético): θ > 0 cuando la cara se **aleja** del transductor PE al crecer el contador lateral (o Z; Z crece hacia abajo). No depende del lado PE.
+- **Correcciones, siempre manuales**: la herramienta mide e informa y no mueve ningún eje para corregir.
+  - Inclinación lateral → platina manual de rotación alrededor del eje vertical: «gira θ° de modo que el extremo X+ (o Y+) de la cara se acerque/aleje del transductor PE».
+  - Inclinación en Z → tilt manual: «inclina θ° de modo que el borde inferior de la cara (Z+) se acerque/aleje del transductor PE».
+  - En los dos casos se da el Δθ con signo.
+  - **R no se usa ni se propone** (1,8° por paso). El secuenciador tampoco puede moverlo.
+- **Puntos poco fiables**, marcados en la gráfica y fuera del ajuste:
+  - eco pegado a un borde de Smin–Smax → «ventana estrecha, amplíala»;
+  - sin eco claro en la banda → «seguimiento perdido». Si hay un eco claro fuera de la banda, el desplazamiento por paso supera la banda y hay que reducir el paso o ampliar la banda;
+  - saturación.
+- **La cara puede acabarse**: si el eco desaparece en los extremos de una línea, el ajuste se limita al tramo con eco claro, se dice y se sugiere un rango. Con menos de 3 puntos válidos no hay resultado para ese eje.
+- Gráfica: las dos líneas como desplazamiento de la cara (µm, desde el ToF) frente a la posición relativa al centro, con sus rectas y los puntos poco fiables marcados.
+- Botones Ejecutar y **Repetir** (mismos parámetros: corriges a mano y vuelves a medir).
+- **No guarda nada** en la base de datos. Volcado de depuración opcional: un `.npz` por ejecución en `data/flatness_debug/`, con el formato del foco más las columnas `line`, `line_position`, `line_offset`, `tof_samples` y `tof_us`.
 
 ### 5.6 Barridos
 - Tipo: línea (lateral o Z) o superficie (lateral × Z).

@@ -91,6 +91,7 @@ try:
     from scanner_panel import ScannerPanel
     from scan_sequencer import ScanSequencer, DEFAULT_AVG_N, DEFAULT_SETTLE_MS
     from focus_tool import FocusTool, FocusGroup, window_peak
+    from flatness_tool import FlatnessTool, FlatnessGroup
     _SCANNER_PANEL_ERR = None
 except Exception as _sp_err:   # e.g. pyserial missing: the rest of the GUI still works
     ScannerPanel = ScanSequencer = None
@@ -1256,6 +1257,16 @@ class EcosGUI(QMainWindow):
         self._echo_mark = None
         self._focus_tool.echo_used.connect(self._mark_echo)
         self._focus_tool.done.connect(lambda _moved: self._clear_echo_mark())
+
+        # Flatness (phase 4): same sequencer, c_w and echo marking as the focus.
+        self._flatness_tool = FlatnessTool(seq, panel, self._get_smin_smax, self._plot_scan,
+                                           show_plot_fn=self._show_scanner_plot,
+                                           cw_fn=self._scanner_water_cw,
+                                           acq_time_fn=lambda: getattr(self, '_t_ascan', None),
+                                           parent=self)
+        panel.add_tool_widget(FlatnessGroup(self._flatness_tool, seq))
+        self._flatness_tool.echo_used.connect(self._mark_echo)
+        self._flatness_tool.done.connect(lambda _ok: self._clear_echo_mark())
 
         if isinstance(self._sedaq, SimSeDaq):
             panel.scanner_state_changed.connect(self._push_scanner_state_to_sim)

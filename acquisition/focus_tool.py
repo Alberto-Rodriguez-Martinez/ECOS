@@ -221,6 +221,27 @@ def format_duration(seconds):
     return f'{h} h {m:02d} min'
 
 
+def resolve_cw(cw_fn):
+    """
+    (c_w, source) from the host's cw_fn: () -> (c_w, source text) from the
+    PT100s, or a bare c_w, or None. Falls back to C_W_NOMINAL, saying so.
+    Shared by the scanner tools (focus, flatness).
+    """
+    value = cw_fn() if cw_fn else None
+    source = 'PT100'
+    if isinstance(value, tuple):
+        value, source = value
+    if not value:
+        return C_W_NOMINAL, 'nominal, no PT100 reading'
+    return float(value), source
+
+
+def acq_time(acq_time_fn):
+    """(seconds per GetAScan, timed?) from the host's timing, else DEFAULT_ACQ_S."""
+    t = acq_time_fn() if acq_time_fn else None
+    return (float(t), True) if t else (DEFAULT_ACQ_S, False)
+
+
 def estimate_duration_s(positions, start, settle_ms, avg_n, acq_s=DEFAULT_ACQ_S,
                         move_mm_s=MOVE_MM_S):
     """Moves (at move_mm_s) + settle + avg_n acquisitions per point, from `start`."""
@@ -590,19 +611,27 @@ class FocusDebugDump:
     (the one the curve and the result used); their window/envelope do not change.
     """
 
-    def __init__(self, meta=None):
+    def __init__(self, meta=None, prefix='focus_debug'):
+        """prefix: file name prefix (other tools reuse the class, e.g. 'flatness_debug')."""
         self.meta = dict(meta or {})
         self.entries = []
+        self.prefix = prefix
 
     def __len__(self):
         return len(self.entries)
 
-    def add(self, phase, x, measure, seg, env, record, window):
+    def add(self, phase, x, measure, seg, env, record, window, extra=None):
+        """extra: optional {name: scalar} per point, saved as arrays named after the keys
+        (only keys present on every point). The focus tool passes none."""
         self.entries.append(dict(
             phase=phase, x=float(x), measure=measure, mode_at_measure=measure.mode,
             amp_at_measure=measure.amp, seg=np.array(seg, dtype=float),
             env=np.array(env, dtype=float), record=np.array(record, dtype=float),
-            smin=int(window[0]), smax=int(window[1]), flags=''))
+            smin=int(window[0]), smax=int(window[1]), flags='', extra=dict(extra or {})))
+
+    def set_extra(self, k, **values):
+        """Update the extra columns of entry k (e.g. after a re-lock revised its measure)."""
+        self.entries[k]['extra'].update(values)
 
     def revise(self, start, measures, flags=None):
         """Measures (and flags) of the current sweep, which starts at entry `start`."""
@@ -643,19 +672,23 @@ class FocusDebugDump:
             contrast=np.array([m.contrast for m in ms]),
             flags=np.array([d['flags'] for d in e]),
             meta_json=np.array(json.dumps(self.meta, default=str)),
-        )
+            **self._extra_arrays())
+
+    def _extra_arrays(self):
+        keys = set.intersection(*[set(d['extra']) for d in self.entries]) if self.entries else set()
+        return {k: np.array([d['extra'][k] for d in self.entries]) for k in sorted(keys)}
 
     def save(self, directory=DEFAULT_DUMP_DIR, stamp=None):
-        """Write focus_debug_<stamp>.npz (never overwrites). Returns the path."""
+        """Write <prefix>_<stamp>.npz (never overwrites). Returns the path."""
         if not self.entries:
             raise ValueError('no points measured: nothing to dump')
         directory = os.path.abspath(directory)
         os.makedirs(directory, exist_ok=True)
         stamp = stamp or time.strftime('%Y%m%d_%H%M%S')
-        path = os.path.join(directory, f'focus_debug_{stamp}.npz')
+        path = os.path.join(directory, f'{self.prefix}_{stamp}.npz')
         k = 1
         while os.path.exists(path):
-            path = os.path.join(directory, f'focus_debug_{stamp}_{k}.npz')
+            path = os.path.join(directory, f'{self.prefix}_{stamp}_{k}.npz')
             k += 1
         np.savez(path, **self.arrays())
         return path
@@ -788,19 +821,10 @@ class FocusTool(QObject):
         return self._phase is not None
 
     def _resolve_cw(self):
-        """(c_w, source): the host's PT100 reading, else nominal."""
-        value = self._cw_fn() if self._cw_fn else None
-        source = 'PT100'
-        if isinstance(value, tuple):
-            value, source = value
-        if not value:
-            return C_W_NOMINAL, 'nominal, no PT100 reading'
-        return float(value), source
+        return resolve_cw(self._cw_fn)
 
     def acq_time_s(self):
-        """(seconds per GetAScan, timed?)"""
-        t = self._acq_time_fn() if self._acq_time_fn else None
-        return (float(t), True) if t else (DEFAULT_ACQ_S, False)
+        return acq_time(self._acq_time_fn)
 
     def estimate(self, half_range, coarse, fine=None, fine_range=DEFAULT_FINE_RANGE_MM,
                  avg_n=DEFAULT_AVG_N, settle_ms=DEFAULT_SETTLE_MS):

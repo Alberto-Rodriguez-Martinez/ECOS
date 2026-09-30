@@ -8,7 +8,7 @@ See task_scanner_phase3.md section 1 and scanner_tab_spec.md sections 2-3.
 SimSeDaq has the interface ecos_gui.py uses from tools/SeDaq.py (GetAScan,
 SetRecLen, SetGain1/2, DataADC1/2, RecLen, UpdateGenCode, SetExtVoltage,
 SetRelay, Close) and generates echoes from a known physical model, so the
-scanner tools (focus, later flatness) can be checked against a ground truth.
+scanner tools (focus, flatness) can be checked against a ground truth.
 
 Model
 -----
@@ -20,6 +20,12 @@ Pulse-echo channel (PE_CHANNEL = Ch2, as everywhere in ecos_gui.py):
                s = −1 with PE side 'max'.  F is the focal distance, so the
                front face sits exactly at the focus when x_beam = x_focus
                (at lat0, z0).
+    Tilt sign convention, the one the flatness tool measures (phase 4):
+    θ > 0 means the face gets FARTHER from the PE transducer as the lateral
+    (resp. Z) counter grows, so dt/dlat = 2·tan(θ_lat)/c_w and
+    θ = atan(c_w·Δt / (2·Δx)) returns θ_lat and θ_z exactly. Z grows downwards
+    (spec section 1). It does not depend on the PE side: it is the face as the
+    PE transducer sees it.
     t_front  = 2·d / c_w
     A_front  = A0·exp(−(d − F)² / (2σ²))   (= exp(−(x_beam − x_focus)²/(2σ²))
                at lat0, z0; with tilt the focus position moves accordingly,
@@ -27,6 +33,9 @@ Pulse-echo channel (PE_CHANNEL = Ch2, as everywhere in ecos_gui.py):
     plus, to make "measure only inside Smin–Smax" matter: the excitation
     main bang near t = 0 (saturating), the back-wall echo and the first
     water-path reverberation (at 2·t_front).
+    Face extent: the sample face covers |lat − lat0| ≤ face_half_lat and
+    |z − z0| ≤ face_half_z. Beyond, the echoes fade out over ~beam_radius (the
+    beam leaves the face), which is how "the face can end" along a flatness line.
     Back-wall echo: t_back = t_front + 2·h/c_sample, with its own focal gain,
     A_back = back_ratio·A0·exp(−(d_back − F)² / (2σ²)), where
     d_back = d + h·c_sample/c_w is the water-equivalent (paraxial) distance of
@@ -108,6 +117,10 @@ class SimParams:
     incl_z: float = 25.0
     incl_radius: float = 4.0
     incl_contrast: float = 0.6   # fractional amplitude loss at the inclusion centre
+    # -- sample face extent (flatness lines can run off it) -----------------------
+    face_half_lat: float = 1000.0  # half width of the face along lateral, around lat0
+    face_half_z: float = 1000.0    # half height along Z, around z0
+    beam_radius: float = 1.0       # the echo fades over ~this when the beam leaves the face
 
     @classmethod
     def thin_sample(cls, **overrides):
@@ -245,6 +258,15 @@ class SimSeDaq:
         return self.expected_focus(lat, z) - self._sign() * p.thickness * p.c_sample / p.c_w
 
     # -- signal generation -------------------------------------------------------
+    def face_coverage(self, lat, z):
+        """Fraction of the beam on the sample face (1 inside, → 0 beyond its edges)."""
+        p = self.params
+        w = max(p.beam_radius, 1e-6) / 4.0
+
+        def edge(u, half):
+            return 1.0 / (1.0 + np.exp(np.clip((abs(u) - half) / w, -50.0, 50.0)))
+        return float(edge(lat - p.lat0, p.face_half_lat) * edge(z - p.z0, p.face_half_z))
+
     def clean_signals(self):
         """Noise-free, unquantized (ch1, ch2) at the current position and gains."""
         p = self.params
@@ -259,6 +281,9 @@ class SimSeDaq:
         d_back = d + p.thickness * p.c_sample / p.c_w
         a_back = p.back_ratio * p.A0 * np.exp(-((d_back - p.focal_distance) ** 2)
                                               / (2.0 * p.sigma ** 2))
+        on_face = self.face_coverage(lat, z)
+        a_front *= on_face
+        a_back *= on_face
         pe = self._pulse(t, 0.3e-6, p.bang_amp)
         if d > 0:
             s_front = -1.0 if p.invert_front else 1.0
@@ -324,6 +349,8 @@ _PANEL_FIELDS = (
     ('f0', 'f₀', 'MHz', 0.5, 50.0, 2, 0.5),
     ('A0', 'A₀ (FS = 0.5)', '', 0.0, 2.0, 3, 0.01),
     ('snr_db', 'SNR', 'dB', -20.0, 100.0, 1, 1.0),
+    ('face_half_lat', 'Face half width (lat)', 'mm', 0.5, 1000.0, 1, 1.0),
+    ('face_half_z', 'Face half height (Z)', 'mm', 0.5, 1000.0, 1, 1.0),
 )
 
 
