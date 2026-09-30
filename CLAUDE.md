@@ -19,13 +19,20 @@ Pulsos rectangulares a 5 o 10 MHz según el transductor utilizado.
 APWP (Adaptive Pulse Waveform Programming) está previsto para fases futuras — no usar en el desarrollo actual.
 
 ## Estructura del repositorio
-- `acquisition/` — Script principal de adquisición
+- `acquisition/` — Adquisición: `ecos_gui.py` (GUI principal), densidad, pulser y la pestaña
+  del escáner (`scanner_panel.py`, `scan_sequencer.py`, `focus_tool.py`, `echo_tracking.py`,
+  SeDaq sintético `sim_sedaq.py`)
 - `tools/` — Toolboxes del laboratorio (ACQ, US, SSP, Plotters, Loaders...)
 - `database/` — Gestor de base de datos de experimentos PVA
-- `hardware/` — Temperatura, velocidad del sonido en agua, Arduino
+- `hardware/` — Temperatura, velocidad del sonido en agua, Arduino; `hardware/scanner/`,
+  driver del escáner XYZR y su simulador serie
 - `analysis/` — Scripts de análisis y ejemplos de uso
 - `data/` — Datos de medida (local only, no sincronizado con GitHub)
-- `_archive/` — Código obsoleto (local only)
+- `_archive/` — Código obsoleto (local only; no existe en todas las máquinas)
+
+## Escáner
+El modelo verificado del firmware del escáner y el estado de las fases están en
+`scanner_tab_spec.md`; no se duplican aquí.
 
 ## Convenciones clave
 - Señales: s_W (water path), s_T (through-transmission), s_R (pulse-echo)
@@ -33,13 +40,35 @@ APWP (Adaptive Pulse Waveform Programming) está previsto para fases futuras —
 - Frecuencia de muestreo adquisición: 100 MHz
 - Diseño de medidas: repeated-measures sobre ciclos freeze-thaw
 
+## Entornos por máquina
+Son distintos en cada máquina.
+
+**Despacho** (`D:\proyectoscode\ecos`)
+- Adquisición: `~\anaconda3_32`, Python 3.9.7 de 32 bits, con scipy 1.6.2 y pyqtgraph 0.11.0.
+  Se activa con `conda activate ~\anaconda3_32` o se usa `conda run -p ~\anaconda3_32 ...`.
+  Llamar al `python.exe` directamente falla: `Library\bin` no queda en el PATH y numpy no
+  carga sus DLL.
+- Análisis: conda base de 64 bits, Python 3.13.5.
+
+**Portátil** (`C:\Users\Alberto Rodriguez\ProyectosCode\ecos`)
+- Adquisición: `.venv32`, Python 3.9.13 de 32 bits creado desde python.org, sin Anaconda.
+  Reproducible con `requirements-acq32.txt`.
+- Análisis: `.venv` de 64 bits.
+- Aquí no hay conda para el proyecto.
+
+**Restricción común:** el código de adquisición y de la pestaña del escáner debe funcionar
+en Python 3.9 y con pyqtgraph 0.11. Nada de sintaxis posterior a 3.9 ni de API posterior a 0.11.
+
 ## Tests
 `python -m unittest` desde la raíz no descubre ninguno: `acquisition/` no es un
 paquete (no tiene `__init__.py`). Hay que lanzar cada carpeta por separado, desde la raíz:
 - `python -m unittest discover -s acquisition`
 - `python -m unittest discover -s hardware/scanner`
 
-Se ejecutan en el entorno de producción de 32 bits (`conda run -p ~\anaconda3_32 python -m unittest ...`).
+Siempre con el intérprete de 32 bits de la máquina correspondiente:
+- Despacho: `conda run -p ~\anaconda3_32 python -m unittest discover -s acquisition`
+- Portátil: `.venv32\Scripts\python.exe -m unittest discover -s acquisition`
+
 `hardware/scanner/test_connection.py` es un script manual para el hardware real: el
 discover lo importa pero no ejecuta nada.
 
