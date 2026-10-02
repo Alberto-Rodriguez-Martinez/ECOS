@@ -49,4 +49,5 @@ analysis/catalog.xlsx
 # Scanner session (per-machine: port, session limits/steps/speeds)
 hardware/scanner/scanner_session.json
 
+# GUI session (per-machine: gains, window, Arduino port)
 acquisition/ecos_gui_session.json
