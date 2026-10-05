@@ -132,6 +132,9 @@ def save_scan_raw_32(
     point_time,         # (N_line, N_point): epoch seconds of each acquisition
     temperatures,       # list of {label, point, time, T1, T2} (NaN when no PT100)
     references=None,    # {'initial': {...}, 'final': {...}}, each with _SCAN_REF_FIELDS
+    witness=None,       # witness point series {name: array (N_visit, ...)}: sum1, sum2
+                        # (N_visit, N_samples) as the signals, offset1/2, coords, time,
+                        # line, ... ; stored as witness_<name>
     adc_bits=ADC_BITS_DEFAULT,
     operator=DEFAULT_OPERATOR,
     comment="",
@@ -212,6 +215,14 @@ def save_scan_raw_32(
                 val = _check_sums(f"reference {which} {key}", val, n_ref, adc_bits)
             arrays[f"ref_{which}_{key}"] = val
         ref_conv[which] = conversion(n_ref, ref["gains"], sum_dtype(n_ref, adc_bits))
+    for name, val in (witness or {}).items():
+        val = np.asarray(val)
+        if name in ("sum1", "sum2"):
+            if val.ndim != 2 or val.shape[1] != n_samp:
+                raise ValueError("witness %s must be (N_visit, %d), got %s"
+                                 % (name, n_samp, val.shape))
+            val = _check_sums(f"witness {name}", val, n_avg, adc_bits)
+        arrays[f"witness_{name}"] = val
     for name, val in (extra_arrays or {}).items():
         arrays[name] = np.asarray(val)
 
@@ -232,6 +243,14 @@ def save_scan_raw_32(
                                  "(X, Y, Z, R), time, T1, T2; conversion in "
                                  "conversion.references",
     }
+    if witness:
+        files["witness_*"] = ("witness point, one entry per visit (phase 6): sum1, sum2 "
+                              "(N_visit, N_samples, same conversion as the signals; floats "
+                              "witness_ch1/2 on load), offset1/2, coords (real X, Y, Z, R), "
+                              "time (epoch), line (lines completed before the visit), tof_us, "
+                              "amplitude, face_um (relative to the first visit, + away from "
+                              "the PE transducer), thickness_mm, thickness_corr, lost. RAW: "
+                              "no drift correction is applied anywhere in this file")
     meta = {
         "schema_version": SCAN_SCHEMA_VERSION,
         "experiment": {"id": exp_id, "type": "SCAN",
@@ -278,6 +297,10 @@ def load_scan_raw_32(exp_dir):
         data[f"signals_{ch}_sum"] = data[f"signals_{ch}"]
         data[f"signals_{ch}"] = counts_to_float_rows(data[f"signals_{ch}_sum"], n,
                                                      data[f"offsets_{ch}"], bits)
+    if "witness_sum1" in data:                     # same conversion as the signals
+        for k in ("1", "2"):
+            data[f"witness_ch{k}"] = counts_to_float_rows(data[f"witness_sum{k}"], n,
+                                                          data[f"witness_offset{k}"], bits)
     for which, rc in conv.get("references", {}).items():
         for k in ("1", "2"):
             x, _ = counts_to_float(data[f"ref_{which}_sum{k}"], rc["n_avg"], rc["quantizer_bits"],

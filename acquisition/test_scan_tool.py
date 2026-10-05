@@ -30,12 +30,14 @@ from BD_Experimentos_PVA import (  # noqa: E402
 from scan_counts import counts_to_float, sum_dtype  # noqa: E402
 from scan_tool import (  # noqa: E402
     LONG_SCAN_S, MAGNITUDES, PointContext, ScanParams, ScanPlan, compute_magnitudes,
-    estimate_scan_s, line_positions, reference_drift, register_magnitude,
+    estimate_scan_s, line_positions, reference_drift, register_magnitude, scan_schedule,
+    witness_correction, witness_doubt, witness_jumps, witness_position,
 )
 from sim_sedaq import SimParams, SimSeDaq  # noqa: E402
 from echo_tracking import (  # noqa: E402
     EchoDelay, FrontEchoTracker, band_samples, echo_pair_delay,
 )
+from ECOS_US_ToolBox import CalcToFAscanCosine_XCRFFT, Envelope  # noqa: E402
 
 FS = tf.FS
 LIMIT = tf.LIMIT
@@ -87,10 +89,18 @@ class TestLineAndMagnitudes(unittest.TestCase):
 
     def test_estimate_and_long_scan(self):
         coords = {'X': 50.0, 'Y': 50.0, 'Z': 25.0, 'R': 0.0}
-        plan = ScanPlan(ScanParams(start=-1, end=1, step=1, settle_ms=500, avg_n=20), coords,
+        plan = ScanPlan(ScanParams(start=-1, end=1, step=1, settle_ms=500, line_settle_ms=800,
+                                   avg_n=20, witness=False), coords,
                         'X', 'Y', {'X': LIMIT, 'Z': LIMIT})
-        # 49 → 50 → 51, from 50 and back: 1 + 1 + 1 + 1 mm; 3 × (0.5 s + 20 × 10 ms)
-        self.assertAlmostEqual(estimate_scan_s(plan, 0.01, 6.7), 4 / 6.7 + 3 * 0.7)
+        # 49 → 50 → 51, from 50 and back: 1 + 1 + 1 + 1 mm; 3 × (20 × 10 ms) and the
+        # settles: the first point after the long move (0.8 s), then 2 × 0.5 s
+        self.assertAlmostEqual(estimate_scan_s(plan, 0.01, 6.7), 4 / 6.7 + 3 * 0.2 + 0.8 + 1.0)
+        # the witness at the first point: visited before and after the line, +2 × (0.8 s
+        # + 20 × 10 ms) and the travel 51 → 49 → 50 instead of 51 → 50: +2 mm
+        wit = ScanPlan(ScanParams(start=-1, end=1, step=1, settle_ms=500, line_settle_ms=800,
+                                  avg_n=20, witness=True), coords, 'X', 'Y', {'X': LIMIT, 'Z': LIMIT})
+        self.assertAlmostEqual(estimate_scan_s(wit, 0.01, 6.7) - estimate_scan_s(plan, 0.01, 6.7),
+                               2 * (0.8 + 0.2) + 2 / 6.7)
         long_plan = ScanPlan(ScanParams(start=-50, end=40, step=0.05, settle_ms=1000, avg_n=20),
                              coords, 'X', 'Y', {'X': LIMIT, 'Z': LIMIT})
         self.assertGreater(estimate_scan_s(long_plan, 0.01), LONG_SCAN_S)
@@ -116,6 +126,62 @@ class TestLineAndMagnitudes(unittest.TestCase):
             self.assertTrue(np.isnan(compute_magnitudes(ctx, lost=True)['tof']))
         finally:
             del MAGNITUDES['peak_to_peak']
+
+
+class TestWitnessPure(unittest.TestCase):
+    """Schedule with witness visits, jumps off the trend and the live correction."""
+
+    coords = {'X': 50.0, 'Y': 50.0, 'Z': 25.0, 'R': 0.0}
+
+    def plan(self, **kw):
+        base = dict(start=-1, end=1, step=1, settle_ms=100, line_settle_ms=1000)
+        base.update(kw)
+        return ScanPlan(ScanParams(**base), self.coords, 'X', 'Y', {'X': LIMIT, 'Z': LIMIT})
+
+    def test_line_schedule(self):
+        sched = scan_schedule(self.plan())
+        self.assertEqual([e.kind for e in sched], ['witness', 'point', 'point', 'point', 'witness'])
+        self.assertEqual([e.pos for e in sched], [{'X': 49.0}, {'X': 49.0}, {'X': 50.0},
+                                                  {'X': 51.0}, {'X': 49.0}])
+        self.assertEqual([e.settle_ms for e in sched], [1000, 1000, 100, 100, 1000])
+        self.assertEqual([(e.line, e.j) for e in sched if e.kind == 'witness'], [(0, 0), (1, 1)])
+        self.assertEqual([e.j for e in sched if e.kind == 'point'], [0, 1, 2])
+
+    def test_witness_positions(self):
+        self.assertEqual(witness_position(self.plan(witness_mode='start')), {'X': 50.0, 'Z': 25.0})
+        custom = self.plan(witness_mode='custom', witness_lat=47.0, witness_z=30.0)
+        sched = scan_schedule(custom)
+        # the other axis moves first to the witness, and first again back to the line
+        self.assertEqual(list(sched[0].pos.items()), [('Z', 30.0), ('X', 47.0)])
+        self.assertEqual(list(sched[1].pos.items()), [('Z', 25.0), ('X', 49.0)])
+        self.assertEqual(list(sched[2].pos.items()), [('X', 50.0)])
+        z = ScanPlan(ScanParams(axis_role='z', start=-1, end=1, step=1, witness_mode='custom',
+                                witness_lat=47.0, witness_z=30.0), self.coords, 'X', 'Y',
+                     {'X': LIMIT, 'Z': LIMIT})
+        self.assertEqual(witness_position(z), {'Z': 30.0, 'X': 47.0})
+        with self.assertRaises(ValueError):
+            witness_position(self.plan(witness_mode='custom', witness_lat=LIMIT + 1))
+
+    def test_jumps_off_the_trend(self):
+        t = np.arange(7) * 30.0                         # a visit every 30 s
+        face = -0.07 * t                                # −4.2 µm/min, steady …
+        face[4:] -= 6.0                                 # … and a 6 µm jerk between visits 3 and 4
+        dev, rate = witness_jumps(t, face)
+        self.assertAlmostEqual(rate, -0.07)
+        np.testing.assert_allclose(dev, [0, 0, 0, -6.0, 0, 0], atol=1e-9)
+        visits = [{'after_line': k} for k in range(7)]
+        self.assertEqual(witness_doubt(visits, dev, 3.0), {3: 'witness jump -6.0 µm'})
+        face[2] = np.nan                                # an echo lost: drift unknown around it
+        dev, _ = witness_jumps(t, face)
+        doubt = witness_doubt(visits, dev, 3.0)
+        self.assertEqual(sorted(doubt), [1, 2, 3])
+        self.assertEqual(doubt[1], 'witness echo lost')
+
+    def test_live_correction(self):
+        t, v = [0.0, 10.0, 20.0], [5.0, 6.0, 8.0]
+        np.testing.assert_allclose(witness_correction([-5.0, 5.0, 15.0, 30.0], t, v),
+                                   [0.0, 0.5, 2.0, 3.0])
+        np.testing.assert_allclose(witness_correction([5.0], t, [np.nan] * 3), [0.0])
 
 
 class TestScanSaveFormat(unittest.TestCase):
@@ -550,7 +616,8 @@ class TestLineScan(ScanHarness):
                 self.make()
                 counts = []
                 self.tool.echo_used.connect(lambda _m: counts.append(len(self.tool.data.coords)))
-                p = ScanParams(axis_role=role, start=-2, end=2, step=0.5, settle_ms=0, avg_n=2)
+                p = ScanParams(axis_role=role, start=-2, end=2, step=0.5, settle_ms=0,
+                               line_settle_ms=0, avg_n=2, witness=False)
                 self.assertIsNone(self.tool.start(p))
                 self.wait(lambda: self.dones)
                 self.assertEqual(self.dones, ['completed'], self.statuses[-1])
@@ -613,7 +680,8 @@ class TestLineScan(ScanHarness):
             if seen['n'] == 5:
                 self.tool.stop()
         self.seq.point_done.connect(on_point)
-        p = ScanParams(start=-4, end=4, step=0.5, settle_ms=0, avg_n=2)
+        p = ScanParams(start=-4, end=4, step=0.5, settle_ms=0, line_settle_ms=0, avg_n=2,
+                       witness=False)
         self.assertIsNone(self.tool.start(p))
         self.wait(lambda: self.tool.state == 'stopped')
         self.assertEqual(paused_states, ['paused'])            # it really paused, then resumed
@@ -636,7 +704,7 @@ class TestLineScan(ScanHarness):
         self.make()
         self.seq.point_done.connect(lambda i, *_: i == 2 and self.tool.stop())
         self.assertIsNone(self.tool.start(ScanParams(start=-2, end=2, step=0.5, settle_ms=0,
-                                                     avg_n=1)))
+                                                     line_settle_ms=0, avg_n=1)))
         self.wait(lambda: self.tool.state == 'stopped')
         self.assertIsNone(self.tool.discard())
         self.assertEqual(self.dones, ['discarded'])
@@ -645,7 +713,7 @@ class TestLineScan(ScanHarness):
     def test_lost_echo_is_marked_and_the_scan_goes_on(self):
         self.make(face_half_lat=2.0)
         self.assertIsNone(self.tool.start(ScanParams(start=-5, end=5, step=1, settle_ms=0,
-                                                     avg_n=2)))
+                                                     line_settle_ms=0, avg_n=2)))
         self.wait(lambda: self.dones)
         self.assertEqual(self.dones, ['completed'])
         d = self.tool.data
@@ -663,7 +731,7 @@ class TestLineScan(ScanHarness):
         modal = []
         self.seq.point_done.connect(lambda *_: modal.append(QApplication.activeModalWidget()))
         self.assertIsNone(self.tool.start(ScanParams(start=-1, end=1, step=1, settle_ms=0,
-                                                     avg_n=1)))
+                                                     line_settle_ms=0, avg_n=1)))
         self.assertTrue(any('PT100 not available' in w for w in self.warnings))
         self.wait(lambda: self.dones)
         self.assertGreaterEqual(len(modal), 3)                    # 3 points + the way back
@@ -677,7 +745,7 @@ class TestLineScan(ScanHarness):
         self.make()
         focus = FocusTool(self.seq, tf.FakePanel(self.sim), lambda: tf.WIDE, pg.PlotWidget())
         self.assertIsNone(self.tool.start(ScanParams(start=-1, end=1, step=1, settle_ms=0,
-                                                     avg_n=1, references=True)))
+                                                     line_settle_ms=0, avg_n=1, references=True)))
         self.assertEqual(self.tool.state, 'ref_out')               # between sequences
         self.assertIn('scan session', focus.run(5.0, 1.0))
         self.tool.cancel_reference()
@@ -691,7 +759,8 @@ class TestThickness(ScanHarness):
         self.make(**THICK)
         offered = []
         self.tool.thickness_available.connect(lambda on, why: offered.append(on))
-        self.assertIsNone(self.tool.start(ScanParams(start=-2, end=2, step=1, settle_ms=0, avg_n=4,
+        self.assertIsNone(self.tool.start(ScanParams(start=-2, end=2, step=1, settle_ms=0,
+                                                     line_settle_ms=0, avg_n=4,
                                                      c_sample=self.sim.params.c_sample)))
         self.assertEqual(offered, [True])
         self.assertEqual(self.tool.magnitude, 'thickness')          # the default of the map
@@ -721,7 +790,7 @@ class TestThickness(ScanHarness):
         self.tool.warning.connect(lambda w: 'Thickness NOT available' in w
                                   and moves_at_warning.append(len(self.worker.moves)))
         self.assertIsNone(self.tool.start(ScanParams(start=-1, end=1, step=1, settle_ms=0,
-                                                     avg_n=4)))
+                                                     line_settle_ms=0, avg_n=4)))
         self.assertEqual(moves_at_warning, [0])                     # before anything moved
         self.assertNotEqual(self.tool.magnitude, 'thickness')
         i = g._cmb_mag.findData('thickness')
@@ -738,11 +807,63 @@ class TestThickness(ScanHarness):
         self.assertFalse(np.any(np.isnan(s['live_tof'])))           # the rest is measured
 
 
+class TestWitness(ScanHarness):
+    """Phase 6, section 3 and verification 4, on a line (two visits)."""
+
+    def test_drift_recorded_raw_and_thickness_unaffected(self):
+        self.make(**THICK)
+        rate = -50.0                                     # µm/s: well above the jitter
+        self.sim.params.drift_um_per_min = rate * 60.0
+        self.sim.restart_drift()
+        self.assertIsNone(self.tool.start(ScanParams(
+            start=-2, end=2, step=1, settle_ms=150, line_settle_ms=150, avg_n=4,
+            c_sample=self.sim.params.c_sample)))
+        self.wait(lambda: self.dones)
+        meta, s = self.load_saved()
+        w = meta['scan']['witness']
+        self.assertTrue(w['enabled'])
+        self.assertEqual((w['mode'], w['n_visits']), ('first', 2))
+        self.assertEqual(list(s['witness_line']), [0, 1])
+        self.assertEqual(s['witness_ch2'].shape, (2, tf.WIDE[1] - tf.WIDE[0]))
+        self.assertEqual(s['witness_coords'].shape, (2, 4))
+        np.testing.assert_allclose(s['witness_coords'][:, 0], 48.0 + OFFSET)   # real, first point
+        dt = s['witness_time'][1] - s['witness_time'][0]
+        self.assertGreater(dt, 0.5)
+        c_w = meta['scan']['c_w']
+        # the saved series rebuilds the drift: cross-correlation of the saved witness
+        # signals (what the analysis does), around the front echo of the first visit
+        k = int(np.argmax(Envelope(s['witness_ch2'][0])))
+        gates = s['witness_ch2'][:, k - 60:k + 61]
+        shift, _, _ = CalcToFAscanCosine_XCRFFT(gates[1], gates[0])
+        self.assertAlmostEqual(c_w * shift / FS / 2.0 * 1e6, rate * dt, delta=1.0 + 0.03 * abs(rate * dt))
+        # the live value (envelope peak, the scan estimator: ±0.3 samples in the simulator)
+        self.assertAlmostEqual(s['witness_face_um'][1] - s['witness_face_um'][0], rate * dt,
+                               delta=5.0 + 0.1 * abs(rate * dt))
+        # the scan points are stored raw: their ToF follows the drift (not corrected) …
+        tof = s['live_tof'][0]
+        face = (tof - tof[0]) * c_w / 2.0
+        span = rate * (s['point_time'][0, -1] - s['point_time'][0, 0])
+        self.assertLess(face[-1] - face[0], 0.5 * span)
+        # … while the thickness does not move
+        np.testing.assert_allclose(s['live_thickness'][0], 3.0, atol=0.003)
+        np.testing.assert_allclose(s['witness_thickness_mm'], 3.0, atol=0.003)
+        self.assertIn('never the thickness', meta['scan']['witness']['note'])
+
+    def test_no_witness(self):
+        self.make()
+        self.assertIsNone(self.tool.start(ScanParams(start=-1, end=1, step=1, settle_ms=0,
+                                                     line_settle_ms=0, avg_n=1, witness=False)))
+        self.wait(lambda: self.dones)
+        meta, s = self.load_saved()
+        self.assertEqual(meta['scan']['witness'], {'enabled': False})
+        self.assertNotIn('witness_sum1', s)
+
+
 class TestWaterReferences(ScanHarness):
 
     def params(self, **kw):
-        base = dict(start=-1, end=1, step=1, settle_ms=0, avg_n=2, references=True,
-                    ref_gain1=20.0, ref_gain2=10.0, ref_avg_n=3)
+        base = dict(start=-1, end=1, step=1, settle_ms=0, line_settle_ms=0, avg_n=2,
+                    references=True, witness=False, ref_gain1=20.0, ref_gain2=10.0, ref_avg_n=3)
         base.update(kw)
         return ScanParams(**base)
 
@@ -895,8 +1016,8 @@ class TestDriftOnScreen(ScanHarness):
         drifts = []
         self.tool.drift.connect(drifts.append)
         self.assertIsNone(self.tool.start(ScanParams(
-            start=-1, end=1, step=1, settle_ms=0, avg_n=2, references=True, ref_gain1=65.0,
-            ref_gain2=35.0, ref_avg_n=10, drift_tol_db=0.5, drift_tol_ns=20.0)))
+            start=-1, end=1, step=1, settle_ms=0, line_settle_ms=0, avg_n=2, references=True,
+            ref_gain1=65.0, ref_gain2=35.0, ref_avg_n=10, drift_tol_db=0.5, drift_tol_ns=20.0)))
         self.panel.manual_move('X', 90.0)
         self.tool.continue_reference()
         self.tool.accept_reference()
@@ -943,7 +1064,7 @@ class TestSurfacePrepared(unittest.TestCase):
 
     def plan(self, **kw):
         base = dict(axis_role='lateral', start=-1, end=1, step=1, surface=True, start2=-1,
-                    end2=1, step2=1)
+                    end2=1, step2=1, witness=False)
         base.update(kw)
         return ScanPlan(ScanParams(**base), self.coords, 'X', 'Y', {'X': LIMIT, 'Z': LIMIT})
 

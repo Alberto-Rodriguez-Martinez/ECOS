@@ -145,7 +145,9 @@ class ScanSequencer(QObject):
               owner=None, no_move=False):
         """
         positions   list of {axis: target_mm}, axes among X/Y/Z
-        settle_ms   wait after each move before acquiring
+        settle_ms   wait after each move before acquiring: one value for every point,
+                    or one per point (a surface scan settles longer after a line
+                    change than between neighbouring points)
         avg_n       captures averaged per point
         measure_fn  measure_fn(ch1, ch2) -> scalar or tuple
         temp_after  point indices after which the temperature is read (besides
@@ -185,8 +187,15 @@ class ScanSequencer(QObject):
                 if err:
                     return err
 
+        if isinstance(settle_ms, (list, tuple)):
+            if len(settle_ms) != len(positions):
+                raise ValueError('one settle time per position, or a single one')
+            settles = [max(0, int(s)) for s in settle_ms]
+        else:
+            settles = [max(0, int(settle_ms))] * len(positions)
+
         self._positions = positions
-        self._settle_ms = max(0, int(settle_ms))
+        self._settles = settles
         self._avg_n = max(1, int(avg_n))
         self._measure = measure_fn
         self._no_move = bool(no_move)
@@ -274,7 +283,7 @@ class ScanSequencer(QObject):
         elif not ok:
             self._finish('error', 'The scanner did not reach the requested position.')
         else:
-            QTimer.singleShot(self._settle_ms, lambda: self._on_settled(token))
+            QTimer.singleShot(self._settles[self._index], lambda: self._on_settled(token))
 
     def _on_settled(self, token):
         if not self._active or token != self._token:

@@ -99,6 +99,21 @@ DEFAULT_REF_AVG_N = 100
 # definitive thickness is computed in the analysis from the saved signals).
 DEFAULT_C_SAMPLE = 1540.0      # m/s, PVA, nominal
 DEFAULT_MIN_CORR = 0.9         # echo 1 / echo 2 correlation below this: point marked less reliable
+# Settle after a LONG move: the first point of every line (line change, and the
+# travel from the start point to the first point) and every witness visit.
+# NOT CHARACTERIZED: the 100 ms above were validated for steps <= 0.5 mm only; a
+# line change of a one-direction scan is a jump of tens of mm and excites the
+# mechanics much more. 1000 ms is a guess to be measured (phase 6, 05/10).
+DEFAULT_LINE_SETTLE_MS = 1000
+# Witness point (phase 6): a fixed point measured again every N lines, so the
+# analysis can remove the drift of the sample from the position of the face
+# (PVA, 05/10: −4.34 µm/min in jerks, 97.5 µm in 21 min; steel: +0.32 µm/min).
+DEFAULT_WITNESS_EVERY = 1
+# A jump: the witness off the trend by more than this between two visits. ~3σ of
+# the difference of two visits with the jitter measured on 05/10 (≈1 µm per point
+# with 20 averages, √2 for a difference), below the jumps seen on PVA (5–7 µm).
+DEFAULT_WITNESS_JUMP_UM = 4.0
+WITNESS_MODES = ('first', 'start', 'custom')
 LONG_SCAN_S = 30 * 60          # warn above half an hour
 DEFAULT_DRIFT_DB = 0.5         # reference drift warnings: amplitude [dB] …
 DEFAULT_DRIFT_NS = 20.0        # … and ToF [ns] (~0.1 °C of water over a 60 mm path)
@@ -227,6 +242,17 @@ class ScanParams:
     thickness: bool = True
     c_sample: float = DEFAULT_C_SAMPLE
     min_corr: float = DEFAULT_MIN_CORR
+    # Settle after a long move (line change, witness visit): see DEFAULT_LINE_SETTLE_MS.
+    line_settle_ms: int = DEFAULT_LINE_SETTLE_MS
+    # Witness point (phase 6): 'first' scan point, position at 'start', or 'custom'
+    # (absolute lateral / Z). Visited before the first line, after every N lines and
+    # after the last one.
+    witness: bool = True
+    witness_mode: str = 'first'
+    witness_lat: float = 0.0
+    witness_z: float = 0.0
+    witness_every: int = DEFAULT_WITNESS_EVERY
+    witness_jump_um: float = DEFAULT_WITNESS_JUMP_UM
     # Surface (phase 6): a line is the case of a single line, as in the data format.
     # The second axis is the other of lateral / Z; same range mode as the first.
     surface: bool = False
@@ -285,12 +311,22 @@ class ScanPlan:
                                     f'{self.axis2} [0, {limit2:g}] mm: {len(self.ys)} lines left.')
             if not self.ys:
                 raise ValueError('no line inside the session limits of the second axis')
+        self.lat_axis = lat_axis
+        # The axis across the lines (Z or lateral), also for a line scan, where it
+        # stays at its start coordinate (a witness point may still move it).
+        self.other = self.axis2 or ('Z' if self.axis != 'Z' else lat_axis)
+        self.limits = dict(limits)
         self.lines = []
         for k, y in enumerate(self.ys):
             xs = list(self.xs)
             if params.surface and params.path == 'zigzag' and k % 2:
                 xs.reverse()
             self.lines.append((y, xs))
+
+    def line_y(self, k):
+        """Coordinate of line k on self.other (the start coordinate for a line scan)."""
+        y = self.lines[k][0]
+        return self.start_coords[self.other] if y is None else y
 
     @property
     def n_points(self):
@@ -314,16 +350,144 @@ class ScanPlan:
         return {self.axis: self.start_coords[self.axis]}
 
 
+@dataclass
+class Entry:
+    """One step of the scan sequence: a scan point or a witness visit."""
+    kind: str            # 'point' or 'witness'
+    line: int            # point: its line; witness: the number of lines completed before it
+    j: int               # point: index in plan.xs (spatial order); witness: visit number
+    pos: dict            # sequencer position (axes moved in this order)
+    settle_ms: int
+
+
+def witness_position(plan):
+    """{axis, other} of the witness point (see ScanParams.witness_mode)."""
+    p = plan.params
+    if p.witness_mode == 'first':
+        x, y = plan.lines[0][1][0], plan.line_y(0)
+    elif p.witness_mode == 'start':
+        x, y = plan.start_coords[plan.axis], plan.start_coords[plan.other]
+    elif p.witness_mode == 'custom':
+        lat, z = float(p.witness_lat), float(p.witness_z)
+        x, y = (lat, z) if plan.axis != 'Z' else (z, lat)
+    else:
+        raise ValueError(f'witness mode must be one of {WITNESS_MODES}')
+    for a, v in ((plan.axis, x), (plan.other, y)):
+        limit = plan.limits.get(a)
+        if limit is not None and not 0.0 <= v <= limit:
+            raise ValueError(f'witness point outside the session limits of {a} [0, {limit:g}] mm')
+    return {plan.axis: round(x, POSITION_DECIMALS), plan.other: round(y, POSITION_DECIMALS)}
+
+
+def scan_schedule(plan):
+    """
+    The whole scan as one sequence: every point of every line, in the order of the
+    path, and the witness visits (before the first line, after every N lines and
+    after the last one). Fixed and reproducible axis order:
+      - along a line only the line axis moves;
+      - when the other axis has to change (line change, witness visit and the
+        return from it) it moves FIRST, then the line axis.
+    Settle: params.line_settle_ms after every long move (first point of each line,
+    witness visits), params.settle_ms between neighbouring points of a line.
+    """
+    p = plan.params
+    wit = witness_position(plan) if p.witness else None
+    every = max(1, int(p.witness_every))
+    entries, cur_y = [], plan.start_coords[plan.other]
+    n_lines = len(plan.lines)
+
+    def visit(after):
+        nonlocal cur_y
+        y = wit[plan.other]
+        pos = ({plan.other: y} if abs(y - cur_y) > 1e-9 else {})
+        pos[plan.axis] = wit[plan.axis]
+        cur_y = y
+        entries.append(Entry('witness', after, sum(e.kind == 'witness' for e in entries), pos,
+                             p.line_settle_ms))
+
+    if wit:
+        visit(0)
+    last = len(plan.xs) - 1
+    for k, (_, xs) in enumerate(plan.lines):
+        y = plan.line_y(k)
+        reverse = xs[0] != plan.xs[0]
+        for i, x in enumerate(xs):
+            pos = {}
+            if i == 0 and abs(y - cur_y) > 1e-9:
+                pos[plan.other] = y
+            pos[plan.axis] = x
+            cur_y = y
+            entries.append(Entry('point', k, last - i if reverse else i, pos,
+                                 p.line_settle_ms if i == 0 else p.settle_ms))
+        if wit and ((k + 1) % every == 0 or k == n_lines - 1):
+            visit(k + 1)
+    return entries
+
+
+def witness_jumps(times, face_um):
+    """
+    Jumps of the witness between consecutive visits. The drift of PVA comes in
+    jerks, so a jump between two visits cannot be reconstructed: the lines
+    measured in between are in doubt. Trend = median rate of every interval
+    (robust to the jump itself); the deviation of interval k (visit k → k+1) is
+    its displacement minus trend × its duration. With fewer than three intervals
+    the trend is not robust and a jump cannot be told from the drift.
+    Returns (deviation_um per interval, NaN where a visit had no echo; rate µm/s).
+    """
+    t = np.asarray(times, dtype=float)
+    w = np.asarray(face_um, dtype=float)
+    if t.size < 2:
+        return np.zeros(0), float('nan')
+    dt, dw = np.diff(t), np.diff(w)
+    ok = np.isfinite(dw) & (dt > 0)
+    rate = float(np.median(dw[ok] / dt[ok])) if ok.any() else float('nan')
+    dev = np.where(ok, dw - (rate if np.isfinite(rate) else 0.0) * dt, np.nan)
+    return dev, rate
+
+
+def witness_doubt(visits, dev, threshold_um):
+    """
+    {line: reason} of the lines in doubt: the lines measured between two visits
+    where the witness jumped off the trend by more than threshold_um, or where a
+    visit had no echo (drift unknown there). visits: dicts with 'after_line'.
+    """
+    out = {}
+    after = [v['after_line'] for v in visits]
+    for k, dv in enumerate(dev):
+        if not np.isfinite(dv):
+            reason = 'witness echo lost'
+        elif abs(dv) > threshold_um:
+            reason = f'witness jump {dv:+.1f} µm'
+        else:
+            continue
+        for line in range(after[k], after[k + 1]):
+            out.setdefault(line, reason)
+    return out
+
+
+def witness_correction(t, times, values):
+    """Witness value interpolated at time(s) t, relative to the first valid visit: the
+    drift of the face. Held flat before the first and after the last visit. NaN
+    visits are skipped; no valid visit gives zeros."""
+    ts, vs = np.asarray(times, dtype=float), np.asarray(values, dtype=float)
+    ok = np.isfinite(vs)
+    if not ok.any():
+        return np.zeros_like(np.asarray(t, dtype=float))
+    return np.interp(t, ts[ok], vs[ok] - vs[ok][0])
+
+
 def estimate_scan_s(plan, acq_s, move_mm_s=MOVE_MM_S):
-    """Seconds: travel to and along the line and back, settle + averages per point,
-    and the two reference acquisitions (the manual steps are not included)."""
+    """Seconds, over the whole schedule (scan_schedule): travel of every move (lines,
+    line changes, witness visits) and back to the start, the settle of each entry
+    (long-move settle included), the averages of every point and witness visit, and
+    the two reference acquisitions (the manual steps are not included)."""
     p = plan.params
     total, cur = 0.0, dict(plan.start_coords)
-    for pos in plan.all_positions():
-        travel = sum(abs(v - cur.get(a, v)) for a, v in pos.items())
-        cur.update(pos)
-        total += travel / move_mm_s + p.settle_ms / 1000.0 + p.avg_n * acq_s
-    total += sum(abs(cur[a] - plan.start_coords[a]) for a in (plan.axis, plan.axis2) if a) \
+    for e in scan_schedule(plan):
+        travel = sum(abs(v - cur.get(a, v)) for a, v in e.pos.items())
+        cur.update(e.pos)
+        total += travel / move_mm_s + e.settle_ms / 1000.0 + p.avg_n * acq_s
+    total += sum(abs(cur[a] - plan.start_coords[a]) for a in (plan.axis, plan.other)) \
         / move_mm_s
     if p.references:
         total += 2 * p.ref_avg_n * acq_s
@@ -332,7 +496,16 @@ def estimate_scan_s(plan, acq_s, move_mm_s=MOVE_MM_S):
 
 @dataclass
 class ScanData:
-    """Everything acquired in one scan session (one line)."""
+    """
+    Everything acquired in one scan session. Scan points in acquisition order
+    (flat lists), each with its line and its index j in plan.xs (spatial order:
+    a zigzag line runs j backwards). The witness visits go apart, in `witness`.
+    """
+    line: List[int] = field(default_factory=list)
+    j: List[int] = field(default_factory=list)
+    witness: List[dict] = field(default_factory=list)
+    witness_dev: Optional[np.ndarray] = None    # deviation per interval between visits, µm
+    witness_rate: float = float('nan')          # median drift rate, µm/s
     sum1: List[np.ndarray] = field(default_factory=list)    # Σ(raw − midpoint), window, Ch1
     sum2: List[np.ndarray] = field(default_factory=list)    # same, Ch2
     off1: List[float] = field(default_factory=list)         # whole-record offset, Ch1
@@ -682,9 +855,14 @@ class ScanTool(QObject):
             return f'Acquisition window Smin–Smax too short ({smin}–{smax}).'
         try:
             plan = self._plan_for(params)
+            schedule = scan_schedule(plan)
+            witness_pos = witness_position(plan) if params.witness else None
         except ValueError as e:
             return str(e)
         self.plan, self.params = plan, params
+        self._schedule, self._witness_pos = schedule, witness_pos
+        self._doubt_lines = {}
+        self._line_start = self._dump_line_start = 0
         self.window = (int(smin), int(smax))
         self._check_thickness(params)
         self.data = ScanData()
@@ -696,6 +874,8 @@ class ScanTool(QObject):
         self._scan_gains = tuple(float(g) for g in self._gains_fn())
         self._tracker = FrontEchoTracker(self.window, 0.0, band_samples(params.band_us),
                                          params.threshold, params.edge_margin)
+        self._witness_tracker = FrontEchoTracker(self.window, 0.0, band_samples(params.band_us),
+                                                 params.threshold, params.edge_margin)
         self._dump = FocusDebugDump(dict(tool='scan', started=time.strftime('%Y-%m-%dT%H:%M:%S'),
                                          axis=plan.axis, xs=plan.xs, smin=smin, smax=smax),
                                     prefix='scan_debug') if params.debug_dump else None
@@ -955,10 +1135,19 @@ class ScanTool(QObject):
         start = self.plan.start_coords
         return [{a: start[a]} for a in reversed(self.data.axis_order) if a in ('X', 'Y', 'Z')]
 
+    def _home_path(self):
+        """Back to the start point after the scan: the line axis first, then the other
+        axis if the scan moved it (surface, or a witness point off the line)."""
+        s, plan = self.plan.start_coords, self.plan
+        pos = {plan.axis: s[plan.axis]}
+        if any(plan.other in e.pos for e in self._schedule):
+            pos[plan.other] = s[plan.other]
+        return [pos]
+
     def _to_reference_path(self):
-        """Scanned axis home first (the path just scanned), then the recorded order."""
+        """Scanned axes home first (the path just scanned), then the recorded order."""
         ref = self.data.reference_position or {}
-        path = [self.plan.home]
+        path = self._home_path()
         path += [{a: ref[a]} for a in self.data.axis_order if a in ('X', 'Y', 'Z')]
         return path
 
@@ -981,12 +1170,18 @@ class ScanTool(QObject):
     def _start_scan(self):
         self._phase = 'scan'
         self._set_state('scan')
-        self._tracker.new_sweep()
-        n = len(self.plan.xs)
-        self.status.emit(f'Scanning {n} points along {self.plan.axis} (c_w = {self.c_w:.1f} m/s, '
-                         f'{self.cw_source})…')
-        reason = self._seq.start(self.plan.positions(), self.params.settle_ms, self.params.avg_n,
-                                 self._measure, validate_fn=self._panel.validate_position,
+        self._cursor = 0
+        self._cur_line = None
+        plan, sched = self.plan, self._schedule
+        nw = sum(e.kind == 'witness' for e in sched)
+        lines = (f'{len(plan.lines)} lines along {plan.axis}' if plan.params.surface else
+                 f'along {plan.axis}')
+        self.status.emit(f'Scanning {plan.n_points} points, {lines}'
+                         + (f', witness point visited {nw} times' if nw else '')
+                         + f' (c_w = {self.c_w:.1f} m/s, {self.cw_source})…')
+        reason = self._seq.start([e.pos for e in sched], [e.settle_ms for e in sched],
+                                 self.params.avg_n, self._measure,
+                                 validate_fn=self._panel.validate_position,
                                  record_temperature=False, owner=self)
         if reason:
             self._stopped(f'The scan could not start: {reason}')
@@ -995,61 +1190,142 @@ class ScanTool(QObject):
         if self._phase != 'scan':
             return None
         smin, smax = self.window
+        e = self._schedule[self._cursor]
+        if e.kind == 'witness':
+            tracker = self._witness_tracker
+        else:
+            tracker = self._tracker
+            if e.line != self._cur_line:            # a new line: a new sweep, same anchor
+                tracker.new_sweep()
+                self._cur_line = e.line
+                self._line_start = self.data.n
+                self._dump_line_start = len(self._dump) if self._dump is not None else 0
         sig = ch2 if PE_CHANNEL == 2 else ch1
-        m = self._tracker.measure(sig, self.plan.beam_x)
-        seg, env = self._tracker.point_signals(-1)
-        (s1, s2), (o1, o2) = self._last_counts(smin, smax)
-        self.data.sum1.append(s1)
-        self.data.sum2.append(s2)
-        self.data.off1.append(o1)
-        self.data.off2.append(o2)
+        m = tracker.measure(sig, self.plan.beam_x)
+        seg, env = tracker.point_signals(-1)
         self._last = (seg, env, np.array(ch1[smin:smax], dtype=float),
                       np.array(sig, dtype=float) if self._dump is not None else None,
-                      self._pair(seg, env, m))
+                      self._pair(seg, env, m), self._last_counts(smin, smax))
         return m
 
     def _on_point(self, i, coords, value):
         if self._phase != 'scan':
             return
-        d = self.data
+        e = self._schedule[i]
+        self._cursor = i + 1
+        if e.kind == 'witness':
+            self._on_witness(e, coords, value)
+        else:
+            self._on_scan_point(e, coords, value)
+
+    def _on_scan_point(self, e, coords, value):
+        d, p = self.data, self.params
+        seg, env, seg1, record, pair, ((s1, s2), (o1, o2)) = self._last
+        d.sum1.append(s1)
+        d.sum2.append(s2)
+        d.off1.append(o1)
+        d.off2.append(o2)
+        d.line.append(e.line)
+        d.j.append(e.j)
         d.coords.append([float(coords.get(a, float('nan'))) for a in AXES4])
         d.times.append(time.time())
-        d.requested.append(self.plan.xs[i] if i < len(self.plan.xs) else float('nan'))
-        d.measures = list(self._tracker.measures)        # a re-lock revises earlier points
-        xs = self.positions_read()
-        seg, env, seg1, record, pair = self._last
+        d.requested.append(e.pos[self.plan.axis])
+        ls = self._line_start                            # this line: d[ls:]
+        d.measures[ls:] = list(self._tracker.measures)   # a re-lock revises earlier points
+        xs = self.positions_read()[ls:]
         d.pairs.append(pair)
-        flags = line_flags(xs, d.measures, self.window, self.params.edge_margin)
+        flags = line_flags(xs, d.measures[ls:], self.window, p.edge_margin)
         lost = 'weak' in flags[-1] or 'outside' in flags[-1]
-        ctx = PointContext(value, seg, env, seg1, ACQ_FS, self.params.emission_sample, pair,
-                           self.params.c_sample)
+        ctx = PointContext(value, seg, env, seg1, ACQ_FS, p.emission_sample, pair, p.c_sample)
         d.magnitudes.append(compute_magnitudes(ctx, lost))
         # ToF and thickness depend on the (possibly revised) measures: refresh them
-        for k, (m, f) in enumerate(zip(d.measures, flags)):
-            self._refresh_echo_values(k, m, f)
-        d.flags = flags
+        for k, (m, f) in enumerate(zip(d.measures[ls:], flags)):
+            self._refresh_echo_values(ls + k, k, m, f)
+        d.flags[ls:] = flags
         if self._dump is not None:
             self._dump.add('scan', self.plan.beam_x, value, seg, env, record, self.window,
-                           extra=dict(line_position=xs[-1], **d.magnitudes[-1]))
-            self._dump.revise(0, d.measures, d.flags)
+                           extra=dict(line_position=xs[-1], line=e.line, **d.magnitudes[-1]))
+            self._dump.revise(self._dump_line_start, d.measures[ls:], d.flags[ls:])
         self.echo_used.emit(value)
         self._redraw()
         f = d.flags[-1]
         if f and not self._warned_kinds >= set(f):
             self._warned_kinds |= set(f)
             self.warning.emit(' '.join(scan_messages([xs[-1]], [f], [d.measures[-1]])))
+        nxt = self._schedule[self._cursor] if self._cursor < len(self._schedule) else None
+        if nxt is None or nxt.kind != 'point' or nxt.line != e.line:
+            self._line_done(e.line)
 
-    def _refresh_echo_values(self, k, m, f):
+    def _line_done(self, k):
+        """Line k complete."""
+
+    # -- witness point ---------------------------------------------------------
+    def _on_witness(self, e, coords, value):
         """
-        Point k of the current sweep after its front-echo measure m (revised by a
-        re-lock or not) and its echo flags f: ToF, echo 1 → echo 2 again if echo 1
-        moved, the thickness magnitudes and the thickness flags (appended to f).
+        One visit: measured as a scan point (own tracker, so the lines keep their
+        anchor), stored raw with its time and the number of lines done. The face
+        position of every visit is relative to the first one; the jumps off the
+        trend mark the lines measured in between as doubtful. Nothing is corrected.
+        """
+        d, p = self.data, self.params
+        seg, env, seg1, record, pair, ((s1, s2), (o1, o2)) = self._last
+        wt = self._witness_tracker
+        flags = line_flags([0.0] * len(wt.measures), wt.measures, self.window, p.edge_margin)
+        lost = 'weak' in flags[-1] or 'outside' in flags[-1]
+        ctx = PointContext(value, seg, env, seg1, ACQ_FS, p.emission_sample, pair, p.c_sample)
+        mags = compute_magnitudes(ctx, lost)
+        d.witness.append(dict(
+            visit=e.j, after_line=e.line, time=time.time(), measure=value, pair=pair,
+            coords=[float(coords.get(a, float('nan'))) for a in AXES4],
+            requested=[float(self._witness_pos.get(a, float('nan'))) for a in AXES4],
+            amplitude=mags['amplitude'], thickness_mm=mags['thickness'],
+            thickness_corr=mags['thickness_corr'], flags=flags[-1],
+            sum1=s1, sum2=s2, offset1=o1, offset2=o2))
+        for v, m, f in zip(d.witness, wt.measures, flags):       # a re-lock revises them
+            v['measure'], v['flags'] = m, f
+            v['lost'] = 'weak' in f or 'outside' in f
+            v['tof_us'] = (float('nan') if v['lost'] else
+                           (m.index_frac - p.emission_sample) / ACQ_FS * 1e6)
+        if self._dump is not None:
+            self._dump.add('witness', self.plan.beam_x, value, seg, env, record, self.window,
+                           extra=dict(line_position=e.pos[self.plan.axis], line=e.line, **mags))
+        self._update_witness()
+        if lost:
+            self.warning.emit(f'Witness point: no clear front echo at visit {e.j}: the drift is '
+                              'not known around it (the lines next to it are marked).')
+
+    def _update_witness(self):
+        """Face position of every visit (µm, + away from the PE transducer, relative to
+        the first visit with an echo) and the lines in doubt."""
+        d, p = self.data, self.params
+        tofs = [v['tof_us'] for v in d.witness]
+        t0 = next((t for t in tofs if t == t), float('nan'))
+        for v in d.witness:
+            v['face_um'] = self.c_w * (v['tof_us'] - t0) / 2.0
+        dev, rate = witness_jumps([v['time'] for v in d.witness],
+                                  [v['face_um'] for v in d.witness])
+        d.witness_dev, d.witness_rate = dev, rate
+        doubt = witness_doubt(d.witness, dev, p.witness_jump_um)
+        new = sorted(set(doubt) - set(self._doubt_lines))
+        self._doubt_lines = doubt
+        if new and any('jump' in doubt[k] for k in new):
+            self.warning.emit(
+                f'Witness point jumped by more than {p.witness_jump_um:g} µm off the trend '
+                f'during line(s) {", ".join(str(k) for k in new)}: the drift there cannot be '
+                'reconstructed, those lines are marked as doubtful.')
+
+    def _refresh_echo_values(self, k, ks, m, f):
+        """
+        Point k (flat index; ks in the current sweep) after its front-echo measure m
+        (revised by a re-lock or not) and its echo flags f: ToF, echo 1 → echo 2
+        again if echo 1 moved, the thickness magnitudes and the thickness flags
+        (appended to f).
         """
         d, p = self.data, self.params
         gone = 'weak' in f or 'outside' in f
         pair = d.pairs[k]
         if pair is not None and pair.front != m.index:
-            pair = d.pairs[k] = self._pair(*self._tracker.point_signals(k), m)
+            pair = d.pairs[k] = self._pair(*self._tracker.point_signals(ks), m)
         if gone and pair is not None and pair.found:      # no echo 1 there: no pair either
             pair = d.pairs[k] = EchoDelay(False, 'front_lost', front=m.index)
         mags = d.magnitudes[k]
@@ -1101,12 +1377,12 @@ class ScanTool(QObject):
                 self._move('to_ref', self._to_reference_path(),
                            'Scan done. To the water reference position (recorded order)…')
             else:
-                self._move('back', [self.plan.home], 'Scan done. Back to the start point…')
+                self._move('back', self._home_path(), 'Scan done. Back to the start point…')
         elif phase == 'to_ref':
             self._ref_which = 'final'
             self._take_reference('final')
         elif phase == 'back':
-            self._finish_and_save('completed' if self.data.n == len(self.plan.xs) else 'stopped')
+            self._finish_and_save('completed' if self.data.n == self.plan.n_points else 'stopped')
 
     # -- STOP, pause -----------------------------------------------------------
     def pause(self):
@@ -1130,7 +1406,7 @@ class ScanTool(QObject):
             return
         self._set_state('stopped')
         can_ref = self.params.references and 'final' not in self.data.references
-        self.status.emit(f'{text} Not moved. {self.data.n} of {len(self.plan.xs)} points acquired: '
+        self.status.emit(f'{text} Not moved. {self.data.n} of {self.plan.n_points} points acquired: '
                          'save them' + (', take the final reference first' if can_ref else '')
                          + ' or discard.')
 
@@ -1161,9 +1437,25 @@ class ScanTool(QObject):
             self.warning.emit(f'Automatic save failed ({e}): use "Save to another folder…".')
             text = f'Scan {how}: {self.data.n} points. NOT saved.'
         msgs = scan_messages(self.positions_read(), self.data.flags, self.data.measures)
+        msgs += self._witness_summary()
         if self.data.drift is not None:
             msgs = drift_lines(self.data.drift) + msgs
         self._end(how, '\n'.join([text] + msgs))
+
+    def _witness_summary(self):
+        d = self.data
+        if not d.witness:
+            return []
+        face = [v['face_um'] for v in d.witness if v['face_um'] == v['face_um']]
+        span = (max(face) - min(face)) if face else float('nan')
+        rate = d.witness_rate * 60.0 if np.isfinite(d.witness_rate) else float('nan')
+        out = [f'Witness point: {len(d.witness)} visits, face moved over {span:.1f} µm, median '
+               f'drift {rate:+.2f} µm/min (saved raw; corrected only in the analysis, never '
+               'the thickness).']
+        if self._doubt_lines:
+            out.append('Doubtful lines (witness): ' + ', '.join(
+                f'{k} ({r})' for k, r in sorted(self._doubt_lines.items())) + '.')
+        return out
 
     def exp_name(self):
         if _DB_DIR not in sys.path:
@@ -1228,6 +1520,10 @@ class ScanTool(QObject):
             },
             'live_values_note': 'live_* arrays: the values of the live map, for the '
                                 'metadata only; the results are computed in the analysis',
+            'line_settle_ms': p.line_settle_ms,
+            'line_settle_note': 'settle after a long move (first point of every line, witness '
+                                'visits): NOT characterized',
+            'witness': self._witness_meta(),
         }
         refs = {w: {k: r[k] for k in ('sum1', 'sum2', 'offset1', 'offset2', 'avg_n', 'gains',
                                       'coords', 'time', 'T1', 'T2')}
@@ -1244,7 +1540,7 @@ class ScanTool(QObject):
             n_avg=p.avg_n, gains=self._scan_gains, adc_bits=self.adc_bits,
             coords=np.array(d.coords, dtype=float).reshape(1, n, 4),
             point_time=np.array(d.times, dtype=float).reshape(1, n),
-            temperatures=d.temperatures, references=refs,
+            temperatures=d.temperatures, references=refs, witness=self._witness_arrays(),
             operator=p.operator, comment=p.comment, base_dir=base_dir, exp_name=name,
             extra_arrays=dict(self._point_arrays(n),
                               positions_requested=np.array(d.requested, dtype=float).reshape(1, n)))
@@ -1252,6 +1548,48 @@ class ScanTool(QObject):
             self.last_saved_path = path
         self.saved.emit(path)
         return path
+
+    def _witness_arrays(self):
+        """The witness series, raw (None without a witness or before its first visit)."""
+        w = self.data.witness
+        if not w:
+            return None
+
+        def col(key, dtype=float):
+            return np.array([v[key] for v in w], dtype=dtype)
+        return {'sum1': np.array([v['sum1'] for v in w], dtype=np.int64),
+                'sum2': np.array([v['sum2'] for v in w], dtype=np.int64),
+                'offset1': col('offset1'), 'offset2': col('offset2'),
+                'coords': col('coords'), 'requested': col('requested'), 'time': col('time'),
+                'line': col('after_line', np.int64), 'visit': col('visit', np.int64),
+                'tof_us': col('tof_us'), 'amplitude': col('amplitude'),
+                'face_um': col('face_um'), 'thickness_mm': col('thickness_mm'),
+                'thickness_corr': col('thickness_corr'), 'lost': col('lost', bool)}
+
+    def _witness_meta(self):
+        p, d = self.params, self.data
+        if not p.witness:
+            return {'enabled': False}
+        dev = d.witness_dev if d.witness_dev is not None else np.zeros(0)
+        last_after = d.witness[-1]['after_line'] if d.witness else 0
+        n_lines = (max(d.line) + 1) if d.line else 0
+        return {
+            'enabled': True, 'mode': p.witness_mode, 'position': self._witness_pos,
+            'every_lines': p.witness_every, 'jump_threshold_um': p.witness_jump_um,
+            'n_visits': len(d.witness),
+            'median_rate_um_per_min': (d.witness_rate * 60.0 if np.isfinite(d.witness_rate)
+                                       else None),
+            'interval_deviation_um': [float(x) if np.isfinite(x) else None for x in dev],
+            'doubtful_lines': {str(k): r for k, r in sorted(self._doubt_lines.items())},
+            'lines_after_last_visit': list(range(last_after, n_lines)),
+            'face_um_note': 'c_w·(tof − tof of the first visit)/2, + away from the PE '
+                            'transducer, with the c_w of this scan',
+            'note': 'raw data: no drift correction is applied in this file. The analysis '
+                    'corrects the position of the face (ToF) with the witness series, '
+                    'never the thickness, which is immune to the drift.',
+            'trend_note': 'jump = displacement between two visits minus median rate × '
+                          'duration; with fewer than three intervals the trend is not robust',
+        }
 
     def _point_arrays(self, n):
         """Per-point live values (live_<magnitude>) and the echo 1 → echo 2 measure."""
@@ -1376,9 +1714,43 @@ class ScanGroup(QGroupBox):
         form.addRow('Path:', self._cmb_path)
         self._surface_widgets = (self._spin_start2, self._spin_end2, self._spin_step2,
                                  self._cmb_path, self._lbl_axis2)
+        self._spin_line_settle = QSpinBox()
+        self._spin_line_settle.setRange(0, 60000)
+        self._spin_line_settle.setValue(DEFAULT_LINE_SETTLE_MS)
+        self._spin_line_settle.setSuffix(' ms')
+        self._spin_line_settle.setToolTip('Settle after a long move: first point of every line '
+                                          'and every witness visit. NOT characterized (the 100 ms '
+                                          'between points hold for steps ≤ 0.5 mm only).')
         form.addRow('Settle (scan):', self._spin_settle)
+        form.addRow('Settle, line change:', self._spin_line_settle)
         form.addRow('Averages (scan):', self._spin_avg)
         form.addRow('Map:', self._cmb_mag)
+
+        self._chk_witness = QCheckBox('Witness point (drift of the sample)')
+        self._chk_witness.setChecked(True)
+        self._chk_witness.setToolTip('A fixed point measured again every N lines. Without it the '
+                                     'topography of the face of a soft sample is not valid: PVA '
+                                     'drifted −4.34 µm/min in jerks on 05/10. Saved raw; the '
+                                     'correction is done in the analysis.')
+        self._cmb_witness = QComboBox()
+        self._cmb_witness.addItem('First point of the scan', 'first')
+        self._cmb_witness.addItem('Position at Start', 'start')
+        self._cmb_witness.addItem('Custom (absolute)', 'custom')
+        self._spin_wlat = dspin(0.0, 1000.0, 0.0, 2, 0.5, ' mm')
+        self._spin_wz = dspin(0.0, 1000.0, 0.0, 2, 0.5, ' mm')
+        self._spin_wevery = QSpinBox()
+        self._spin_wevery.setRange(1, 1000)
+        self._spin_wevery.setValue(DEFAULT_WITNESS_EVERY)
+        self._spin_wevery.setSuffix(' line(s)')
+        self._spin_wjump = dspin(0.1, 1000.0, DEFAULT_WITNESS_JUMP_UM, 1, 0.5, ' µm')
+        self._spin_wjump.setToolTip('A witness displacement between two visits off the trend by '
+                                    'more than this marks the lines in between as doubtful.')
+        form.addRow(self._chk_witness)
+        form.addRow('Witness position:', self._cmb_witness)
+        form.addRow('Witness lateral:', self._spin_wlat)
+        form.addRow('Witness Z:', self._spin_wz)
+        form.addRow('Witness every:', self._spin_wevery)
+        form.addRow('Witness jump limit:', self._spin_wjump)
 
         self._chk_thick = QCheckBox('Thickness per point (echo 1 → echo 2)')
         self._chk_thick.setChecked(True)
@@ -1509,6 +1881,11 @@ class ScanGroup(QGroupBox):
         for w in (self._spin_start2, self._spin_end2, self._spin_step2):
             w.valueChanged.connect(self._refresh_estimate)
         self._cmb_path.currentIndexChanged.connect(self._refresh_estimate)
+        for w in (self._spin_line_settle, self._spin_wlat, self._spin_wz, self._spin_wevery):
+            w.valueChanged.connect(self._refresh_estimate)
+        self._chk_witness.toggled.connect(self._on_witness_widgets)
+        self._cmb_witness.currentIndexChanged.connect(self._on_witness_widgets)
+        self._on_witness_widgets()
         self._on_surface_toggled(False)
         self._prefill_ref_gain2()
         self._on_state('idle')
@@ -1519,6 +1896,15 @@ class ScanGroup(QGroupBox):
             w.setEnabled(on)
         self._update_axis2_label()
         self._btn_start.setText('Start surface scan' if on else 'Start scan')
+        self._refresh_estimate()
+
+    def _on_witness_widgets(self, *_):
+        on = self._chk_witness.isChecked()
+        custom = self._cmb_witness.currentData() == 'custom'
+        for w in (self._cmb_witness, self._spin_wevery, self._spin_wjump):
+            w.setEnabled(on)
+        for w in (self._spin_wlat, self._spin_wz):
+            w.setEnabled(on and custom)
         self._refresh_estimate()
 
     def _update_axis2_label(self, *_):
@@ -1553,7 +1939,11 @@ class ScanGroup(QGroupBox):
             surface=self._chk_surface.isChecked(), start2=self._spin_start2.value(),
             end2=self._spin_end2.value(), step2=self._spin_step2.value(),
             path=self._cmb_path.currentData(), thickness=self._chk_thick.isChecked(),
-            c_sample=self._spin_csample.value(), min_corr=self._spin_mincorr.value())
+            c_sample=self._spin_csample.value(), min_corr=self._spin_mincorr.value(),
+            line_settle_ms=self._spin_line_settle.value(), witness=self._chk_witness.isChecked(),
+            witness_mode=self._cmb_witness.currentData(), witness_lat=self._spin_wlat.value(),
+            witness_z=self._spin_wz.value(), witness_every=self._spin_wevery.value(),
+            witness_jump_um=self._spin_wjump.value())
 
     def _refresh_estimate(self, *_):
         _, text, long_ = self._tool.estimate(self.params())

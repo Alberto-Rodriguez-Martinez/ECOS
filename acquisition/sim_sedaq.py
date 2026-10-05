@@ -16,6 +16,7 @@ The host injects the scanner position after every move (set_scanner_state).
 
 Pulse-echo channel (PE_CHANNEL = Ch2, as everywhere in ecos_gui.py):
     d        = F + s·(x_beam − x_focus) + tan(θ_lat)·(lat − lat0) + tan(θ_z)·(z − z0)
+               + shift(t)   (the sample's own movement: drift and jumps, phase 6)
                s = +1 with PE side 'origin' (moving + takes the face away),
                s = −1 with PE side 'max'.  F is the focal distance, so the
                front face sits exactly at the focus when x_beam = x_focus
@@ -67,6 +68,7 @@ Amplitudes are in the units of ecos_gui._raw_to_float: full scale is ±0.5.
 """
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass
 
 import numpy as np
@@ -121,6 +123,13 @@ class SimParams:
     face_half_lat: float = 1000.0  # half width of the face along lateral, around lat0
     face_half_z: float = 1000.0    # half height along Z, around z0
     beam_radius: float = 1.0       # the echo fades over ~this when the beam leaves the face
+    # -- movement of the sample itself (phase 6, witness point) ------------------
+    # The whole sample moves along the beam (both faces together, thickness
+    # unchanged), + = away from the PE transducer: a steady rate since the
+    # simulator was created (or restart_drift()), plus a step that can be changed
+    # at any time (a jump). Measured on PVA on 05/10: −4.34 µm/min, in jerks.
+    drift_um_per_min: float = 0.0
+    face_offset_um: float = 0.0
 
     @classmethod
     def thin_sample(cls, **overrides):
@@ -158,6 +167,8 @@ class SimSeDaq:
         self.gain1 = self.params.gain_ref_ch1
         self.gain2 = self.params.gain_ref_ch2
         self._rng = np.random.default_rng(seed)
+        self.clock = time.monotonic          # replaceable (tests)
+        self._drift_t0 = self.clock()
         # Scanner state, injected by the host (set_scanner_state). With no
         # scanner connected the sample sits at the reference point (in focus).
         self._coords = None
@@ -231,10 +242,21 @@ class SimSeDaq:
         return (np.tan(np.radians(p.theta_lat)) * (lat - p.lat0)
                 + np.tan(np.radians(p.theta_z)) * (z - p.z0))
 
-    def face_distance(self, x_beam, lat, z):
-        """PE transducer to front face distance [mm]."""
+    def restart_drift(self):
+        """The steady drift of the sample counts from now."""
+        self._drift_t0 = self.clock()
+
+    def sample_shift_mm(self):
+        """Movement of the sample along the beam now [mm], + away from the PE transducer."""
         p = self.params
-        return p.focal_distance + self._sign() * (x_beam - p.x_focus) + self._tilt_mm(lat, z)
+        minutes = (self.clock() - self._drift_t0) / 60.0
+        return (p.face_offset_um + p.drift_um_per_min * minutes) * 1e-3
+
+    def face_distance(self, x_beam, lat, z):
+        """PE transducer to front face distance [mm] (with the movement of the sample)."""
+        p = self.params
+        return (p.focal_distance + self._sign() * (x_beam - p.x_focus) + self._tilt_mm(lat, z)
+                + self.sample_shift_mm())
 
     def expected_focus(self, lat=None, z=None):
         """Beam-axis position that puts the face at the focus, at (lat, z)."""
@@ -351,6 +373,8 @@ _PANEL_FIELDS = (
     ('snr_db', 'SNR', 'dB', -20.0, 100.0, 1, 1.0),
     ('face_half_lat', 'Face half width (lat)', 'mm', 0.5, 1000.0, 1, 1.0),
     ('face_half_z', 'Face half height (Z)', 'mm', 0.5, 1000.0, 1, 1.0),
+    ('drift_um_per_min', 'Sample drift', 'µm/min', -1000.0, 1000.0, 2, 1.0),
+    ('face_offset_um', 'Sample offset (jump)', 'µm', -5000.0, 5000.0, 1, 5.0),
 )
 
 
