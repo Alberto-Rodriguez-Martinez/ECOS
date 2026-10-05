@@ -276,6 +276,17 @@ class TestReferenceDrift(unittest.TestCase):
         self.assertIn('ch1 amplitude', d['exceeds'])
         self.assertIn('ch1 ToF', d['exceeds'])
 
+    def test_only_the_transmission_channel_is_compared(self):
+        """A change of the pulse-echo channel alone (Ch2) does not count as drift."""
+        a, b = self.refs(A0=SimParams().A0 * 0.5)       # PE echo −6 dB, Ch1 untouched
+        d = reference_drift(a, b, tol_db=0.5, tol_ns=20.0)
+        self.assertEqual(d['channel'], 'ch1')
+        self.assertNotIn('ch2', d)
+        self.assertEqual(d['exceeds'], [])
+        self.assertLess(abs(d['ch1']['d_db']), 0.05)
+        # and both channels are still there to be saved
+        self.assertTrue(np.max(np.abs(b['ch2'])) < 0.7 * np.max(np.abs(a['ch2'])))
+
 
 # ===========================================================================
 #  Qt: ScanTool on the real ScanSequencer
@@ -665,10 +676,12 @@ class TestWaterReferences(ScanHarness):
         self.assertEqual(list(d['temp_label']), ['start', 'ref_initial', 'ref_final', 'end'])
         self.assertEqual(meta['scan']['manual_axis_order'], ['Z', 'X'])
         drift = meta['scan']['reference_drift']                # compared, shown and saved
-        for key in ('ch1', 'ch2', 'exceeds', 'tol_db', 'tol_ns'):   # (3 averages at low gains:
+        self.assertEqual(drift['channel'], 'ch1')                   # transmission only
+        self.assertNotIn('ch2', drift)
+        for key in ('ch1', 'exceeds', 'tol_db', 'tol_ns'):          # (3 averages at low gains:
             self.assertIn(key, drift)                               #  values are noise here;
                                                                     #  TestDriftOnScreen checks them)
-        self.assertTrue(any('Reference drift Ch1' in st for st in self.statuses))
+        self.assertTrue(any('Reference drift (Ch1' in st for st in self.statuses))
         self.assertEqual(sorted(meta['scan']['references_taken']), ['final', 'initial'])
         # in water (sample out) there is no front echo: the reference PE channel is quiet there
         self.assertLess(np.max(np.abs(d['ref_initial_ch2'])), np.max(np.abs(d['signals_ch2'])))
@@ -729,7 +742,7 @@ class TestDriftOnScreen(ScanHarness):
         self.assertIn('ch1 ToF', drifts[0]['exceeds'])
         self.assertGreater(drifts[0]['ch1']['d_tof_ns'], 20.0)
         self.assertTrue(any('Drift above the limits' in w for w in self.warnings))
-        self.assertIn('Reference drift Ch1', self.statuses[-1])
+        self.assertIn('Reference drift (Ch1', self.statuses[-1])
         meta, _ = self.load_saved()
         self.assertIn('ch1 ToF', meta['scan']['reference_drift']['exceeds'])
 

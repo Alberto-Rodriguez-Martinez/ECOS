@@ -38,11 +38,13 @@ every acquisition, and the floats every tool sees are computed from them with
 scan_counts.counts_to_float, so the file rebuilds them bit for bit.
 
 Reference drift: with both water references, the final one is compared with
-the initial one per channel (amplitude difference in dB, ToF difference by
-cross-correlation, ECOS_US_ToolBox.CalcToFAscanCosine_XCRFFT). Shown on screen,
-saved in meta.json, and warned about above configurable thresholds: it measures
-the drift during the scan (temperature, gain, coupling) and says whether the
-scan can be trusted.
+the initial one on Ch1, the through-transmission channel (the ECOS s_W):
+amplitude difference in dB and ToF difference by cross-correlation
+(ECOS_US_ToolBox.CalcToFAscanCosine_XCRFFT). Shown on screen, saved in
+meta.json, and warned about above configurable thresholds: it measures the
+drift of the transmission path during the scan (temperature, gain, coupling).
+Ch2 (pulse-echo) is saved in every reference but not compared, so a drift of
+the pulse-echo channel alone is not covered by this metric.
 
 Settle and averages are the scan's own, NOT the focus ones (5000 ms / 100 were
 measured with 1 mm steps): defaults DEFAULT_SCAN_SETTLE_MS / DEFAULT_SCAN_AVG_N,
@@ -265,17 +267,22 @@ class ScanData:
         return len(self.coords)
 
 
+DRIFT_CHANNEL = 'ch1'          # through-transmission, the ECOS s_W (Ch2 is pulse-echo)
+
+
 def reference_drift(initial, final, fs=ACQ_FS, tol_db=DEFAULT_DRIFT_DB, tol_ns=DEFAULT_DRIFT_NS):
     """
-    Final vs initial water reference, per channel: envelope maximum of each, the
-    difference in dB (final − initial) and the ToF difference by cross-correlation
-    (positive: the final one arrives later). A channel without a clear signal in
-    both references (contrast < CONFIDENT_CONTRAST) is reported as such, not compared.
-    initial/final: {'ch1', 'ch2'} float arrays (the Smin–Smax window).
-    Returns {'ch1': {...}, 'ch2': {...}, 'exceeds': [...], 'tol_db', 'tol_ns'}.
+    Final vs initial water reference on Ch1 (through-transmission, s_W): envelope
+    maximum of each, the difference in dB (final − initial) and the ToF difference
+    by cross-correlation (positive: the final one arrives later). Without a clear
+    signal in both references (contrast < CONFIDENT_CONTRAST) it is reported as
+    not measured. Ch2 (pulse-echo) is not compared: a drift of its own is not
+    covered. initial/final: {'ch1', 'ch2'} float arrays (the Smin–Smax window).
+    Returns {'channel': 'ch1', 'ch1': {...}, 'exceeds': [...], 'tol_db', 'tol_ns'}.
     """
-    out = {'tol_db': float(tol_db), 'tol_ns': float(tol_ns), 'exceeds': []}
-    for ch in ('ch1', 'ch2'):
+    out = {'channel': DRIFT_CHANNEL, 'path': 'through-transmission (Ch1, s_W)',
+           'tol_db': float(tol_db), 'tol_ns': float(tol_ns), 'exceeds': []}
+    for ch in (DRIFT_CHANNEL,):
         a, b = np.asarray(initial[ch], dtype=float), np.asarray(final[ch], dtype=float)
         ea, eb = Envelope(a), Envelope(b)
         ca = float(np.max(ea) / np.median(ea)) if np.median(ea) > 0 else float('inf')
@@ -297,13 +304,14 @@ def reference_drift(initial, final, fs=ACQ_FS, tol_db=DEFAULT_DRIFT_DB, tol_ns=D
 
 def drift_lines(drift):
     lines = []
-    for ch, name in (('ch1', 'Ch1'), ('ch2', 'Ch2 (PE)')):
-        r = drift[ch]
-        if not r['clear']:
-            lines.append(f'Reference drift {name}: no clear signal in the references, not compared.')
-            continue
-        lines.append(f'Reference drift {name}: {r["d_db"]:+.2f} dB, ToF {r["d_tof_ns"]:+.1f} ns '
-                     f'(final − initial; limits ±{drift["tol_db"]:g} dB, ±{drift["tol_ns"]:g} ns).')
+    r = drift[DRIFT_CHANNEL]
+    if not r['clear']:
+        lines.append('Reference drift (Ch1, transmission): no clear signal in the references: '
+                     'drift NOT measured.')
+    else:
+        lines.append(f'Reference drift (Ch1, transmission): {r["d_db"]:+.2f} dB, ToF '
+                     f'{r["d_tof_ns"]:+.1f} ns (final − initial; limits ±{drift["tol_db"]:g} dB, '
+                     f'±{drift["tol_ns"]:g} ns). Pulse-echo (Ch2) drift not covered.')
     if drift['exceeds']:
         lines.append('⚠ Drift above the limits (' + ', '.join(drift['exceeds']) + '): temperature, '
                      'gain or coupling changed during the scan; check before trusting it.')
@@ -1202,9 +1210,13 @@ class ScanGroup(QGroupBox):
 
     def _on_drift(self, drift):
         self._lbl_drift.setText('\n'.join(drift_lines(drift)))
-        self._lbl_drift.setStyleSheet(
-            'background: rgb(200, 40, 40); color: white;' if drift['exceeds'] else
-            'background: rgb(40, 160, 70); color: white;')
+        if drift['exceeds']:
+            style = 'background: rgb(200, 40, 40); color: white;'
+        elif not drift[DRIFT_CHANNEL]['clear']:
+            style = 'background: gray; color: white;'
+        else:
+            style = 'background: rgb(40, 160, 70); color: white;'
+        self._lbl_drift.setStyleSheet(style)
 
     def _on_copy(self):
         folder = QFileDialog.getExistingDirectory(self, 'Save the scan to another folder')
