@@ -68,9 +68,50 @@ Escáner XYZR (controlador SE SC-03-00) para posicionar muestras de PVA dentro d
 
 Al lanzar una herramienta, la gráfica grande pasa automáticamente a la pestaña Escáner.
 
+### Pestaña Escáner de la columna derecha (reorganizada el 2026-10-05)
+Quedaba demasiado densa en una sola columna, así que se divide en dos subpestañas bajo una cabecera fija:
+
+```
+┌──────────────────────────────────────────────┐
+│ Cabecera fija (siempre visible):             │
+│   posición haz / lateral / Z / R             │
+│   [ STOP ]  estado (Libre, Moviendo,         │
+│             Secuencia i/n)                   │
+├──────────────────────────────────────────────┤
+│ [Movimiento y calibración] [Barridos]        │
+│                                              │
+│ Movimiento y calibración:                    │
+│   Conexión (puerto, conectar, resultado)     │
+│   Sesión (eje del haz, lado PE, límites,     │
+│     pasos, velocidades, ceros)               │
+│   Movimiento manual                          │
+│   Foco (5.4)                                 │
+│   Planitud (5.5)                             │
+│   [simulador: modelo del SeDaq sintético y   │
+│    secuencia de prueba]                      │
+│                                              │
+│ Barridos (5.6):                              │
+│   Eje de la línea, rango, paso               │
+│   [ ] Superficie → segundo eje (el otro de   │
+│       lateral/Z), su rango y paso, recorrido │
+│       en zigzag o en un solo sentido         │
+│   Asentamiento, promedios, mapa              │
+│   Referencias en agua (ganancias, promedios) │
+│   Operador, comentario, límites de deriva    │
+│   Tiempo estimado; Inicio / Pausa / Parar;   │
+│   pasos de referencia; guardar              │
+└──────────────────────────────────────────────┘
+```
+
+- **El STOP no está en ninguna subpestaña**: vive en la cabecera, junto a la posición y el estado, para que siga a la vista desde cualquiera de las dos (5.1).
+- **Barridos: una sola sección para línea y superficie.** Una línea es el caso de una sola línea, igual que en el formato de datos (N_línea = 1). La casilla «Superficie» activa los campos del segundo eje (inicio, fin y paso; el modo relativo o absoluto es el del primero) y el recorrido: **zigzag**, que alterna el sentido del primer eje, o **un solo sentido**, en el que todas las líneas se recorren igual para que la holgura no desplace las líneas alternas.
+- Preparado para la fase 6: `ScanParams` lleva ya los campos (`surface`, `start2`, `end2`, `step2`, `path`). `ScanPlan` genera las líneas en los dos recorridos (`lines`, `all_positions`) y el tiempo estimado ya las cuenta. Solo falta la adquisición en superficie: hasta entonces, Inicio con «Superficie» marcada se rechaza con un mensaje.
+- `ScannerPanel.add_tool_widget(widget, tab='motion' | 'scans')` coloca cada herramienta en su subpestaña. La de barridos se crea al añadir el primer widget, así que el panel independiente (sin ECOS) no muestra una pestaña vacía.
+
 ## 5. Pestaña Escáner (columna derecha)
 
-### 5.1 Estado (fijo, arriba)
+### 5.1 Estado: cabecera fija y conexión
+Posición, STOP y estado van en la cabecera fija (sección 4). Puerto, conexión y resultado van en el grupo Conexión de «Movimiento y calibración».
 - Selección de puerto: desplegable con los puertos serie detectados (`serial.tools.list_ports`, mostrando descripción) y botón de refresco. Se preselecciona el último usado (guardado en la sesión). El puerto asignado al Arduino PT100 en ECOS se marca y no se preselecciona. Nada de puertos fijos en el código.
 - Botones Conectar y Desconectar. **Verificación de identidad antes de instanciar `Scanner`**: abrir el puerto con pyserial, enviar `SCX` y exigir una respuesta con el formato `OKX` + 6 dígitos + `\r`. Si no coincide o no hay respuesta, se muestra «El dispositivo en COMx no es el escáner» y se cierra el puerto. Solo si la verificación es correcta se crea `Scanner(port=...)` (su constructor habilita motores y envía velocidades). Resultado siempre visible: «Conectado: escáner en COMx» o el error concreto.
 - Posición actual X / Y / Z / R, con la etiqueta de cada eje según su papel (haz, lateral, Z). Se actualiza al terminar cada movimiento.
@@ -165,6 +206,10 @@ Implementada en `acquisition/flatness_tool.py` (fase 4, `task_scanner_phase4.md`
 
 #### Referencias en agua (opcional)
 Casilla «Tomar referencias en agua al inicio y al final». Parámetros en el panel: **ganancia de referencia por canal** (Ch1, Ch2) y número de promedios de la referencia.
+
+- La ganancia de referencia de **Ch2** se rellena con la de Ch2 de la pestaña Acquisition, salvo que el usuario ya la haya cambiado. Una nota junto al campo explica que, con la pieza fuera, Ch2 recibe el eco del transductor opuesto y también puede saturar.
+- **Repetir permite cambiar las ganancias de referencia** antes de volver a medir: se usan los valores de los campos en ese momento. La referencia aceptada se guarda con las ganancias con las que se midió.
+- **Lo que se aprueba es lo que se guarda**: el A-scan mostrado es la señal promediada de la referencia, idéntica bit a bit a la guardada. Mientras espera OK / Repetir / Cancelar, el refresco en vivo queda retenido, para que no la sustituyan capturas sueltas. Se reanuda al aceptar o cancelar.
 
 Flujo al pulsar Inicio:
 1. La posición actual se guarda como **punto de inicio** del barrido.

@@ -57,7 +57,7 @@ import os
 import sys
 import time
 from collections import OrderedDict
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Callable, Dict, List, Optional
 
 import numpy as np
@@ -193,10 +193,27 @@ class ScanParams:
     debug_dump: bool = False
     drift_tol_db: float = DEFAULT_DRIFT_DB
     drift_tol_ns: float = DEFAULT_DRIFT_NS
+    # Surface (phase 6): a line is the case of a single line, as in the data format.
+    # The second axis is the other of lateral / Z; same range mode as the first.
+    surface: bool = False
+    start2: float = -5.0
+    end2: float = 5.0
+    step2: float = DEFAULT_SCAN_STEP_MM
+    path: str = 'zigzag'                 # 'zigzag' or 'same' (always the same direction)
+
+
+SURFACE_PENDING = ('Surface scans are prepared but not implemented yet (phase 6): '
+                   'uncheck «Surface» to run a line.')
 
 
 class ScanPlan:
-    """Positions of a line scan from the start coordinates (no Qt, no hardware)."""
+    """
+    Positions of a scan from the start coordinates (no Qt, no hardware). A line
+    is the case of a single line (lines = [(None, xs)]). With params.surface the
+    second axis (the other of lateral / Z) gives the lines: zigzag alternates the
+    direction of the first axis, 'same' always scans it in the same direction
+    (avoids the backlash between alternate lines). Acquiring a surface is phase 6.
+    """
 
     def __init__(self, params, start_coords, lat_axis, beam_axis, limits):
         if params.axis_role not in ('lateral', 'z'):
@@ -218,9 +235,44 @@ class ScanPlan:
                                 f'[0, {limit:g}] mm: {len(self.xs)} points left.')
         if len(self.xs) < 2:
             raise ValueError('fewer than 2 scan points inside the session limits')
+        self.axis2, self.ys = None, [None]
+        if params.surface:
+            if params.path not in ('zigzag', 'same'):
+                raise ValueError("path must be 'zigzag' or 'same'")
+            self.axis2 = 'Z' if self.axis != 'Z' else lat_axis
+            limit2 = limits.get(self.axis2)
+            if limit2 is None or limit2 <= 0:
+                raise ValueError(f'{self.axis2} limit unknown')
+            origin2 = self.start_coords[self.axis2] if params.mode == 'relative' else 0.0
+            self.ys, clipped2 = line_positions(origin2 + params.start2, origin2 + params.end2,
+                                               params.step2, limit2)
+            if clipped2:
+                self.notices.append(f'Second-axis range clipped to the session limits of '
+                                    f'{self.axis2} [0, {limit2:g}] mm: {len(self.ys)} lines left.')
+            if not self.ys:
+                raise ValueError('no line inside the session limits of the second axis')
+        self.lines = []
+        for k, y in enumerate(self.ys):
+            xs = list(self.xs)
+            if params.surface and params.path == 'zigzag' and k % 2:
+                xs.reverse()
+            self.lines.append((y, xs))
+
+    @property
+    def n_points(self):
+        return sum(len(xs) for _, xs in self.lines)
 
     def positions(self):
+        """Line scan positions (one line)."""
         return [{self.axis: x} for x in self.xs]
+
+    def all_positions(self):
+        """Every point of every line, as sequencer positions (second axis first on each)."""
+        out = []
+        for y, xs in self.lines:
+            for x in xs:
+                out.append({self.axis: x} if y is None else {self.axis2: y, self.axis: x})
+        return out
 
     @property
     def home(self):
@@ -232,11 +284,13 @@ def estimate_scan_s(plan, acq_s, move_mm_s=MOVE_MM_S):
     """Seconds: travel to and along the line and back, settle + averages per point,
     and the two reference acquisitions (the manual steps are not included)."""
     p = plan.params
-    total, cur = 0.0, plan.start_coords[plan.axis]
-    for x in plan.xs:
-        total += abs(x - cur) / move_mm_s + p.settle_ms / 1000.0 + p.avg_n * acq_s
-        cur = x
-    total += abs(cur - plan.start_coords[plan.axis]) / move_mm_s
+    total, cur = 0.0, dict(plan.start_coords)
+    for pos in plan.all_positions():
+        travel = sum(abs(v - cur.get(a, v)) for a, v in pos.items())
+        cur.update(pos)
+        total += travel / move_mm_s + p.settle_ms / 1000.0 + p.avg_n * acq_s
+    total += sum(abs(cur[a] - plan.start_coords[a]) for a in (plan.axis, plan.axis2) if a) \
+        / move_mm_s
     if p.references:
         total += 2 * p.ref_avg_n * acq_s
     return total
@@ -393,10 +447,12 @@ class ScanPlot:
         self._flag.setData(fx, fy)
 
     def show_reference(self, which, ch1, ch2, smin, fs):
+        self.shown_reference = (ch1, ch2)          # exactly what is up for approval
         pw = self._pw
         pw.clear()
         self._curve = None
-        pw.setTitle(f'Water reference ({which}): Ch1 red, Ch2 (PE) yellow — OK, Repeat or Cancel')
+        pw.setTitle(f'Water reference ({which}), averaged as saved: Ch1 (transmission) red, '
+                    'Ch2 (PE) yellow — OK, Repeat or Cancel')
         pw.setLabel('bottom', 'Time', units='µs')
         pw.setLabel('left', 'Amplitude', units=None)
         pw.getAxis('bottom').enableAutoSIPrefix(False)
@@ -433,13 +489,17 @@ class ScanTool(QObject):
     def __init__(self, sequencer, panel, window_fn, plot_widget, acquire_fn, gains_fn,
                  set_gains_fn, counts_fn=None, temp_factory=None, sos_fn=None, cw_fn=None,
                  info_fn=None, base_dir=None, show_plot_fn=None, acq_time_fn=None, lock_fn=None,
-                 dump_dir=None, adc_bits=ADC_BITS_DEFAULT, parent=None):
+                 dump_dir=None, adc_bits=ADC_BITS_DEFAULT, hold_live_fn=None, parent=None):
         """
         acquire_fn(avg_n) -> (ch1, ch2) full averaged records (references)
         counts_fn() -> {'sum': (s1, s2), 'offset': (o1, o2), 'n': avg_n} of the LAST
                      acquisition (the sequencer's or acquire_fn's): integer sums of
                      (raw − midpoint) over the whole record, as scan_counts defines
         adc_bits: ADC resolution assumed for the conversion (written in every file)
+        hold_live_fn(bool): host stops / restarts the live A-scan refresh. While a
+                     water reference is up for approval the live view is held, so
+                     what is shown (and approved) is the averaged reference that
+                     is saved, not single live captures
         gains_fn() -> (gain1, gain2) of the Acquisition tab (the scan gains)
         set_gains_fn(g1, g2): Gain1 then Gain2, always both (pulser fault)
         temp_factory() -> Arduino-like (getTemperatures, close) or None: opened ONCE
@@ -457,6 +517,8 @@ class ScanTool(QObject):
         self._acquire = acquire_fn
         self._counts_fn = counts_fn
         self.adc_bits = int(adc_bits)
+        self._hold_live_fn = hold_live_fn
+        self._holding = False
         self._gains_fn = gains_fn
         self._set_gains = set_gains_fn
         self._temp_factory = temp_factory
@@ -489,6 +551,15 @@ class ScanTool(QObject):
         self.state = state
         self.state_changed.emit(state)
 
+    def scan_gains(self):
+        """(gain1, gain2) of the Acquisition tab (to prefill the reference gains)."""
+        return tuple(float(g) for g in self._gains_fn())
+
+    def _hold_live(self, hold):
+        if hold != self._holding and self._hold_live_fn is not None:
+            self._hold_live_fn(hold)
+        self._holding = hold
+
     def _plan_for(self, params):
         lat = self._panel.role_axis('lateral')
         beam = self._panel.role_axis('beam')
@@ -506,8 +577,12 @@ class ScanTool(QObject):
         total = estimate_scan_s(plan, acq_s)
         long_ = total > LONG_SCAN_S
         refs = ' + two water references (manual steps not included)' if params.references else ''
-        text = (f'Estimated time ≈ {format_duration(total)}: {len(plan.xs)} points along '
-                f'{plan.axis} ({plan.xs[0]:g} → {plan.xs[-1]:g} mm){refs}; per point '
+        where = (f'{len(plan.xs)} points along {plan.axis} ({plan.xs[0]:g} → {plan.xs[-1]:g} mm)'
+                 if not params.surface else
+                 f'{plan.n_points} points: {len(plan.lines)} lines along {plan.axis} × '
+                 f'{len(plan.xs)} points, {plan.axis2} {plan.ys[0]:g} → {plan.ys[-1]:g} mm, '
+                 f'{"zigzag" if params.path == "zigzag" else "same direction"}')
+        text = (f'Estimated time ≈ {format_duration(total)}: {where}{refs}; per point '
                 f'{params.settle_ms / 1000.0:g} s settle + {params.avg_n} × {acq_s * 1e3:.0f} ms '
                 f'({"timed" if timed else "assumed"}).')
         if long_:
@@ -519,6 +594,8 @@ class ScanTool(QObject):
         """Start a scan session. None if started, else the reason it could not."""
         if self.state != 'idle':
             return 'A scan session is already in progress.'
+        if params.surface:
+            return SURFACE_PENDING
         if self._seq.active:
             return 'A sequence is already running.'
         reason = self._seq.reserved_reason(self) or self._panel.sequence_blocker()
@@ -672,16 +749,30 @@ class ScanTool(QObject):
             'time': time.time(),
         }
         self._review = which
+        # Approve what is saved: the averaged reference, held on screen (the live
+        # refresh would replace it by single captures) and shown on the big plot.
+        self._hold_live(True)
         self._plot.show_reference(which, self._pending_ref['ch1'], self._pending_ref['ch2'],
                                   smin, ACQ_FS)
+        if self._show_plot is not None:
+            self._show_plot()
         self._set_state('ref_review')
         self.reference_ready.emit(which)
-        self.status.emit(f'Water reference ({which}) acquired at gains '
-                         f'{p.ref_gain1:g}/{p.ref_gain2:g} dB: OK, Repeat or Cancel.')
+        self.status.emit(f'Water reference ({which}): {n} averages at gains '
+                         f'{p.ref_gain1:g}/{p.ref_gain2:g} dB (the averaged signal shown is the '
+                         'one saved). OK, or change the reference gains and Repeat, or Cancel.')
 
-    def repeat_reference(self):
+    def repeat_reference(self, gain1=None, gain2=None):
+        """Measure the reference again, optionally with new reference gains."""
         if self.state != 'ref_review':
             return 'No reference to repeat.'
+        changes = {}
+        if gain1 is not None:
+            changes['ref_gain1'] = float(gain1)
+        if gain2 is not None:
+            changes['ref_gain2'] = float(gain2)
+        if changes:
+            self.params = replace(self.params, **changes)
         self._take_reference(self._review)
         return None
 
@@ -693,6 +784,7 @@ class ScanTool(QObject):
         ref['T1'], ref['T2'] = t['T1'], t['T2']
         self.data.references[which] = ref
         self._restore_gains()
+        self._hold_live(False)
         self._pending_ref = None
         if which == 'final' and 'initial' in self.data.references:
             self._compare_references()
@@ -722,6 +814,7 @@ class ScanTool(QObject):
             return 'Not in a reference step.'
         self._stop_watching()
         self._restore_gains()
+        self._hold_live(False)
         self._pending_ref = None
         if self._ref_which == 'initial':
             self._end('cancelled', 'Scan cancelled before starting: nothing scanned. The '
@@ -1010,6 +1103,7 @@ class ScanTool(QObject):
     def _end(self, how, text):
         self._phase = None
         self._stop_watching()
+        self._hold_live(False)
         try:
             if self._arduino is not None:
                 self._arduino.close()
@@ -1033,10 +1127,14 @@ class ScanTool(QObject):
 
 
 class ScanGroup(QGroupBox):
-    """Line-scan controls for the Scanner tab (spec 5.6, phase 5)."""
+    """
+    Scan controls, for the «Scans» sub-tab (spec 4 and 5.6). A line is the case
+    of a single line: «Surface» enables the second-axis fields and the path,
+    ready for phase 6 (the surface acquisition itself).
+    """
 
     def __init__(self, tool, sequencer, parent=None):
-        super().__init__('Line scan', parent)
+        super().__init__('Scan', parent)
         self._tool = tool
         self._seq = sequencer
         form = QFormLayout(self)
@@ -1072,11 +1170,33 @@ class ScanGroup(QGroupBox):
         self._cmb_mag = QComboBox()
         for name, mag in MAGNITUDES.items():
             self._cmb_mag.addItem(mag.label, name)
-        form.addRow('Axis:', self._cmb_axis)
+        form.addRow('Line axis:', self._cmb_axis)
         form.addRow('Range:', self._cmb_mode)
         form.addRow('Start:', self._spin_start)
         form.addRow('End:', self._spin_end)
         form.addRow('Step:', self._spin_step)
+
+        self._chk_surface = QCheckBox('Surface')
+        self._chk_surface.setToolTip('Several lines along the second axis (phase 6). A line '
+                                     'scan is a surface of one line, as in the data format.')
+        self._lbl_axis2 = QLabel()
+        self._spin_start2 = dspin(-500.0, 500.0, -5.0, 2, 0.5, ' mm')
+        self._spin_end2 = dspin(-500.0, 500.0, 5.0, 2, 0.5, ' mm')
+        self._spin_step2 = dspin(0.01, 50.0, DEFAULT_SCAN_STEP_MM, 2, 0.05, ' mm')
+        self._cmb_path = QComboBox()
+        self._cmb_path.addItem('Zigzag', 'zigzag')
+        self._cmb_path.addItem('Same direction', 'same')
+        self._cmb_path.setToolTip('Same direction: every line is scanned the same way, so the '
+                                  'mechanical backlash does not shift alternate lines (zigzag '
+                                  'is faster).')
+        form.addRow(self._chk_surface)
+        form.addRow('Second axis:', self._lbl_axis2)
+        form.addRow('Start (2nd):', self._spin_start2)
+        form.addRow('End (2nd):', self._spin_end2)
+        form.addRow('Step (2nd):', self._spin_step2)
+        form.addRow('Path:', self._cmb_path)
+        self._surface_widgets = (self._spin_start2, self._spin_end2, self._spin_step2,
+                                 self._cmb_path, self._lbl_axis2)
         form.addRow('Settle (scan):', self._spin_settle)
         form.addRow('Averages (scan):', self._spin_avg)
         form.addRow('Map:', self._cmb_mag)
@@ -1084,13 +1204,26 @@ class ScanGroup(QGroupBox):
         self._chk_refs = QCheckBox('Take water references at the start and at the end')
         self._spin_rg1 = dspin(0.0, 100.0, 0.0, 1, 1.0, ' dB')
         self._spin_rg2 = dspin(0.0, 100.0, 0.0, 1, 1.0, ' dB')
+        self._rg2_touched = False
+        self._prefilling = False
+        self._spin_rg2.valueChanged.connect(self._on_rg2_edited)
+        self._lbl_rg2_note = QLabel('Prefilled with the Acquisition gain of Ch2. With the sample '
+                                    'out, Ch2 receives the echo of the opposite transducer and '
+                                    'can saturate too: check it in the reference shown.')
+        self._lbl_rg2_note.setWordWrap(True)
+        self._lbl_rg2_note.setStyleSheet('color: gray;')
         self._spin_ravg = QSpinBox()
         self._spin_ravg.setRange(1, 10000)
         self._spin_ravg.setValue(DEFAULT_REF_AVG_N)
+        self._lbl_ref_hint = QLabel('The reference gains can be changed before Repeat.')
+        self._lbl_ref_hint.setWordWrap(True)
+        self._lbl_ref_hint.setStyleSheet('color: gray;')
         form.addRow(self._chk_refs)
         form.addRow('Reference gain Ch1:', self._spin_rg1)
         form.addRow('Reference gain Ch2:', self._spin_rg2)
+        form.addRow(self._lbl_rg2_note)
         form.addRow('Reference averages:', self._spin_ravg)
+        form.addRow(self._lbl_ref_hint)
         self._txt_operator = QLineEdit('Sebas')
         self._txt_comment = QLineEdit('')
         form.addRow('Operator:', self._txt_operator)
@@ -1149,7 +1282,8 @@ class ScanGroup(QGroupBox):
         self._btn_stop.clicked.connect(tool.stop)
         self._btn_continue.clicked.connect(lambda: self._report(tool.continue_reference()))
         self._btn_ok.clicked.connect(lambda: self._report(tool.accept_reference()))
-        self._btn_repeat.clicked.connect(lambda: self._report(tool.repeat_reference()))
+        self._btn_repeat.clicked.connect(lambda: self._report(tool.repeat_reference(
+            self._spin_rg1.value(), self._spin_rg2.value())))
         self._btn_cancel.clicked.connect(lambda: self._report(tool.cancel_reference()))
         self._btn_save.clicked.connect(lambda: self._report(tool.save_acquired(False)))
         self._btn_save_ref.clicked.connect(lambda: self._report(tool.save_acquired(True)))
@@ -1168,8 +1302,42 @@ class ScanGroup(QGroupBox):
         for c in (self._cmb_axis, self._cmb_mode):
             c.currentIndexChanged.connect(self._refresh_estimate)
         self._chk_refs.toggled.connect(self._refresh_estimate)
+        self._chk_refs.toggled.connect(lambda on: on and self._prefill_ref_gain2())
+        self._chk_surface.toggled.connect(self._on_surface_toggled)
+        self._cmb_axis.currentIndexChanged.connect(self._update_axis2_label)
+        for w in (self._spin_start2, self._spin_end2, self._spin_step2):
+            w.valueChanged.connect(self._refresh_estimate)
+        self._cmb_path.currentIndexChanged.connect(self._refresh_estimate)
+        self._on_surface_toggled(False)
+        self._prefill_ref_gain2()
         self._on_state('idle')
         self._refresh_estimate()
+
+    def _on_surface_toggled(self, on):
+        for w in self._surface_widgets:
+            w.setEnabled(on)
+        self._update_axis2_label()
+        self._btn_start.setText('Start surface scan' if on else 'Start scan')
+        self._refresh_estimate()
+
+    def _update_axis2_label(self, *_):
+        self._lbl_axis2.setText('Z' if self._cmb_axis.currentData() == 'lateral' else 'Lateral')
+
+    def _on_rg2_edited(self, _v):
+        if not self._prefilling:
+            self._rg2_touched = True
+
+    def _prefill_ref_gain2(self):
+        """Ch2 reference gain = the Acquisition one, unless the user already set it."""
+        if self._rg2_touched or self._tool.state != 'idle':
+            return
+        try:
+            g2 = self._tool.scan_gains()[1]
+        except Exception:
+            return
+        self._prefilling = True
+        self._spin_rg2.setValue(g2)
+        self._prefilling = False
 
     def params(self):
         return ScanParams(
@@ -1180,7 +1348,10 @@ class ScanGroup(QGroupBox):
             ref_gain1=self._spin_rg1.value(), ref_gain2=self._spin_rg2.value(),
             ref_avg_n=self._spin_ravg.value(), operator=self._txt_operator.text().strip(),
             comment=self._txt_comment.text(), debug_dump=self._chk_dump.isChecked(),
-            drift_tol_db=self._spin_drift_db.value(), drift_tol_ns=self._spin_drift_ns.value())
+            drift_tol_db=self._spin_drift_db.value(), drift_tol_ns=self._spin_drift_ns.value(),
+            surface=self._chk_surface.isChecked(), start2=self._spin_start2.value(),
+            end2=self._spin_end2.value(), step2=self._spin_step2.value(),
+            path=self._cmb_path.currentData())
 
     def _refresh_estimate(self, *_):
         _, text, long_ = self._tool.estimate(self.params())
@@ -1189,6 +1360,7 @@ class ScanGroup(QGroupBox):
                                          else 'font-weight: bold;')
 
     def showEvent(self, event):
+        self._prefill_ref_gain2()
         self._refresh_estimate()
         super().showEvent(event)
 

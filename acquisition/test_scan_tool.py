@@ -437,6 +437,7 @@ class ScanHarness(unittest.TestCase):
             self.sim.SetGain2(g2)
 
         self.locks = []
+        self.holds = []
         self.tool = ScanTool(
             self.seq, self.panel, lambda: tf.WIDE, pg.PlotWidget(),
             acquire_fn=acquire, gains_fn=lambda: self.scan_gains,
@@ -449,7 +450,7 @@ class ScanHarness(unittest.TestCase):
                              'equipment2': {},
                              'name_parts': {'pva': '10', 'additive': '5', 'sample_id': 'P3A',
                                             'cycles': '5'}},
-            base_dir=self.base, lock_fn=self.locks.append,
+            base_dir=self.base, lock_fn=self.locks.append, hold_live_fn=self.holds.append,
             acq_time_fn=getattr(self, 'acq_time', None))
         self.statuses, self.warnings, self.dones, self.states = [], [], [], []
         self.tool.status.connect(self.statuses.append)
@@ -708,6 +709,34 @@ class TestWaterReferences(ScanHarness):
         self.assertIn('ref_final_ch1', d)
         self.assertFalse(meta['scan']['completed'])
 
+    def test_repeat_with_new_gains_and_approve_what_is_saved(self):
+        """Repeat can change the reference gains; what is shown is the averaged signal saved."""
+        self.make()
+        self.assertIsNone(self.tool.start(self.params(ref_avg_n=5)))
+        self.take_out()
+        self.assertEqual(self.holds, [])                       # live view while moving out
+        self.tool.continue_reference()
+        self.assertEqual(self.holds, [True])                   # held while up for approval
+        self.sim.gain_log.clear()
+        self.assertIsNone(self.tool.repeat_reference(30.0, 25.0))   # "the gain was wrong"
+        self.assertEqual(self.sim.gain_log, [('G1', 30.0), ('G2', 25.0)])
+        shown = self.tool._plot.shown_reference
+        self.tool.accept_reference()
+        self.assertEqual(self.holds, [True, False])            # live again after OK
+        self.assertEqual((self.sim.gain1, self.sim.gain2), self.scan_gains)
+        self.wait(lambda: self.tool.state == 'ref_review')     # final: with the new gains too
+        self.assertEqual(self.sim.gain_log[-2:], [('G1', 30.0), ('G2', 25.0)])
+        self.tool.accept_reference()
+        self.wait(lambda: self.dones)
+        meta, d = self.load_saved()
+        np.testing.assert_allclose(d['ref_initial_gains'], [30.0, 25.0])
+        self.assertEqual(meta['conversion']['references']['initial']['gain_db'],
+                         {'ch1': 30.0, 'ch2': 25.0})
+        # bit-identical: the approved A-scan is the saved, averaged one (5 captures)
+        np.testing.assert_array_equal(d['ref_initial_ch1'], shown[0])
+        np.testing.assert_array_equal(d['ref_initial_ch2'], shown[1])
+        self.assertEqual(int(d['ref_initial_avg_n']), 5)
+
     def test_cancel_initial_reference_moves_nothing(self):
         self.make()
         self.tool.start(self.params())
@@ -769,7 +798,70 @@ class TestEstimateMatchesReality(ScanHarness):
                         f'estimate {estimate:.2f} s, elapsed {elapsed:.2f} s')
 
 
+class TestSurfacePrepared(unittest.TestCase):
+    """«Surface» only prepares phase 6: plan, paths and estimate; no acquisition yet."""
+
+    coords = {'X': 50.0, 'Y': 50.0, 'Z': 25.0, 'R': 0.0}
+
+    def plan(self, **kw):
+        base = dict(axis_role='lateral', start=-1, end=1, step=1, surface=True, start2=-1,
+                    end2=1, step2=1)
+        base.update(kw)
+        return ScanPlan(ScanParams(**base), self.coords, 'X', 'Y', {'X': LIMIT, 'Z': LIMIT})
+
+    def test_zigzag_and_same_direction(self):
+        zig = self.plan(path='zigzag')
+        self.assertEqual(zig.axis2, 'Z')
+        self.assertEqual([y for y, _ in zig.lines], [24.0, 25.0, 26.0])
+        self.assertEqual([xs for _, xs in zig.lines],
+                         [[49.0, 50.0, 51.0], [51.0, 50.0, 49.0], [49.0, 50.0, 51.0]])
+        same = self.plan(path='same')
+        self.assertTrue(all(xs == [49.0, 50.0, 51.0] for _, xs in same.lines))
+        self.assertEqual(same.n_points, 9)
+        self.assertEqual(same.all_positions()[3], {'Z': 25.0, 'X': 49.0})
+        z_lines = self.plan(axis_role='z')
+        self.assertEqual((z_lines.axis, z_lines.axis2), ('Z', 'X'))
+
+    def test_a_line_is_one_line(self):
+        line = self.plan(surface=False)
+        self.assertEqual(line.lines, [(None, [49.0, 50.0, 51.0])])
+        self.assertEqual(line.all_positions(), line.positions())
+
+    def test_estimate_counts_every_line(self):
+        line, surf = self.plan(surface=False), self.plan(path='same')
+        self.assertGreater(estimate_scan_s(surf, 0.01), 2.9 * estimate_scan_s(line, 0.01))
+
+
 class TestScanGroup(ScanHarness):
+
+    def test_surface_checkbox_and_refusal(self):
+        self.make()
+        g = ScanGroup(self.tool, self.seq)
+        self.assertFalse(g._spin_start2.isEnabled())
+        self.assertFalse(g._cmb_path.isEnabled())
+        g._chk_surface.setChecked(True)
+        self.assertTrue(g._spin_start2.isEnabled() and g._cmb_path.isEnabled())
+        self.assertEqual(g._lbl_axis2.text(), 'Z')
+        g._cmb_axis.setCurrentIndex(1)
+        self.assertEqual(g._lbl_axis2.text(), 'Lateral')
+        p = g.params()
+        self.assertTrue(p.surface)
+        self.assertIn('lines along', g._lbl_estimate.text())
+        self.assertIn('phase 6', self.tool.start(p))
+        self.assertEqual(self.tool.state, 'idle')
+
+    def test_ref_gain_ch2_prefilled_from_acquisition(self):
+        self.make()
+        g = ScanGroup(self.tool, self.seq)
+        self.assertEqual(g._spin_rg2.value(), 35.0)              # Acquisition gain of Ch2
+        self.assertIn('opposite transducer', g._lbl_rg2_note.text())
+        self.assertIn('saturate', g._lbl_rg2_note.text())
+        g._spin_rg2.setValue(12.0)                              # the user's choice stays
+        self.scan_gains = (65.0, 40.0)
+        g._chk_refs.setChecked(True)
+        self.assertEqual(g._spin_rg2.value(), 12.0)
+        g2 = ScanGroup(self.tool, self.seq)
+        self.assertEqual(g2._spin_rg2.value(), 40.0)
 
     def test_defaults_estimate_and_buttons(self):
         self.make()
@@ -787,6 +879,34 @@ class TestScanGroup(ScanHarness):
         self.assertIn('half an hour', g._lbl_estimate.text())
         self.assertTrue(g._btn_start.isEnabled())
         self.assertFalse(g._btn_continue.isEnabled())
+
+
+class TestScannerSubTabs(unittest.TestCase):
+    """Spec 4: two sub-tabs (movement & calibration, scans) under a header with the STOP."""
+
+    def test_layout(self):
+        sys.path.insert(0, os.path.join(_HERE, '..'))
+        from scanner_panel import ScannerPanel
+        from PyQt5.QtWidgets import QLabel
+        panel = ScannerPanel(use_sim=True)
+        try:
+            self.assertEqual(panel._tabs.count(), 1)              # standalone: no empty tab
+            panel.add_tool_widget(QLabel('focus'))
+            panel.add_tool_widget(QLabel('scan'), tab='scans')
+            self.assertEqual([panel._tabs.tabText(i) for i in range(panel._tabs.count())],
+                             ['Motion && calibration', 'Scans'])
+            w = panel._btn_stop
+            while w is not None:                                   # STOP outside both tabs
+                self.assertIsNot(w, panel._tabs)
+                w = w.parentWidget()
+            panel.show_tab('scans')
+            self.assertEqual(panel._tabs.currentIndex(), 1)
+            with self.assertRaises(ValueError):
+                panel.add_tool_widget(QLabel('x'), tab='other')
+        finally:
+            panel.close()
+            if hasattr(panel, 'shutdown'):
+                panel.shutdown()
 
 
 if __name__ == '__main__':

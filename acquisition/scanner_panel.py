@@ -48,7 +48,7 @@ from PyQt5.QtCore import Qt, QThread, pyqtSignal
 from PyQt5.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
     QGroupBox, QLabel, QLineEdit, QComboBox, QPushButton, QMessageBox,
-    QScrollArea, QFrame, QCheckBox,
+    QScrollArea, QFrame, QCheckBox, QTabWidget,
 )
 
 from hardware.scanner.Scanner import Scanner
@@ -734,25 +734,73 @@ class ScannerPanel(QWidget):
         self._lbl_free_banner.setVisible(False)
         outer.addWidget(self._lbl_free_banner)
 
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll.setFrameShape(QFrame.NoFrame)
-        outer.addWidget(scroll)
+        # Fixed header above the two sub-tabs: position, state and the STOP, so
+        # the STOP stays visible whichever sub-tab is open (spec 5.1, 4).
+        outer.addWidget(self._build_header())
 
-        content = QWidget()
-        scroll.setWidget(content)
-        layout = QVBoxLayout(content)
-        layout.setSpacing(6)
+        # Two sub-tabs (spec 4): movement & calibration, and scans. The scans one
+        # is created when the first scan widget is added (add_tool_widget), so the
+        # standalone panel shows no empty tab.
+        self._tabs = QTabWidget()
+        outer.addWidget(self._tabs, 1)
+        self._tab_layouts = {}
+        layout = self._add_tab('motion', 'Motion && calibration')
         self._content_layout = layout
 
         layout.addWidget(self._build_status_group())
         layout.addWidget(self._build_session_group())
         layout.addWidget(self._build_movement_group())
+
+    def _add_tab(self, key, title):
+        """A scrollable sub-tab; returns its layout (tools are inserted before its stretch)."""
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
+        content = QWidget()
+        scroll.setWidget(content)
+        layout = QVBoxLayout(content)
+        layout.setSpacing(6)
         layout.addStretch()
+        self._tabs.addTab(scroll, title)
+        self._tab_layouts[key] = layout
+        return layout
+
+    def _build_header(self):
+        """Position (one row per role), STOP and state: always visible."""
+        box = QFrame()
+        box.setFrameShape(QFrame.StyledPanel)
+        layout = QVBoxLayout(box)
+        layout.setContentsMargins(4, 4, 4, 4)
+        pos_grid = QGridLayout()
+        self._lbl_role_name = {}
+        self._lbl_pos = {}
+        for i, role in enumerate(ROLE_ORDER):
+            lbl_name = QLabel()
+            lbl_name.setStyleSheet('font-weight: bold;')
+            lbl_pos = QLabel('—')
+            self._lbl_role_name[role] = lbl_name
+            self._lbl_pos[role] = lbl_pos
+            pos_grid.addWidget(lbl_name, i // 2, 2 * (i % 2))
+            pos_grid.addWidget(lbl_pos, i // 2, 2 * (i % 2) + 1)
+        layout.addLayout(pos_grid)
+
+        row = QHBoxLayout()
+        # STOP: always enabled, never disabled by busy/ack state
+        self._btn_stop = QPushButton('STOP')
+        self._btn_stop.setStyleSheet(
+            'background-color: #b00020; color: white; font-weight: bold; font-size: 16px; padding: 8px;'
+        )
+        self._btn_stop.clicked.connect(self._on_stop_clicked)
+        row.addWidget(self._btn_stop, 2)
+        self._lbl_state = QLabel('Disconnected')
+        row.addWidget(self._lbl_state, 1)
+        layout.addLayout(row)
+        return box
 
     # -- Status (spec 5.1) ---------------------------------------------------
     def _build_status_group(self):
-        group = QGroupBox('Status')
+        """Connection (port, connect, result). Position, STOP and state live in the header."""
+        group = QGroupBox('Connection')
         layout = QVBoxLayout(group)
 
         # Port selection
@@ -781,31 +829,6 @@ class ScannerPanel(QWidget):
         self._lbl_result = QLabel('Not connected.')
         self._lbl_result.setWordWrap(True)
         layout.addWidget(self._lbl_result)
-
-        # Position display, one row per role
-        pos_grid = QGridLayout()
-        self._lbl_role_name = {}
-        self._lbl_pos = {}
-        for i, role in enumerate(ROLE_ORDER):
-            lbl_name = QLabel()
-            lbl_name.setStyleSheet('font-weight: bold;')
-            lbl_pos = QLabel('—')
-            self._lbl_role_name[role] = lbl_name
-            self._lbl_pos[role] = lbl_pos
-            pos_grid.addWidget(lbl_name, i, 0)
-            pos_grid.addWidget(lbl_pos, i, 1)
-        layout.addLayout(pos_grid)
-
-        # STOP: always enabled, never disabled by busy/ack state
-        self._btn_stop = QPushButton('STOP')
-        self._btn_stop.setStyleSheet(
-            'background-color: #b00020; color: white; font-weight: bold; font-size: 16px; padding: 8px;'
-        )
-        self._btn_stop.clicked.connect(self._on_stop_clicked)
-        layout.addWidget(self._btn_stop)
-
-        self._lbl_state = QLabel('Disconnected')
-        layout.addWidget(self._lbl_state)
 
         if self._use_sim:
             btn_power_cycle = QPushButton('Simulate power cycle (debug)')
@@ -1529,9 +1552,23 @@ class ScannerPanel(QWidget):
         self._seq_text = f'Sequence {done}/{total}'
         self._update_enabled_state()
 
-    def add_tool_widget(self, widget):
-        """Add a widget (a tool's own controls) at the bottom of the scrollable panel."""
-        self._content_layout.insertWidget(self._content_layout.count() - 1, widget)
+    def add_tool_widget(self, widget, tab='motion'):
+        """
+        Add a tool's controls at the bottom of a sub-tab: 'motion' (movement &
+        calibration: focus, flatness...) or 'scans' (created on first use).
+        """
+        if tab not in self._tab_layouts:
+            if tab != 'scans':
+                raise ValueError(f'unknown sub-tab {tab!r}')
+            self._add_tab('scans', 'Scans')
+        layout = self._tab_layouts[tab]
+        layout.insertWidget(layout.count() - 1, widget)
+
+    def show_tab(self, tab):
+        """Bring a sub-tab to the front ('motion' or 'scans')."""
+        keys = list(self._tab_layouts)
+        if tab in keys:
+            self._tabs.setCurrentIndex(keys.index(tab))
 
     def _axes_out_of_range(self):
         """Axes whose current GUI position falls outside [0, limit]."""

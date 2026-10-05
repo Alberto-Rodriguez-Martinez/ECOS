@@ -1298,8 +1298,9 @@ class EcosGUI(QMainWindow):
             show_plot_fn=self._show_scanner_plot,
             acq_time_fn=lambda: getattr(self, '_t_ascan', None),
             lock_fn=self._scan_lock,
+            hold_live_fn=self._hold_live,
             parent=self)
-        panel.add_tool_widget(ScanGroup(self._scan_tool, seq))
+        panel.add_tool_widget(ScanGroup(self._scan_tool, seq), tab='scans')
         self._scan_tool.echo_used.connect(self._mark_echo)
         self._scan_tool.done.connect(lambda _how: self._clear_echo_mark())
 
@@ -1414,6 +1415,14 @@ class EcosGUI(QMainWindow):
         its sequences (water-reference steps)."""
         self._scan_session_lock = bool(locked)
         self._acq_scroll.setEnabled(not locked and not self._sequencer.active)
+
+    def _hold_live(self, hold):
+        """Hold the live A-scan refresh while a water reference is up for approval:
+        the averaged reference stays on the plots instead of single live captures."""
+        if hold:
+            self._timer.stop()
+        elif not self._sequencer.active:
+            self._timer.start(REALTIME_INTERVAL)
 
     def _scanner_cw_no_read(self):
         """c_w without opening the Arduino (the scan holds its only instance)."""
