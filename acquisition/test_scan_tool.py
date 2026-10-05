@@ -33,6 +33,9 @@ from scan_tool import (  # noqa: E402
     estimate_scan_s, line_positions, reference_drift, register_magnitude,
 )
 from sim_sedaq import SimParams, SimSeDaq  # noqa: E402
+from echo_tracking import (  # noqa: E402
+    EchoDelay, FrontEchoTracker, band_samples, echo_pair_delay,
+)
 
 FS = tf.FS
 LIMIT = tf.LIMIT
@@ -93,7 +96,8 @@ class TestLineAndMagnitudes(unittest.TestCase):
         self.assertGreater(estimate_scan_s(long_plan, 0.01), LONG_SCAN_S)
 
     def test_magnitudes_are_extensible(self):
-        self.assertEqual(list(MAGNITUDES)[:3], ['amplitude', 'tof', 'energy'])
+        # thickness first: the default of the map (phase 6)
+        self.assertEqual(list(MAGNITUDES)[:4], ['thickness', 'tof', 'amplitude', 'energy'])
         from echo_tracking import PeakMeasure
         seg = np.sin(np.arange(100) / 3.0)
         ctx = PointContext(PeakMeasure(1.0, 150, False, False, 50.0, 'tracked', index_frac=150.5),
@@ -104,6 +108,11 @@ class TestLineAndMagnitudes(unittest.TestCase):
             vals = compute_magnitudes(ctx)
             self.assertAlmostEqual(vals['tof'], 1.505)
             self.assertAlmostEqual(vals['peak_to_peak'], np.ptp(seg))
+            self.assertTrue(np.isnan(vals['thickness']))          # no echo pair given
+            pair = EchoDelay(True, '', 150, 540, 389.61, 0.99, -1)
+            ctx.pair, ctx.c_sample = pair, 1540.0
+            self.assertAlmostEqual(compute_magnitudes(ctx)['thickness'], 3.0, places=4)
+            self.assertAlmostEqual(compute_magnitudes(ctx)['thickness_corr'], 0.99)
             self.assertTrue(np.isnan(compute_magnitudes(ctx, lost=True)['tof']))
         finally:
             del MAGNITUDES['peak_to_peak']
@@ -288,6 +297,58 @@ class TestReferenceDrift(unittest.TestCase):
         self.assertTrue(np.max(np.abs(b['ch2'])) < 0.7 * np.max(np.abs(a['ch2'])))
 
 
+# A sample whose back face is in the window and clear: 3 mm, a focal zone wide
+# enough for both faces (σ = 6 mm) and averaged-like SNR.
+THICK = dict(thickness=3.0, sigma=6.0, snr_db=45.0)
+
+
+def true_delay_samples(p):
+    return 2.0 * p.thickness * 1e-3 / p.c_sample * FS
+
+
+class TestEchoPair(unittest.TestCase):
+    """Echo 1 → echo 2 by cross-correlation (echo_tracking.echo_pair_delay)."""
+
+    def pair(self, window=tf.WIDE, seed=1, **kw):
+        sim = SimSeDaq(SimParams(**dict(THICK, **kw)), reclen=8192, seed=seed)
+        sim.set_scanner_state({'X': 50.0, 'Y': 50.0, 'Z': 25.0, 'R': 0.0})
+        s1, s2 = acquire_counts(sim, 4)
+        sig = counts_to_float(s2, 4)[0]
+        tr = FrontEchoTracker(window, 0.0, band_samples(0.5))
+        m = tr.measure(sig, 0.0)
+        seg, env = tr.point_signals()
+        return sim, echo_pair_delay(seg, env, m.index - window[0], tr.band, smin=window[0])
+
+    def test_delay_and_polarity(self):
+        """The simulator's 2h/c_sample, with the back wall inverted (default) or not."""
+        for invert_back, polarity in ((False, -1), (True, 1)):
+            with self.subTest(invert_back=invert_back):
+                sim, p = self.pair(invert_back=invert_back)
+                self.assertTrue(p.found, p.reason)
+                self.assertAlmostEqual(p.delay_samples, true_delay_samples(sim.params), delta=0.1)
+                self.assertEqual(p.polarity, polarity)
+                self.assertGreater(p.corr, 0.99)
+
+    def test_thin_and_thick_samples(self):
+        for kw in (dict(thickness=1.5), dict(thickness=10.0, sigma=20.0)):
+            with self.subTest(**kw):
+                sim, p = self.pair(**kw)
+                self.assertTrue(p.found, p.reason)
+                self.assertAlmostEqual(p.delay_samples, true_delay_samples(sim.params), delta=0.1)
+
+    def test_echo_2_outside_the_window_gives_no_number(self):
+        """Smax just before the back echo, or just after it: never a delay against the edge."""
+        sim = SimSeDaq(SimParams(**THICK))
+        front = int(round(sim.front_tof(50.0, 50.0, 25.0) * FS))
+        back = int(round(sim.back_tof(50.0, 50.0, 25.0) * FS))
+        for smax, reason in ((back - 100, 'no_back'), (back + 60, 'back_at_edge')):
+            with self.subTest(smax=smax):
+                _, p = self.pair(window=(front - 600, smax))
+                self.assertFalse(p.found)
+                self.assertEqual(p.reason, reason)
+                self.assertTrue(np.isnan(p.delay_samples))
+
+
 # ===========================================================================
 #  Qt: ScanTool on the real ScanSequencer
 # ===========================================================================
@@ -405,6 +466,7 @@ class ScanHarness(unittest.TestCase):
         self.sim = GainLogSim(SimParams(**sim_params), reclen=8192, seed=3)
         self.panel = Panel(self.sim)
         self.worker = Worker(self.panel, worker_speed)
+        self.window = tf.WIDE
         self.live = {'on': True}
         self.measured = []                  # every float pair handed to the tools
 
@@ -439,7 +501,7 @@ class ScanHarness(unittest.TestCase):
         self.locks = []
         self.holds = []
         self.tool = ScanTool(
-            self.seq, self.panel, lambda: tf.WIDE, pg.PlotWidget(),
+            self.seq, self.panel, lambda: self.window, pg.PlotWidget(),
             acquire_fn=acquire, gains_fn=lambda: self.scan_gains,
             set_gains_fn=set_gains, counts_fn=lambda: self.last_counts,
             temp_factory=factory if temp else None,
@@ -497,7 +559,8 @@ class TestLineScan(ScanHarness):
                 n_samp = tf.WIDE[1] - tf.WIDE[0]
                 # exact rebuild of what was measured (task_scan_int16 point 1)
                 smin, smax = tf.WIDE
-                scanned = self.measured[:9]            # then one acquisition on the way back
+                # the thickness check at Start, the 9 points, one acquisition on the way back
+                scanned = self.measured[1:10]
                 np.testing.assert_array_equal(
                     d['signals_ch1'][0], np.array([m[0][smin:smax] for m in scanned]))
                 np.testing.assert_array_equal(
@@ -619,6 +682,60 @@ class TestLineScan(ScanHarness):
         self.assertIn('scan session', focus.run(5.0, 1.0))
         self.tool.cancel_reference()
         self.assertIsNone(self.seq.reserved_reason())
+
+
+class TestThickness(ScanHarness):
+    """Phase 6, section 2 and verification 3."""
+
+    def test_thickness_matches_the_simulator(self):
+        self.make(**THICK)
+        offered = []
+        self.tool.thickness_available.connect(lambda on, why: offered.append(on))
+        self.assertIsNone(self.tool.start(ScanParams(start=-2, end=2, step=1, settle_ms=0, avg_n=4,
+                                                     c_sample=self.sim.params.c_sample)))
+        self.assertEqual(offered, [True])
+        self.assertEqual(self.tool.magnitude, 'thickness')          # the default of the map
+        self.wait(lambda: self.dones)
+        d = self.tool.data
+        th = [m['thickness'] for m in d.magnitudes]
+        np.testing.assert_allclose(th, 3.0, atol=0.003)            # 3 µm on 3 mm
+        self.assertTrue(all(m['thickness_corr'] > 0.95 for m in d.magnitudes))
+        self.assertFalse(any('no_back' in f or 'low_corr' in f for f in d.flags))
+        meta, s = self.load_saved()
+        self.assertTrue(meta['scan']['thickness']['enabled'])
+        self.assertEqual(s['live_thickness'].shape, (1, 5))
+        np.testing.assert_allclose(s['echo_delay_us'][0],
+                                   true_delay_samples(self.sim.params) / FS * 1e6, atol=2e-3)
+        self.assertTrue(np.all(s['echo_polarity'] == -1))          # PVA back face: inverted
+        np.testing.assert_allclose(s['live_thickness_corr'][0], [m['thickness_corr']
+                                                                 for m in d.magnitudes])
+
+    def test_echo_2_outside_the_window_warns_before_starting(self):
+        self.make(**THICK)
+        front = int(round(self.sim.front_tof(50.0, 50.0, 25.0) * FS))
+        back = int(round(self.sim.back_tof(50.0, 50.0, 25.0) * FS))
+        self.window = (front - 600, back - 100)                     # echo 2 beyond Smax
+        g = ScanGroup(self.tool, self.seq)
+        self.assertEqual(g._cmb_mag.currentData(), 'thickness')
+        moves_at_warning = []
+        self.tool.warning.connect(lambda w: 'Thickness NOT available' in w
+                                  and moves_at_warning.append(len(self.worker.moves)))
+        self.assertIsNone(self.tool.start(ScanParams(start=-1, end=1, step=1, settle_ms=0,
+                                                     avg_n=4)))
+        self.assertEqual(moves_at_warning, [0])                     # before anything moved
+        self.assertNotEqual(self.tool.magnitude, 'thickness')
+        i = g._cmb_mag.findData('thickness')
+        self.assertFalse(g._cmb_mag.model().item(i).isEnabled())    # not offered
+        self.assertEqual(g._cmb_mag.currentData(), 'amplitude')
+        self.assertIn('beyond Smax', g._lbl_thick.text())
+        self.wait(lambda: self.dones)
+        self.assertEqual(self.dones, ['completed'])                # the scan itself goes on
+        meta, s = self.load_saved()
+        self.assertFalse(meta['scan']['thickness']['enabled'])
+        self.assertIn('beyond Smax', meta['scan']['thickness']['reason_off'])
+        self.assertTrue(np.all(np.isnan(s['live_thickness'])))
+        self.assertTrue(np.all(np.isnan(s['echo_delay_us'])))
+        self.assertFalse(np.any(np.isnan(s['live_tof'])))           # the rest is measured
 
 
 class TestWaterReferences(ScanHarness):

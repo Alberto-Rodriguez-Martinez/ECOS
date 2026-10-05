@@ -64,7 +64,7 @@ import numpy as np
 
 from echo_tracking import (
     ACQ_FS, DEFAULT_BAND_SAMPLES, DEFAULT_BAND_US, DEFAULT_EDGE_MARGIN, DEFAULT_THRESHOLD,
-    MIN_WINDOW_SAMPLES, FrontEchoTracker, band_samples,
+    MIN_WINDOW_SAMPLES, EchoDelay, FrontEchoTracker, band_samples, echo_pair_delay,
 )
 from flatness_tool import line_flags
 from ECOS_US_ToolBox import CalcToFAscanCosine_XCRFFT, Envelope
@@ -94,6 +94,11 @@ DEFAULT_SCAN_SETTLE_MS = 100
 DEFAULT_SCAN_AVG_N = 20
 DEFAULT_SCAN_STEP_MM = 0.5
 DEFAULT_REF_AVG_N = 100
+# Thickness (echo 1 → echo 2), phase 6. The delay is what is measured; the thickness
+# in mm uses a NOMINAL sound speed of the sample, for the live map only (the
+# definitive thickness is computed in the analysis from the saved signals).
+DEFAULT_C_SAMPLE = 1540.0      # m/s, PVA, nominal
+DEFAULT_MIN_CORR = 0.9         # echo 1 / echo 2 correlation below this: point marked less reliable
 LONG_SCAN_S = 30 * 60          # warn above half an hour
 DEFAULT_DRIFT_DB = 0.5         # reference drift warnings: amplitude [dB] …
 DEFAULT_DRIFT_NS = 20.0        # … and ToF [ns] (~0.1 °C of water over a 60 mm path)
@@ -114,6 +119,8 @@ class PointContext:
     seg_ch1: np.ndarray          # Ch1 samples Smin..Smax-1
     fs: float
     emission_sample: int
+    pair: Optional[EchoDelay] = None     # echo 1 → echo 2 (None: thickness off)
+    c_sample: float = DEFAULT_C_SAMPLE
 
 
 @dataclass
@@ -132,13 +139,29 @@ def register_magnitude(name, label, unit, fn, uses_echo=False):
     MAGNITUDES[name] = Magnitude(label, unit, fn, uses_echo)
 
 
-register_magnitude('amplitude', 'Max. envelope in the window (PE)', '',
-                   lambda c: float(np.max(c.env)))
+def pair_thickness_mm(pair, c_sample, fs=ACQ_FS):
+    """Thickness [mm] from an EchoDelay at the sound speed c_sample; NaN if not found."""
+    if pair is None or not pair.found:
+        return float('nan')
+    return c_sample * pair.delay_samples / fs / 2.0 * 1e3
+
+
+# The thickness first: it is the default of the map. Measured between echoes 1
+# and 2, it is immune to the drift of the sample (05/10: 0.20 µm residual vs 2.4 µm
+# for the position of the face), the most reliable quantity of the system.
+register_magnitude('thickness', 'Thickness (echo 1 → echo 2)', 'mm',
+                   lambda c: pair_thickness_mm(c.pair, c.c_sample, c.fs), uses_echo=True)
 register_magnitude('tof', 'Front-echo time of flight', 'µs',
                    lambda c: (c.measure.index_frac - c.emission_sample) / c.fs * 1e6,
                    uses_echo=True)
+register_magnitude('amplitude', 'Max. envelope in the window (PE)', '',
+                   lambda c: float(np.max(c.env)))
 register_magnitude('energy', 'Energy in the window (PE)', 'a.u.·µs',
                    lambda c: float(np.sum(c.seg * c.seg)) / c.fs * 1e6)
+register_magnitude('thickness_corr', 'Thickness: echo 1 / echo 2 correlation', '',
+                   lambda c: c.pair.corr if c.pair is not None and c.pair.found
+                   else float('nan'), uses_echo=True)
+THICKNESS_MAGNITUDES = ('thickness', 'thickness_corr')
 
 
 def compute_magnitudes(ctx, lost=False):
@@ -200,6 +223,10 @@ class ScanParams:
     debug_dump: bool = False
     drift_tol_db: float = DEFAULT_DRIFT_DB
     drift_tol_ns: float = DEFAULT_DRIFT_NS
+    # Thickness per point (phase 6): echo 1 → echo 2 by cross-correlation.
+    thickness: bool = True
+    c_sample: float = DEFAULT_C_SAMPLE
+    min_corr: float = DEFAULT_MIN_CORR
     # Surface (phase 6): a line is the case of a single line, as in the data format.
     # The second axis is the other of lateral / Z; same range mode as the first.
     surface: bool = False
@@ -314,6 +341,7 @@ class ScanData:
     times: List[float] = field(default_factory=list)
     requested: List[float] = field(default_factory=list)
     measures: list = field(default_factory=list)
+    pairs: List[Optional[EchoDelay]] = field(default_factory=list)   # echo 1 → echo 2
     magnitudes: List[Dict[str, float]] = field(default_factory=list)
     flags: List[List[str]] = field(default_factory=list)
     temperatures: List[dict] = field(default_factory=list)
@@ -397,7 +425,45 @@ def scan_messages(xs, flags, measures):
                     'Marked; the scan goes on (ToF = NaN there).')
     if sat:
         msgs.append(f'Signal saturated at {_pts(sat)} mm: lower the gain.')
+    no_back = [x for x, f in zip(xs, flags) if 'no_back' in f]
+    low = [x for x, f in zip(xs, flags) if 'low_corr' in f]
+    if no_back:
+        msgs.append(f'No second echo (back face) inside Smin–Smax at {_pts(no_back)} mm: '
+                    'no thickness there (NaN).')
+    if low:
+        msgs.append(f'Echo 1 / echo 2 correlation below the limit at {_pts(low)} mm: the echo '
+                    'is deformed (inclined face?), thickness less reliable there.')
     return msgs
+
+
+def thickness_flags(pair, min_corr):
+    """'no_back' (echo 2 not found / not inside the window) or 'low_corr'; [] when off."""
+    if pair is None:
+        return []
+    if not pair.found:
+        return ['no_back']
+    return ['low_corr'] if pair.corr < min_corr else []
+
+
+THICKNESS_FLAGS = ('no_back', 'low_corr')
+
+
+def point_marked(magnitude, flags):
+    """Is a point marked on the map of `magnitude`? The thickness flags only mark the
+    thickness maps; saturation and a pinned echo mark every map."""
+    if magnitude in THICKNESS_MAGNITUDES:
+        return bool(flags)
+    if MAGNITUDES[magnitude].uses_echo:
+        return any(f not in THICKNESS_FLAGS for f in flags)
+    return 'saturated' in flags or 'edge' in flags
+
+
+THICKNESS_REASONS = {
+    'front_gate': 'the gate around the front echo does not fit in Smin–Smax',
+    'no_back': 'there is no clear second echo (back face) after the front echo inside '
+               'Smin–Smax: it is beyond Smax, or too weak',
+    'back_at_edge': 'the second echo (back face) is at the edge of Smin–Smax',
+}
 
 
 def _pts(xs):
@@ -492,6 +558,7 @@ class ScanTool(QObject):
     done = pyqtSignal(str)
 
     drift = pyqtSignal(object)
+    thickness_available = pyqtSignal(bool, str)      # (on, reason when off), at every Start
 
     def __init__(self, sequencer, panel, window_fn, plot_widget, acquire_fn, gains_fn,
                  set_gains_fn, counts_fn=None, temp_factory=None, sos_fn=None, cw_fn=None,
@@ -538,7 +605,9 @@ class ScanTool(QObject):
         self._lock_fn = lock_fn
         self._dump_dir = dump_dir or DEFAULT_DUMP_DIR
         self.state = 'idle'
-        self.magnitude = 'amplitude'
+        self.magnitude = 'thickness'
+        self.thickness_on = False
+        self.thickness_reason = ''
         self.data = None
         self.plan = None
         self.params = None
@@ -617,6 +686,7 @@ class ScanTool(QObject):
             return str(e)
         self.plan, self.params = plan, params
         self.window = (int(smin), int(smax))
+        self._check_thickness(params)
         self.data = ScanData()
         self.last_saved_path = None
         self.last_dump_path = None
@@ -688,6 +758,47 @@ class ScanTool(QObject):
     def _coords4(self):
         c = self._panel.current_coords()
         return [float(c.get(a, float('nan'))) for a in AXES4]
+
+    # -- thickness (echo 1 → echo 2) -------------------------------------------
+    def _check_thickness(self, params):
+        """
+        Before anything moves: one acquisition where the scan starts, the front
+        echo by the first-peak rule and then echo 2. If echo 2 does not fit in
+        Smin–Smax the thickness is disabled for the whole scan and the magnitude
+        is not offered: better no thickness than one measured against whatever
+        lies at the edge of the window.
+        """
+        on, reason = False, 'disabled (Thickness unchecked)'
+        if params.thickness:
+            _, sig = self._acquire(params.avg_n)
+            tr = FrontEchoTracker(self.window, 0.0, band_samples(params.band_us),
+                                  params.threshold, params.edge_margin)
+            m = tr.measure(sig, 0.0)
+            if not m.confident:
+                reason = ('no clear front echo where the scan starts, so the second echo cannot '
+                          'be checked')
+            else:
+                seg, env = tr.point_signals()
+                pair = echo_pair_delay(seg, env, m.index - self.window[0], tr.band,
+                                       params.threshold, params.edge_margin, self.window[0])
+                on = pair.found
+                reason = '' if on else (THICKNESS_REASONS[pair.reason] + ' where the scan '
+                                        'starts: widen Smax (Acquisition tab) to include it')
+        self.thickness_on, self.thickness_reason = on, reason
+        self.thickness_available.emit(on, reason)
+        if not on:
+            if params.thickness:
+                self.warning.emit(f'Thickness NOT available for this scan: {reason}.')
+            if self.magnitude in THICKNESS_MAGNITUDES:
+                self.magnitude = 'amplitude'
+
+    def _pair(self, seg, env, m):
+        """Echo 1 → echo 2 on one point's window (None when the thickness is off)."""
+        if not self.thickness_on:
+            return None
+        p, smin = self.params, self.window[0]
+        return echo_pair_delay(seg, env, m.index - smin, self._tracker.band, p.threshold,
+                               p.edge_margin, smin)
 
     # -- water references ------------------------------------------------------
     def _enter_ref_out(self, which):
@@ -893,7 +1004,8 @@ class ScanTool(QObject):
         self.data.off1.append(o1)
         self.data.off2.append(o2)
         self._last = (seg, env, np.array(ch1[smin:smax], dtype=float),
-                      np.array(sig, dtype=float) if self._dump is not None else None)
+                      np.array(sig, dtype=float) if self._dump is not None else None,
+                      self._pair(seg, env, m))
         return m
 
     def _on_point(self, i, coords, value):
@@ -905,16 +1017,17 @@ class ScanTool(QObject):
         d.requested.append(self.plan.xs[i] if i < len(self.plan.xs) else float('nan'))
         d.measures = list(self._tracker.measures)        # a re-lock revises earlier points
         xs = self.positions_read()
-        d.flags = line_flags(xs, d.measures, self.window, self.params.edge_margin)
-        seg, env, seg1, record = self._last
-        ctx = PointContext(value, seg, env, seg1, ACQ_FS, self.params.emission_sample)
-        lost = 'weak' in d.flags[-1] or 'outside' in d.flags[-1]
+        seg, env, seg1, record, pair = self._last
+        d.pairs.append(pair)
+        flags = line_flags(xs, d.measures, self.window, self.params.edge_margin)
+        lost = 'weak' in flags[-1] or 'outside' in flags[-1]
+        ctx = PointContext(value, seg, env, seg1, ACQ_FS, self.params.emission_sample, pair,
+                           self.params.c_sample)
         d.magnitudes.append(compute_magnitudes(ctx, lost))
-        # ToF depends on the (possibly revised) measures: refresh it on every point
-        for k, (m, f) in enumerate(zip(d.measures, d.flags)):
-            gone = 'weak' in f or 'outside' in f
-            d.magnitudes[k]['tof'] = (float('nan') if gone else
-                                      (m.index_frac - self.params.emission_sample) / ACQ_FS * 1e6)
+        # ToF and thickness depend on the (possibly revised) measures: refresh them
+        for k, (m, f) in enumerate(zip(d.measures, flags)):
+            self._refresh_echo_values(k, m, f)
+        d.flags = flags
         if self._dump is not None:
             self._dump.add('scan', self.plan.beam_x, value, seg, env, record, self.window,
                            extra=dict(line_position=xs[-1], **d.magnitudes[-1]))
@@ -926,12 +1039,36 @@ class ScanTool(QObject):
             self._warned_kinds |= set(f)
             self.warning.emit(' '.join(scan_messages([xs[-1]], [f], [d.measures[-1]])))
 
+    def _refresh_echo_values(self, k, m, f):
+        """
+        Point k of the current sweep after its front-echo measure m (revised by a
+        re-lock or not) and its echo flags f: ToF, echo 1 → echo 2 again if echo 1
+        moved, the thickness magnitudes and the thickness flags (appended to f).
+        """
+        d, p = self.data, self.params
+        gone = 'weak' in f or 'outside' in f
+        pair = d.pairs[k]
+        if pair is not None and pair.front != m.index:
+            pair = d.pairs[k] = self._pair(*self._tracker.point_signals(k), m)
+        if gone and pair is not None and pair.found:      # no echo 1 there: no pair either
+            pair = d.pairs[k] = EchoDelay(False, 'front_lost', front=m.index)
+        mags = d.magnitudes[k]
+        mags['tof'] = (float('nan') if gone else
+                       (m.index_frac - p.emission_sample) / ACQ_FS * 1e6)
+        mags['thickness'] = float('nan') if gone else pair_thickness_mm(pair, p.c_sample)
+        mags['thickness_corr'] = (pair.corr if not gone and pair is not None and pair.found
+                                  else float('nan'))
+        if not gone:
+            f.extend(thickness_flags(pair, p.min_corr))
+
     def positions_read(self):
         """Real positions along the scanned axis of the points acquired so far."""
         k = AXES4.index(self.plan.axis)
         return [c[k] for c in self.data.coords]
 
     def set_magnitude(self, name):
+        if name in THICKNESS_MAGNITUDES and self.state != 'idle' and not self.thickness_on:
+            name = 'amplitude'                 # not offered in this scan (see _check_thickness)
         self.magnitude = name
         if self.plan is not None and self.state not in ('ref_review',):
             self._plot.reset(self.plan.axis, name)
@@ -941,9 +1078,7 @@ class ScanTool(QObject):
         d = self.data
         if d is None or not d.coords:
             return
-        mag = MAGNITUDES[self.magnitude]
-        flagged = [bool(f) if mag.uses_echo else ('saturated' in f or 'edge' in f)
-                   for f in d.flags]
+        flagged = [point_marked(self.magnitude, f) for f in d.flags]
         self._plot.set_data(self.positions_read(), [m[self.magnitude] for m in d.magnitudes],
                             flagged)
 
@@ -1079,6 +1214,20 @@ class ScanTool(QObject):
                          'edge_margin': p.edge_margin, 'emission_sample': p.emission_sample},
             'flags': {str(k): f for k, f in enumerate(d.flags) if f},
             'reference_drift': d.drift,
+            'thickness': {
+                'enabled': self.thickness_on, 'reason_off': self.thickness_reason or None,
+                'method': 'echo 1 (tracked front echo) to echo 2 (first clear echo after it), '
+                          'cross-correlation of ±gate_samples gates around their envelope '
+                          'peaks (ECOS_US_ToolBox.CalcToFAscanCosine_XCRFFT)',
+                'gate_samples': self._tracker.band, 'c_sample': p.c_sample,
+                'c_sample_note': 'nominal, for the live map (live_thickness) only: the '
+                                 'measured quantity is echo_delay_us',
+                'min_corr': p.min_corr,
+                'drift_note': 'immune to the movement of the sample (both echoes move '
+                              'together); never drift-corrected',
+            },
+            'live_values_note': 'live_* arrays: the values of the live map, for the '
+                                'metadata only; the results are computed in the analysis',
         }
         refs = {w: {k: r[k] for k in ('sum1', 'sum2', 'offset1', 'offset2', 'avg_n', 'gains',
                                       'coords', 'time', 'T1', 'T2')}
@@ -1097,11 +1246,26 @@ class ScanTool(QObject):
             point_time=np.array(d.times, dtype=float).reshape(1, n),
             temperatures=d.temperatures, references=refs,
             operator=p.operator, comment=p.comment, base_dir=base_dir, exp_name=name,
-            extra_arrays={'positions_requested': np.array(d.requested, dtype=float).reshape(1, n)})
+            extra_arrays=dict(self._point_arrays(n),
+                              positions_requested=np.array(d.requested, dtype=float).reshape(1, n)))
         if os.path.abspath(base_dir) == os.path.abspath(self.base_dir) or self.last_saved_path is None:
             self.last_saved_path = path
         self.saved.emit(path)
         return path
+
+    def _point_arrays(self, n):
+        """Per-point live values (live_<magnitude>) and the echo 1 → echo 2 measure."""
+        d = self.data
+        out = {f'live_{name}': np.array([m.get(name, float('nan')) for m in d.magnitudes[:n]],
+                                        dtype=float).reshape(1, n)
+               for name in MAGNITUDES}
+        pairs = d.pairs[:n]
+        out['echo_delay_us'] = np.array(
+            [q.delay_samples / ACQ_FS * 1e6 if q is not None and q.found else float('nan')
+             for q in pairs], dtype=float).reshape(1, n)
+        out['echo_polarity'] = np.array([q.polarity if q is not None else 0 for q in pairs],
+                                        dtype=np.int8).reshape(1, n)
+        return out
 
     def save_copy(self, base_dir):
         """'Save to another folder…': the same data, written again under base_dir."""
@@ -1216,6 +1380,26 @@ class ScanGroup(QGroupBox):
         form.addRow('Averages (scan):', self._spin_avg)
         form.addRow('Map:', self._cmb_mag)
 
+        self._chk_thick = QCheckBox('Thickness per point (echo 1 → echo 2)')
+        self._chk_thick.setChecked(True)
+        self._chk_thick.setToolTip('Cross-correlation of the front and back echoes, both inside '
+                                   'Smin–Smax. Immune to the drift of the sample. Checked at '
+                                   'Start: if the second echo is not inside the window it is '
+                                   'disabled for the scan.')
+        self._spin_csample = dspin(500.0, 5000.0, DEFAULT_C_SAMPLE, 0, 10.0, ' m/s')
+        self._spin_csample.setToolTip('NOMINAL sound speed of the sample, for the thickness in mm '
+                                      'of the live map only. The delay is what is saved and '
+                                      'analysed.')
+        self._spin_mincorr = dspin(0.0, 1.0, DEFAULT_MIN_CORR, 2, 0.05, '')
+        self._spin_mincorr.setToolTip('Echo 1 / echo 2 correlation below this marks the point as '
+                                      'less reliable (deformed echo: inclined face).')
+        self._lbl_thick = QLabel('')
+        self._lbl_thick.setWordWrap(True)
+        form.addRow(self._chk_thick)
+        form.addRow('Sample sound speed:', self._spin_csample)
+        form.addRow('Min. correlation:', self._spin_mincorr)
+        form.addRow(self._lbl_thick)
+
         self._chk_refs = QCheckBox('Take water references at the start and at the end')
         self._spin_rg1 = dspin(0.0, 100.0, 0.0, 1, 1.0, ' dB')
         self._spin_rg2 = dspin(0.0, 100.0, 0.0, 1, 1.0, ' dB')
@@ -1310,6 +1494,8 @@ class ScanGroup(QGroupBox):
         tool.warning.connect(self._lbl_warn.setText)
         tool.state_changed.connect(self._on_state)
         tool.drift.connect(self._on_drift)
+        tool.thickness_available.connect(self._on_thickness_available)
+        self._chk_thick.toggled.connect(lambda on: self._on_thickness_available(on, '', False))
         sequencer.state_changed.connect(lambda st: self._on_state(tool.state, st))
         for w in (self._spin_start, self._spin_end, self._spin_step, self._spin_settle,
                   self._spin_avg, self._spin_ravg):
@@ -1366,7 +1552,8 @@ class ScanGroup(QGroupBox):
             drift_tol_db=self._spin_drift_db.value(), drift_tol_ns=self._spin_drift_ns.value(),
             surface=self._chk_surface.isChecked(), start2=self._spin_start2.value(),
             end2=self._spin_end2.value(), step2=self._spin_step2.value(),
-            path=self._cmb_path.currentData())
+            path=self._cmb_path.currentData(), thickness=self._chk_thick.isChecked(),
+            c_sample=self._spin_csample.value(), min_corr=self._spin_mincorr.value())
 
     def _refresh_estimate(self, *_):
         _, text, long_ = self._tool.estimate(self.params())
@@ -1394,6 +1581,20 @@ class ScanGroup(QGroupBox):
             self._tool.resume()
         else:
             self._tool.pause()
+
+    def _on_thickness_available(self, on, reason, at_start=True):
+        """Offer the thickness magnitudes only when they can be measured."""
+        model = self._cmb_mag.model()
+        for i in range(self._cmb_mag.count()):
+            if self._cmb_mag.itemData(i) in THICKNESS_MAGNITUDES:
+                model.item(i).setEnabled(bool(on))
+        if not on and self._cmb_mag.currentData() in THICKNESS_MAGNITUDES:
+            self._cmb_mag.setCurrentIndex(self._cmb_mag.findData('amplitude'))
+        if at_start:
+            self._lbl_thick.setText('' if on else f'Thickness not available: {reason}.')
+            self._lbl_thick.setStyleSheet('' if on else 'color: rgb(200, 40, 40);')
+        else:
+            self._lbl_thick.setText('')
 
     def _on_drift(self, drift):
         self._lbl_drift.setText('\n'.join(drift_lines(drift)))

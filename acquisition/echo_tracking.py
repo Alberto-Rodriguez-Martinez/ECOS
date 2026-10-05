@@ -26,6 +26,11 @@ FrontEchoTracker, one measure per point, always inside Smin–Smax:
       their stored envelopes, predicting backwards. A peak pinned on the left
       edge of the window (e.g. the tail of the main bang) never triggers it.
 
+echo_pair_delay (scan, phase 6): time from the front echo to the next one (the
+back face) by cross-correlation of a gate around each, the thickness of the
+sample. Echo 2 is the first clear lobe after echo 1 (echo_lobes, the same rule
+as the first-peak rule), never searched outside Smin–Smax.
+
 The positions passed to measure() are beam-axis positions. For moves along
 lateral or Z (flatness), pass the unchanged beam-axis coordinate: the
 prediction is then t_prev and the band has to absorb the shift due to the
@@ -43,7 +48,7 @@ import numpy as np
 _TOOLS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'tools')
 if _TOOLS_DIR not in sys.path:
     sys.path.append(_TOOLS_DIR)
-from ECOS_US_ToolBox import Envelope  # noqa: E402
+from ECOS_US_ToolBox import CalcToFAscanCosine_XCRFFT, Envelope  # noqa: E402
 
 DEFAULT_EDGE_MARGIN = 0.05     # fraction of the window width
 SATURATION_LEVEL = 0.49        # |amplitude| in ecos_gui units (full scale ±0.5)
@@ -153,6 +158,57 @@ def echo_lobes(env, threshold):
     if above[-1]:
         ends.append(len(above))
     return [(int(s), int(e), int(s + np.argmax(env[s:e]))) for s, e in zip(starts, ends)]
+
+
+@dataclass
+class EchoDelay:
+    """Echo 1 (front face) → echo 2 (back face) of one pulse-echo record."""
+    found: bool
+    reason: str = ''              # when not found: 'front_gate', 'no_back' or 'back_at_edge'
+    front: int = -1               # absolute sample of echo 1 (the tracked envelope peak)
+    back: int = -1                # absolute sample of echo 2 (envelope peak)
+    delay_samples: float = float('nan')   # echo 2 − echo 1, cross-correlation, sub-sample
+    corr: float = float('nan')    # |normalized correlation| of the aligned gates (1 = same shape)
+    polarity: int = 0             # +1 same sign as echo 1, −1 inverted (PVA back face in water)
+
+
+def echo_pair_delay(seg, env, front_k, half, threshold=DEFAULT_THRESHOLD,
+                    edge_margin=DEFAULT_EDGE_MARGIN, smin=0):
+    """
+    Delay from echo 1 (relative index front_k of seg, the tracked front echo) to
+    echo 2, the first clear lobe of the envelope after echo 1 whose gate does not
+    overlap echo 1's (peak more than 2·half samples later). Both gates are
+    ±half samples around the envelope peaks; the delay is (k2 − k1) plus the
+    cross-correlation shift of gate 2 against gate 1 (CalcToFAscanCosine_XCRFFT,
+    the ECOS estimator: it takes the largest |xcorr|, so an inverted echo 2 is
+    measured as well and reported by `polarity`). corr is the normalized
+    correlation of the aligned gates: it drops where the echo deforms (an
+    inclined face), a quality indicator of the point.
+    Not found when gate 1 does not fit in the window ('front_gate'), there is no
+    clear echo after echo 1 ('no_back': echo 2 beyond Smax, or no back face), or
+    gate 2 reaches the edge margin of the window ('back_at_edge'): no number is
+    given rather than one measured against the edge.
+    """
+    n = len(seg)
+    k1, half = int(front_k), max(1, int(half))
+    if k1 - half < 0 or k1 + half >= n:
+        return EchoDelay(False, 'front_gate', front=smin + k1)
+    margin = max(1, int(round(edge_margin * n)))
+    lobes = echo_lobes(env, echo_threshold(env, threshold))
+    front_end = next((e for s, e, _ in lobes if s <= k1 < e), k1)
+    later = [pk for s, e, pk in lobes if s >= front_end and pk > k1 + 2 * half]
+    if not later:
+        return EchoDelay(False, 'no_back', front=smin + k1)
+    k2 = later[0]
+    if k2 + half >= n - margin or k2 - half < 0:
+        return EchoDelay(False, 'back_at_edge', front=smin + k1, back=smin + k2)
+    g1 = np.asarray(seg[k1 - half:k1 + half + 1], dtype=float)
+    g2 = np.asarray(seg[k2 - half:k2 + half + 1], dtype=float)
+    shift, _, aligned = CalcToFAscanCosine_XCRFFT(g2, g1)
+    norm = float(np.linalg.norm(g1) * np.linalg.norm(g2))
+    rho = float(np.dot(np.real(aligned[:len(g1)]), g1)) / norm if norm > 0 else 0.0
+    return EchoDelay(True, '', smin + k1, smin + k2, float(k2 - k1 + shift),
+                     min(abs(rho), 1.0), 1 if rho >= 0 else -1)
 
 
 class FrontEchoTracker:
