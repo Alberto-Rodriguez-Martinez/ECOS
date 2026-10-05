@@ -288,6 +288,21 @@ class TestFlatnessToolQt(unittest.TestCase):
         self.assertNotIn(' R ', final)
         self.assertTrue(self.live['on'])
 
+    def test_debug_dump_measurement_parameters(self):
+        tool = FlatnessTool(self.seq, self.panel, lambda: tf.WIDE, pg.PlotWidget(),
+                            dump_dir=self.dump_dir, gains_fn=lambda: (65.0, 35.0),
+                            temp_fn=lambda: {'T1': 24.5, 'T2': 24.7, 'time': 1.0, 'source': 'PT100'})
+        tool.done.connect(self.results.append)
+        self.assertIsNone(tool.run(**dict(self.params, avg_n=3, settle_ms=4)))
+        loop = QEventLoop()
+        tool.done.connect(loop.quit)
+        QTimer.singleShot(30000, loop.quit)
+        loop.exec_()
+        meta = json.loads(str(np.load(tool.last_dump_path)['meta_json']))
+        self.assertEqual((meta['settle_ms'], meta['avg_n']), (4, 3))
+        self.assertEqual((meta['gain_ch1_db'], meta['gain_ch2_db']), (65.0, 35.0))
+        self.assertEqual(meta['temperature']['T2'], 24.7)
+
     def test_debug_dump_holds_both_lines(self):
         """Point 6: both lines with their ToF (and the return point)."""
         self.assertIsNone(self.tool.run(**self.params))

@@ -841,6 +841,31 @@ class TestFocusToolQt(unittest.TestCase):
         self.assertTrue(set(d['mode']) <= {'first', 'tracked', 'relock', 'none'})
         self.assertTrue(np.all(d['smin'] == smin) and np.all(d['smax'] == smax))
 
+    def test_debug_dump_measurement_parameters(self):
+        """Settle, averages, both gains and the temperature in meta_json (to compare dumps)."""
+        tool = FocusTool(self.seq, self.panel, lambda: WIDE, pg.PlotWidget(),
+                         dump_dir=self.dump_dir, gains_fn=lambda: (65.0, 35.0),
+                         temp_fn=lambda: {'T1': 24.5, 'T2': 24.7, 'time': 1.0, 'source': 'PT100'})
+        done = []
+        tool.done.connect(done.append)
+        self.assertIsNone(tool.run(5.0, 1.0, avg_n=3, settle_ms=7))
+        loop = QEventLoop()
+        tool.done.connect(loop.quit)
+        QTimer.singleShot(20000, loop.quit)
+        loop.exec_()
+        meta = json.loads(str(np.load(tool.last_dump_path)['meta_json']))
+        self.assertEqual((meta['settle_ms'], meta['avg_n']), (7, 3))
+        self.assertEqual((meta['gain_ch1_db'], meta['gain_ch2_db']), (65.0, 35.0))
+        self.assertEqual(meta['temperature']['T1'], 24.5)
+        # without the host functions the keys are there, with null values
+        meta0 = None
+        self.tool.run(5.0, 1.0, avg_n=2, settle_ms=0)
+        self.wait_done()
+        meta0 = json.loads(str(np.load(self.tool.last_dump_path)['meta_json']))
+        self.assertIsNone(meta0['gain_ch1_db'])
+        self.assertIsNone(meta0['temperature'])
+        self.assertEqual(meta0['settle_ms'], 0)
+
     def test_debug_dump_full_run(self):
         self.assertIsNone(self.tool.run(5.0, 1.0, 0.2, avg_n=2, settle_ms=0))
         self.wait_done()

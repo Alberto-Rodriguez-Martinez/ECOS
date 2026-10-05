@@ -71,7 +71,7 @@ from echo_tracking import (
 )
 from focus_tool import (
     DEFAULT_EMISSION_SAMPLE, MOVE_MM_S, POSITION_DECIMALS, FocusDebugDump, acq_time,
-    format_duration, point_flags, resolve_cw, sweep_positions,
+    format_duration, host_value, measurement_meta, point_flags, resolve_cw, sweep_positions,
 )
 from scan_sequencer import DEFAULT_AVG_N, DEFAULT_SETTLE_MS
 
@@ -472,7 +472,8 @@ class FlatnessTool(QObject):
     done = pyqtSignal(bool)
 
     def __init__(self, sequencer, panel, window_fn, plot_widget, show_plot_fn=None,
-                 cw_fn=None, dump_dir=None, acq_time_fn=None, parent=None):
+                 cw_fn=None, dump_dir=None, acq_time_fn=None, gains_fn=None, temp_fn=None,
+                 parent=None):
         """Same collaborators as focus_tool.FocusTool (c_w from the PT100s, GetAScan timing)."""
         super().__init__(parent)
         self._seq = sequencer
@@ -482,6 +483,8 @@ class FlatnessTool(QObject):
         self._show_plot = show_plot_fn
         self._cw_fn = cw_fn
         self._acq_time_fn = acq_time_fn
+        self._gains_fn = gains_fn        # () -> (g1, g2) [dB], debug-dump metadata only
+        self._temp_fn = temp_fn          # () -> latest PT100 reading dict or None, idem
         self._dump_dir = dump_dir or DEFAULT_DUMP_DIR
         self._phase = None
         self._dump = None
@@ -560,10 +563,12 @@ class FlatnessTool(QObject):
             tool='flatness', started=time.strftime('%Y-%m-%dT%H:%M:%S'), beam_axis=beam,
             lateral_axis=lat, beam_x=plan.beam_x, centers=plan.centers, smin=smin, smax=smax,
             lat_half_mm=lat_half, lat_step_mm=lat_step, z_half_mm=z_half, z_step_mm=z_step,
-            avg_n=avg_n, settle_ms=settle_ms, tolerance_deg=tolerance_deg,
+            tolerance_deg=tolerance_deg,
             edge_margin=edge_margin, band_us=band_us, band_samples=plan.band,
             threshold=threshold, c_w=c_w, cw_source=cw_source, emission_sample=emission_sample,
             fs=ACQ_FS, pe_channel=PE_CHANNEL, notices=plan.notices,
+            **measurement_meta(settle_ms, avg_n, host_value(self._gains_fn),
+                               host_value(self._temp_fn)),
         ), prefix='flatness_debug') if debug_dump else None
         self._plot.reset(lat)
         for text in plan.notices:

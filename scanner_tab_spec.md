@@ -300,6 +300,8 @@ En `acquisition/scan_tool.py` (`ScanTool`, `ScanGroup`). Reutiliza el secuenciad
 
 **Volcado de depuración** opcional (desactivado por defecto: guarda registros completos), en `data/scan_debug/`.
 
+**Parámetros de medida en los volcados** (foco, planitud y barrido, 05/10): los tres escriben en `meta_json`, con las mismas claves, `settle_ms`, `avg_n`, `gain_ch1_db`, `gain_ch2_db` y `temperature`. Este último es un diccionario con `T1`, `T2`, `time` y `source` de la última lectura real de los PT100, o `null` si no la hay; las temperaturas supuestas o manuales no cuentan. Así se pueden comparar volcados entre sí sin deducir por la hora del archivo con qué se midió cada uno. En el foco y la planitud la temperatura es la leída al lanzar la herramienta; en el barrido, la lectura de inicio.
+
 ## 6. Seguridad
 
 - `SN` (`unlimitedDiffMove*`) solo se usa en el **modo de movimiento libre**, activado explícitamente por el usuario con confirmación y con aviso visible en pantalla. Nunca en foco, planitud ni barridos.

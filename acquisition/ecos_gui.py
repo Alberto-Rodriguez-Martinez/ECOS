@@ -1078,6 +1078,7 @@ class EcosGUI(QMainWindow):
             cw = self._approx_cw(T)
             self._state.T1 = self._state.T2 = T
             self._state.Cw1 = self._state.Cw2 = self._state.Cw_mean = cw
+            self._temp_note = None        # assumed, not read: not reported as a reading
             self._update_temp_label()
             return True
 
@@ -1095,6 +1096,7 @@ class EcosGUI(QMainWindow):
             self._state.T1, self._state.T2   = T1, T2
             self._state.Cw1, self._state.Cw2 = Cw1, Cw2
             self._state.Cw_mean = (Cw1 + Cw2) / 2.0
+            self._note_temperature("PT100 (Acquisition tab)")
             self._update_temp_label()
             return True
         except Exception as e:
@@ -1124,6 +1126,7 @@ class EcosGUI(QMainWindow):
         cw = self._approx_cw(T)
         self._state.T1 = self._state.T2 = T
         self._state.Cw1 = self._state.Cw2 = self._state.Cw_mean = cw
+        self._temp_note = None            # manual, not read: not reported as a reading
         self._lbl_temp.setText(f"Manual: T = {T:.1f} °C   Cw = {cw:.1f} m/s")
         return True
 
@@ -1263,6 +1266,7 @@ class EcosGUI(QMainWindow):
         self._focus_tool = FocusTool(seq, panel, self._get_smin_smax, self._plot_scan,
                                      show_plot_fn=self._show_scanner_plot,
                                      cw_fn=self._scanner_water_cw,
+                                     gains_fn=self._scan_gains, temp_fn=self._latest_temperature,
                                      acq_time_fn=lambda: getattr(self, '_t_ascan', None),
                                      parent=self)
         panel.add_tool_widget(FocusGroup(self._focus_tool, seq, self._get_smin_smax),
@@ -1276,6 +1280,8 @@ class EcosGUI(QMainWindow):
         self._flatness_tool = FlatnessTool(seq, panel, self._get_smin_smax, self._plot_scan,
                                            show_plot_fn=self._show_scanner_plot,
                                            cw_fn=self._scanner_water_cw,
+                                           gains_fn=self._scan_gains,
+                                           temp_fn=self._latest_temperature,
                                            acq_time_fn=lambda: getattr(self, '_t_ascan', None),
                                            parent=self)
         panel.add_tool_widget(FlatnessGroup(self._flatness_tool, seq), tab='calibration')
@@ -1387,6 +1393,7 @@ class EcosGUI(QMainWindow):
                 st.T1, st.T2 = T1, T2
                 st.Cw1, st.Cw2 = water_temp2sos(T1), water_temp2sos(T2)
                 st.Cw_mean = (st.Cw1 + st.Cw2) / 2.0
+                self._note_temperature("PT100 (scanner tool start)")
                 self._update_temp_label()
                 return st.Cw_mean, f"PT100 T1 = {T1:.2f} °C, T2 = {T2:.2f} °C"
             except Exception as e:
@@ -1424,6 +1431,19 @@ class EcosGUI(QMainWindow):
             self._timer.stop()
         elif not self._sequencer.active:
             self._timer.start(REALTIME_INTERVAL)
+
+    def _note_temperature(self, source):
+        """Remember when and where the state temperatures were last read (debug dumps)."""
+        self._temp_note = {"time": time.time(), "source": source}
+
+    def _latest_temperature(self):
+        """The latest PT100 reading, with its time and source, or None. Only real readings
+        count: the assumed (no hardware) or manual values are not noted."""
+        note = getattr(self, "_temp_note", None)
+        st = self._state
+        if note is None or (st.T1 is None and st.T2 is None):
+            return None
+        return dict(note, T1=st.T1, T2=st.T2)
 
     def _scanner_cw_no_read(self):
         """c_w without opening the Arduino (the scan holds its only instance)."""

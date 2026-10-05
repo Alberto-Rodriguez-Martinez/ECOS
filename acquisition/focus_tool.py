@@ -221,6 +221,27 @@ def format_duration(seconds):
     return f'{h} h {m:02d} min'
 
 
+def measurement_meta(settle_ms, avg_n, gains=None, temperature=None):
+    """
+    The measurement parameters every debug dump writes into meta_json, with the
+    same keys in the three tools (focus, flatness, scan), so dumps can be compared
+    with each other: settle_ms, avg_n, gain_ch1_db, gain_ch2_db and temperature
+    ({'T1', 'T2', 'time', 'source'} of the reading available at that moment, or None).
+    gains: (g1, g2) or None (unknown).
+    """
+    g1, g2 = (None, None) if gains is None else (float(gains[0]), float(gains[1]))
+    return {'settle_ms': int(settle_ms), 'avg_n': int(avg_n),
+            'gain_ch1_db': g1, 'gain_ch2_db': g2, 'temperature': temperature}
+
+
+def host_value(fn):
+    """fn() or None when the host gave no fn or it failed (metadata only)."""
+    try:
+        return fn() if fn is not None else None
+    except Exception:
+        return None
+
+
 def resolve_cw(cw_fn):
     """
     (c_w, source) from the host's cw_fn: () -> (c_w, source text) from the
@@ -787,7 +808,8 @@ class FocusTool(QObject):
     done = pyqtSignal(bool)
 
     def __init__(self, sequencer, panel, window_fn, plot_widget, show_plot_fn=None,
-                 cw_fn=None, dump_dir=None, acq_time_fn=None, parent=None):
+                 cw_fn=None, dump_dir=None, acq_time_fn=None, gains_fn=None, temp_fn=None,
+                 parent=None):
         """
         sequencer     ScanSequencer (phase 2), used as is
         panel         ScannerPanel (role_axis, pe_side, current_coords, axis_limit,
@@ -808,6 +830,8 @@ class FocusTool(QObject):
         self._show_plot = show_plot_fn
         self._cw_fn = cw_fn
         self._acq_time_fn = acq_time_fn
+        self._gains_fn = gains_fn        # () -> (g1, g2) [dB], debug-dump metadata only
+        self._temp_fn = temp_fn          # () -> latest PT100 reading dict or None, idem
         self._phase = None
         self.last_outcome = None
         self._dump_dir = dump_dir or DEFAULT_DUMP_DIR
@@ -895,11 +919,13 @@ class FocusTool(QObject):
         self._dump = FocusDebugDump(dict(
             started=time.strftime('%Y-%m-%dT%H:%M:%S'), beam_axis=axis,
             pe_side=self._panel.pe_side(), start_x=self._start_x, smin=smin, smax=smax,
-            half_range_mm=half_range, coarse_mm=coarse, fine_mm=fine, avg_n=avg_n,
-            settle_ms=settle_ms, edge_margin=edge_margin, band_us=band_us,
+            half_range_mm=half_range, coarse_mm=coarse, fine_mm=fine,
+            edge_margin=edge_margin, band_us=band_us,
             band_samples=plan.tracker.band, threshold=threshold, c_w=c_w,
             samples_per_mm=plan.samples_per_mm, fs=ACQ_FS, pe_channel=PE_CHANNEL,
             coarse_positions=plan.coarse_positions, notices=plan.notices,
+            **measurement_meta(settle_ms, avg_n, host_value(self._gains_fn),
+                               host_value(self._temp_fn)),
         )) if debug_dump else None
         self._plot.reset(axis)
         for text in plan.notices:

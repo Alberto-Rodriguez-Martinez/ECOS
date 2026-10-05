@@ -71,7 +71,7 @@ from ECOS_US_ToolBox import CalcToFAscanCosine_XCRFFT, Envelope
 from echo_tracking import CONFIDENT_CONTRAST
 from focus_tool import (
     DEFAULT_EMISSION_SAMPLE, MOVE_MM_S, POSITION_DECIMALS, FocusDebugDump, acq_time,
-    format_duration, resolve_cw,
+    format_duration, measurement_meta, resolve_cw,
 )
 
 _DB_DIR = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), '..',
@@ -626,7 +626,12 @@ class ScanTool(QObject):
         if self._lock_fn:
             self._lock_fn(True)
         self._open_temperature()
-        self._read_temperature('start', -1)
+        start_t = self._read_temperature('start', -1)
+        if self._dump is not None:
+            has_t = start_t['T1'] == start_t['T1'] or start_t['T2'] == start_t['T2']
+            self._dump.meta.update(measurement_meta(
+                params.settle_ms, params.avg_n, self._scan_gains,
+                dict(start_t, source='PT100, scan start') if has_t else None))
         self._resolve_cw()
         for text in plan.notices:
             self.warning.emit(text)

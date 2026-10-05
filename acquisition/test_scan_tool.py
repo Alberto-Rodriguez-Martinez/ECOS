@@ -451,6 +451,7 @@ class ScanHarness(unittest.TestCase):
                              'name_parts': {'pva': '10', 'additive': '5', 'sample_id': 'P3A',
                                             'cycles': '5'}},
             base_dir=self.base, lock_fn=self.locks.append, hold_live_fn=self.holds.append,
+            dump_dir=os.path.join(self.base, '_debug'),
             acq_time_fn=getattr(self, 'acq_time', None))
         self.statuses, self.warnings, self.dones, self.states = [], [], [], []
         self.tool.status.connect(self.statuses.append)
@@ -747,6 +748,26 @@ class TestWaterReferences(ScanHarness):
         self.assertEqual(self.worker.moves, [])
         self.assertEqual((self.sim.gain1, self.sim.gain2), self.scan_gains)
         self.assertEqual(os.listdir(self.base), [])
+
+
+class TestScanDebugDump(ScanHarness):
+
+    def test_measurement_parameters_in_meta(self):
+        """Settle, averages, both gains and the start temperature in meta_json."""
+        for temp in (True, False):
+            with self.subTest(pt100=temp):
+                self.make(temp=temp)
+                self.assertIsNone(self.tool.start(ScanParams(start=-1, end=1, step=1, settle_ms=3,
+                                                             avg_n=2, debug_dump=True)))
+                self.wait(lambda: self.dones)
+                meta = json.loads(str(np.load(self.tool.last_dump_path)['meta_json']))
+                self.assertEqual((meta['settle_ms'], meta['avg_n']), (3, 2))
+                self.assertEqual((meta['gain_ch1_db'], meta['gain_ch2_db']), (65.0, 35.0))
+                if temp:
+                    self.assertEqual((meta['temperature']['T1'], meta['temperature']['T2']),
+                                     (24.5, 24.7))
+                else:
+                    self.assertIsNone(meta['temperature'])
 
 
 class TestDriftOnScreen(ScanHarness):
