@@ -13,6 +13,9 @@ from datetime import datetime
 import numpy as np
 import matplotlib.pyplot as plt
 
+from scan_counts import (ADC_BITS_DEFAULT, counts_to_float, counts_to_float_rows,
+                         quantizer, sum_dtype)
+
 DEFAULT_OPERATOR = "Sebas"      # save_experiment_raw_32 still writes it fixed
 
 
@@ -93,8 +96,22 @@ def save_experiment_raw_32(
                         Signal_Ref=np.asarray(Signal_Ref, dtype=np.float64))
     return str(d)
 
-SCAN_SCHEMA_VERSION = "scan-32-1.0"
-_SCAN_REF_FIELDS = ("ch1", "ch2", "gains", "coords", "time", "T1", "T2", "avg_n")
+SCAN_SCHEMA_VERSION = "scan-32-2.0"
+# 2.0 (2026-10): signals stored as integer sums of counts + conversion metadata.
+# 1.0 (float32 signals) is not readable any more: no real scan was ever saved with it.
+_SCAN_REF_FIELDS = ("sum1", "sum2", "offset1", "offset2", "avg_n", "gains", "coords",
+                    "time", "T1", "T2")
+
+
+def _check_sums(name, arr, n_avg, bits):
+    a = np.asarray(arr)
+    if not np.issubdtype(a.dtype, np.integer):
+        raise ValueError("%s must be integer sums of counts, got %s" % (name, a.dtype))
+    _, mid = quantizer(bits)
+    if a.size and int(np.max(np.abs(a.astype(np.int64)))) > mid * int(n_avg):
+        raise ValueError("%s exceeds midpoint·n_avg = %d: not a sum of %d captures of %d bits"
+                         % (name, mid * int(n_avg), int(n_avg), int(bits)))
+    return a.astype(sum_dtype(n_avg, bits))
 
 
 def save_scan_raw_32(
@@ -105,12 +122,17 @@ def save_scan_raw_32(
     equipment2,         # dict: Arduino / PT100
     scanner_session,    # dict from ScannerPanel.session_dict() (JSON-serialisable)
     scan,               # dict: scan parameters (type, axis, range, step, settle, averages...)
-    signals_ch1,        # array (N_line, N_point, N_samples)
-    signals_ch2,        # array (N_line, N_point, N_samples)
-    coords,             # array (N_line, N_point, 4): real X, Y, Z, R read back from the scanner
-    point_time,         # array (N_line, N_point): epoch seconds of each acquisition
+    signals_ch1,        # int (N_line, N_point, N_samples): Σ(raw − midpoint) over n_avg captures
+    signals_ch2,        # int (N_line, N_point, N_samples)
+    offsets_ch1,        # float (N_line, N_point): whole-record mean removed (scan_counts)
+    offsets_ch2,        # float (N_line, N_point)
+    n_avg,              # captures summed per point
+    gains,              # (gain_ch1, gain_ch2) [dB] of the scan
+    coords,             # (N_line, N_point, 4): real X, Y, Z, R read back from the scanner
+    point_time,         # (N_line, N_point): epoch seconds of each acquisition
     temperatures,       # list of {label, point, time, T1, T2} (NaN when no PT100)
     references=None,    # {'initial': {...}, 'final': {...}}, each with _SCAN_REF_FIELDS
+    adc_bits=ADC_BITS_DEFAULT,
     operator=DEFAULT_OPERATOR,
     comment="",
     base_dir="data_32",
@@ -119,28 +141,35 @@ def save_scan_raw_32(
 ):
     """
     Raw data of a scan (line or surface), one folder per scan:
-        <exp_name>/meta.json   schema "scan-32-1.0": experiment (id, timestamps,
+        <exp_name>/meta.json   schema scan-32-2.0: experiment (id, timestamps,
                                operator), specimen, protocol, equipment, scanner_session,
-                               scan, comment, and the description of scan.npz
-        <exp_name>/scan.npz    signals per channel (N_line × N_point × N_samples),
-                               real coordinates, times, temperatures and references
-    No results.json: results are computed later, in the analysis.
-    save_experiment_raw_32 only takes three 1D signals; this one takes the cubes.
-    Its metadata scheme is reused (specimen, protocol, equipment, experiment), not
-    its signature. Returns the folder path.
+                               scan, conversion, comment, and the description of scan.npz
+        <exp_name>/scan.npz    (compressed) integer signals per channel
+                               (N_line × N_point × N_samples) and their offsets, real
+                               coordinates, times, temperatures and water references
+    The signals are the integer sums of counts of the averaged captures, int16 when
+    they fit and int32 otherwise (scan_counts.py): exact, about half the size of
+    float32, and nothing converted when writing. The conversion parameters (bits,
+    midpoint, full scale, averages, dtype, gain per channel) go into meta.json and
+    load_scan_raw_32 rebuilds the exact floats. No results.json.
     """
-    ch1 = np.asarray(signals_ch1)
-    ch2 = np.asarray(signals_ch2)
+    s1, s2 = np.asarray(signals_ch1), np.asarray(signals_ch2)
+    if s1.ndim != 3 or s2.shape != s1.shape:
+        raise ValueError("signals must be two arrays (N_line, N_point, N_samples) of equal shape, "
+                         "got %s and %s" % (s1.shape, s2.shape))
+    s1 = _check_sums("signals_ch1", s1, n_avg, adc_bits)
+    s2 = _check_sums("signals_ch2", s2, n_avg, adc_bits)
+    n_line, n_point, n_samp = s1.shape
+    o1 = np.asarray(offsets_ch1, dtype=np.float64)
+    o2 = np.asarray(offsets_ch2, dtype=np.float64)
     xyz = np.asarray(coords, dtype=np.float64)
     tpt = np.asarray(point_time, dtype=np.float64)
-    if ch1.ndim != 3 or ch2.shape != ch1.shape:
-        raise ValueError("signals must be two arrays (N_line, N_point, N_samples) of equal shape, "
-                         "got %s and %s" % (ch1.shape, ch2.shape))
-    n_line, n_point, n_samp = ch1.shape
-    if xyz.shape != (n_line, n_point, 4):
-        raise ValueError("coords must be (N_line, N_point, 4), got %s" % (xyz.shape,))
-    if tpt.shape != (n_line, n_point):
-        raise ValueError("point_time must be (N_line, N_point), got %s" % (tpt.shape,))
+    for name, arr, shape in (("offsets_ch1", o1, (n_line, n_point)),
+                             ("offsets_ch2", o2, (n_line, n_point)),
+                             ("coords", xyz, (n_line, n_point, 4)),
+                             ("point_time", tpt, (n_line, n_point))):
+        if arr.shape != shape:
+            raise ValueError("%s must be %s, got %s" % (name, shape, arr.shape))
     params = equipment1.get("params", {})
     smin, smax = int(params["Smin"]), int(params["Smax"])
     if n_samp != smax - smin:
@@ -153,9 +182,15 @@ def save_scan_raw_32(
         raise FileExistsError(f"{d} already exists and is not empty")
     d.mkdir(parents=True, exist_ok=True)
 
+    full, mid = quantizer(adc_bits)
+
+    def conversion(n, g, dtype):
+        return {"quantizer_bits": int(adc_bits), "quantizer_midpoint": mid,
+                "full_scale_counts": full, "n_avg": int(n), "dtype": np.dtype(dtype).name,
+                "gain_db": {"ch1": float(g[0]), "ch2": float(g[1])}}
+
     arrays = {
-        "signals_ch1": ch1.astype(np.float32),
-        "signals_ch2": ch2.astype(np.float32),
+        "signals_ch1": s1, "signals_ch2": s2, "offsets_ch1": o1, "offsets_ch2": o2,
         "coords": xyz,
         "coord_axes": np.array(["X", "Y", "Z", "R"]),
         "point_time": tpt,
@@ -165,29 +200,37 @@ def save_scan_raw_32(
         "temp_T1": np.array([float(t["T1"]) for t in temperatures], dtype=np.float64),
         "temp_T2": np.array([float(t["T2"]) for t in temperatures], dtype=np.float64),
     }
-    taken = []
+    taken, ref_conv = [], {}
     for which, ref in (references or {}).items():
         if ref is None:
             continue
         taken.append(which)
+        n_ref = int(ref["avg_n"])
         for key in _SCAN_REF_FIELDS:
             val = np.asarray(ref[key])
-            if key in ("ch1", "ch2"):
-                val = val.astype(np.float32)
+            if key in ("sum1", "sum2"):
+                val = _check_sums(f"reference {which} {key}", val, n_ref, adc_bits)
             arrays[f"ref_{which}_{key}"] = val
+        ref_conv[which] = conversion(n_ref, ref["gains"], sum_dtype(n_ref, adc_bits))
     for name, val in (extra_arrays or {}).items():
         arrays[name] = np.asarray(val)
 
     files = {
-        "signals_ch1/2": "float32 (N_line, N_point, N_samples): samples Smin..Smax-1 of "
-                         "each averaged record, ecos_gui units (full scale ±0.5)",
+        "signals_ch1/2": "%s (N_line, N_point, N_samples): sum over n_avg captures of "
+                         "(raw − midpoint), samples Smin..Smax-1" % s1.dtype.name,
+        "offsets_ch1/2": "float64 (N_line, N_point): mean over the whole record of "
+                         "sum/(full_scale·n_avg), removed as ECOS does",
+        "float": "x = signals / (full_scale_counts · n_avg) − offsets: the ECOS float "
+                 "(full scale ±0.5), rebuilt exactly by load_scan_raw_32; not gain-corrected",
         "coords": "float64 (N_line, N_point, 4): X, Y, Z [mm], R [deg] read back from the "
                   "scanner after each move (not the requested target)",
         "point_time": "float64 (N_line, N_point): epoch [s] of each acquisition",
         "temp_*": "one entry per reading: label, point (index of the last acquired point, "
                   "-1 before the first), time (epoch), T1, T2 [°C] (NaN without PT100)",
-        "ref_<initial|final>_*": "water references: ch1, ch2 (N_samples), gains (Ch1, Ch2), "
-                                 "coords (X, Y, Z, R), time, T1, T2, avg_n",
+        "ref_<initial|final>_*": "water references: sum1, sum2 (N_samples, integer sums), "
+                                 "offset1, offset2, avg_n, gains (Ch1, Ch2), coords "
+                                 "(X, Y, Z, R), time, T1, T2; conversion in "
+                                 "conversion.references",
     }
     meta = {
         "schema_version": SCAN_SCHEMA_VERSION,
@@ -199,6 +242,11 @@ def save_scan_raw_32(
         "equipment": {"device_1_ultrasound": equipment1, "device_2_aux": equipment2},
         "scanner_session": scanner_session,
         "scan": dict(scan, shape=[n_line, n_point, n_samp], references_taken=taken),
+        "conversion": dict(conversion(n_avg, gains, s1.dtype),
+                           formula="x = signals / (full_scale_counts * n_avg) - offsets",
+                           adc_bits_note="10 bits assumed: the SeDaq resolution cannot be "
+                                         "read from the equipment",
+                           references=ref_conv),
         "comment": comment,
         "notes": "",
         "files": files,
@@ -210,11 +258,31 @@ def save_scan_raw_32(
 
 
 def load_scan_raw_32(exp_dir):
-    """meta (dict) and the arrays of scan.npz (dict of np.ndarray) of a scan folder."""
+    """
+    meta (dict) and the arrays of scan.npz (dict of np.ndarray) of a scan folder,
+    with the signals as the exact ECOS floats (float64):
+        signals_ch1/2, ref_<which>_ch1/2   floats rebuilt with the file's conversion
+        signals_ch1/2_sum, ref_<which>_sum1/2   the stored integer sums, as saved
+    """
     exp_dir = Path(exp_dir)
     meta = json.loads((exp_dir / "meta.json").read_text(encoding="utf-8"))
+    version = meta.get("schema_version")
+    if version != SCAN_SCHEMA_VERSION:
+        raise ValueError(f"{exp_dir}: schema {version!r} not supported (only "
+                         f"{SCAN_SCHEMA_VERSION}; float32 scans 1.0 are not readable)")
     with np.load(exp_dir / "scan.npz") as npz:
         data = {k: npz[k] for k in npz.files}
+    conv = meta["conversion"]
+    bits, n = conv["quantizer_bits"], conv["n_avg"]
+    for ch in ("ch1", "ch2"):
+        data[f"signals_{ch}_sum"] = data[f"signals_{ch}"]
+        data[f"signals_{ch}"] = counts_to_float_rows(data[f"signals_{ch}_sum"], n,
+                                                     data[f"offsets_{ch}"], bits)
+    for which, rc in conv.get("references", {}).items():
+        for k in ("1", "2"):
+            x, _ = counts_to_float(data[f"ref_{which}_sum{k}"], rc["n_avg"], rc["quantizer_bits"],
+                                   offset=float(data[f"ref_{which}_offset{k}"]))
+            data[f"ref_{which}_ch{k}"] = x
     return meta, data
 
 

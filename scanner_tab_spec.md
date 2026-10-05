@@ -1,6 +1,6 @@
 # Especificación: pestaña Escáner en ECOS
 
-Estado: aprobada. Fase 1 implementada y probada en hardware (21–24/09). Fase 3 (foco) cerrada tras las pruebas en hardware (30/09). Fases 4 (planitud) y 5 (barrido en línea, referencias en agua y guardado) implementadas y probadas con el SeDaq sintético, pendientes de prueba en hardware. Última revisión: 2026-10-05.
+Estado: aprobada. Fase 1 implementada y probada en hardware (21–24/09). Fase 3 (foco) cerrada tras las pruebas en hardware (30/09). Fases 4 (planitud) y 5 (barrido en línea, referencias en agua y guardado) implementadas y probadas con el SeDaq sintético, pendientes de prueba en hardware. Formato de barrido `scan-32-2.0` (señales enteras, task_scan_int16.md). Última revisión: 2026-10-05.
 
 ## 1. Contexto
 
@@ -189,7 +189,7 @@ Cada referencia (inicial y final) se guarda en el archivo del barrido con: seña
 ```
 PVA_10_PG_5_A_C005_SCAN_20260925_171200/
   meta.json    specimen, protocol, equipment (parámetros del pulser), bloque scanner_session,
-               parámetros del barrido, operator y comentario. schema_version: "scan-32-1.0"
+               parámetros del barrido, conversión, operator y comentario. schema_version: "scan-32-2.0"
   scan.npz     señales (N_línea × N_punto × N_muestras) por canal, coordenadas reales de cada
                punto, temperaturas con su marca de tiempo e índice, y las referencias en agua
                con su ganancia, posición, hora y temperatura
@@ -230,11 +230,22 @@ En `acquisition/scan_tool.py` (`ScanTool`, `ScanGroup`). Reutiliza el secuenciad
 **Temperatura:** una sola instancia de `Arduino` para toda la sesión. Se lee al empezar, en cada referencia y al terminar, con `point` = índice del último punto adquirido (−1 antes del primero). c_w sale de esas lecturas con `water_temp2sos`. Sin PT100: NaN, aviso y nunca un diálogo.
 
 **Guardado**
-- `BD_Experimentos_PVA.save_scan_raw_32` / `load_scan_raw_32`, esquema `scan-32-1.0`, carpeta `database/PVA_..._SCAN_<ts>/` con `meta.json` + `scan.npz`. Señales en float32 (N_línea × N_punto × N_muestras); coordenadas reales; tiempos; temperaturas (`temp_label`, `temp_point`, `temp_time`, `temp_T1`, `temp_T2`); referencias `ref_<initial|final>_{ch1, ch2, gains, coords, time, T1, T2, avg_n}`.
+- `BD_Experimentos_PVA.save_scan_raw_32` / `load_scan_raw_32`, esquema **`scan-32-2.0`**, carpeta `database/PVA_..._SCAN_<ts>/` con `meta.json` + `scan.npz` (comprimido). Contenido: coordenadas reales, tiempos, temperaturas (`temp_label`, `temp_point`, `temp_time`, `temp_T1`, `temp_T2`) y referencias `ref_<initial|final>_{sum1, sum2, offset1, offset2, avg_n, gains, coords, time, T1, T2}`.
+- **Señales en enteros** (desde `scan-32-2.0`, 2026-10-05; `database/scan_counts.py`):
+  - Lo que se mide en cada punto es la media de N capturas, cada una con su media del registro restada, como hace ECOS. Esa media no es un entero: el promediado da resolución por debajo del bit menos significativo, y eso es información real. Por eso no se guarda la media redondeada a cuentas, sino la **suma entera** de (cuenta − punto medio) de las N capturas, más un **desplazamiento por punto y canal**. El desplazamiento es la media del registro completo, que no se puede recalcular porque solo se guarda la ventana.
+  - El flotante de ECOS es `x = suma / (fondo_escala · N) − desplazamiento`. Lo calcula la misma función (`counts_to_float`) al medir (`ecos_gui._seq_acquire`, que adquiere por sumas) y al leer, así que la lectura lo reconstruye **bit a bit**.
+  - Tipo: int16 si |suma| ≤ punto medio · N cabe (N ≤ 63 a 10 bits; los 20 promedios del barrido), int32 si no (las referencias con 100). El número de promedios nunca lo limita el formato.
+  - Motivo: es exacto, no convierte nada al escribir y sin comprimir ocupa la mitad que float32. Comprimido, en un barrido simulado de 41 puntos × 3500 muestras × 2 canales: 0,34 MB frente a 0,52 MB en float32 (0,65×), porque deflate también reduce los float32. Sin comprimir: 0,57 MB frente a 1,15 MB.
+  - `meta.json["conversion"]`: bits, punto medio, fondo de escala, N, tipo y **ganancia por canal**, más un bloque igual para cada referencia, con sus propios N y ganancias. La ganancia queda registrada pero no entra en la conversión: el flotante de ECOS es la señal a la salida del receptor, sin compensar la ganancia, como en el resto de ECOS.
+  - `load_scan_raw_32` devuelve los flotantes con las mismas claves (`signals_ch1/2`, `ref_<x>_ch1/2`) y las sumas aparte (`*_sum`).
+  - **Sin compatibilidad hacia atrás**: `scan-32-1.0` (float32) no se lee, porque no llegó a existir ningún barrido real en ese formato.
+- **Resolución del ADC: supuesta.** El SeDaq no permite leerla: la DLL entrega búferes `uint16` y no hay función que la informe. Se suponen 10 bits (punto medio 512, fondo de escala 1024), el valor que ECOS usaba fijo. Es un parámetro (`ADC_BITS` en `ecos_gui.py`, `ADC_BITS_DEFAULT` en `scan_counts.py`) y queda escrito en cada barrido. `density_gui` y `pulser_gui` la dejan elegir al usuario, también con 10 bits por defecto.
 - El nombre lo construye `experiment_name` (compartido; Compute & Save sigue dando el mismo nombre US).
 - `operator` es editable, con «Sebas» por defecto.
 - «Guardar en otra carpeta…» escribe una copia.
 - `analysis/ecos_loader.py` reconoce `SCAN`: `load_scan`, `scan_database` y `build_scan_catalog`. `build_catalog` sigue siendo US + DENS, porque un barrido no tiene resultados que fusionar hasta analizarlo.
+
+**Deriva entre referencias:** con las dos referencias tomadas, la final se compara con la inicial en cada canal. Se calcula la diferencia de amplitud (máximo de la envolvente, en dB) y la de tiempo de vuelo (correlación cruzada, `CalcToFAscanCosine_XCRFFT`, en ns; positiva si la final llega más tarde). Un canal sin señal clara en las dos referencias no se compara y se dice. El resultado se muestra en pantalla (en verde o rojo), se guarda en `meta.json["scan"]["reference_drift"]` y avisa si supera los umbrales configurables, por defecto 0,5 dB y 20 ns; 20 ns es del orden de 0,1 °C de agua en 60 mm de camino. Es la medida de la deriva durante el barrido (temperatura, ganancia, acoplo) y dice si el barrido es fiable.
 
 **Volcado de depuración** opcional (desactivado por defecto: guarda registros completos), en `data/scan_debug/`.
 
@@ -264,10 +275,11 @@ Cada fase termina con prueba en hardware y commit.
 - **Origen del sesgo de +0,2 dB** entre barrido fino y grueso en la misma posición (sección 5.4).
 - Confirmar que `import ECOS_US_ToolBox` funciona en el Python de la máquina de adquisición (sección 3).
 - Estimador de tiempo de vuelo que se reutiliza de ECOS: `LongVelocity_Thickness` usa `CalcToFAscanCosine_XCRFFT`, que es el candidato.
-- `BITS_OPTIONS` en `ecos_gui.py` parece código muerto: el cuantizador está fijo a 1024 en `_update_plots` y `_acquire_ch_avg`. Aclararlo si el foco necesita conocer la resolución real del ADC.
+- **Resolución real del ADC**: no se puede leer del equipo y se suponen 10 bits (sección 5.6). Confirmarla con la documentación del SeDaq.
 - Relación entre el parámetro de velocidad y los mm/s de cada eje: calibrar si se necesita una velocidad concreta.
 
 ### Resueltos
+- `BITS_OPTIONS` en `ecos_gui.py` era código muerto: se ha sustituido por el parámetro `ADC_BITS` (10 bits supuestos), que usan `_update_plots`, `_acquire_avg` y la adquisición por sumas, y que se escribe en cada barrido (05/10).
 - Tiempo de asentamiento y número de promedios: medidos en el equipo real, 5000 ms y 100 (30/09). La duración de `GetAScan()` se cronometra en ejecución para el tiempo estimado.
 - Formato y ubicación del guardado de barridos: sección 5.6 (25/09).
 - Hilo del secuenciador: dirigido por eventos en el hilo de la GUI, sección 3 (25/09).

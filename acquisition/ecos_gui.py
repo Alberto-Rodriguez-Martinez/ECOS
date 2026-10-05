@@ -144,11 +144,14 @@ REALTIME_INTERVAL = 34       # ms (~30 fps)
 DEFAULT_COM       = "COM3"
 AVG_MAX_ATTEMPTS_FACTOR = 4  # captures tried per requested average before giving up
 
-BITS_OPTIONS = {
-    "8 bit":  256,
-    "10 bit": 1024,
-    "12 bit": 4096,
-}
+# ADC resolution of the SeDaq. It cannot be read from the equipment (SeDaqDLL
+# gives uint16 buffers and no query), so 10 bits is ASSUMED, as everywhere in
+# ECOS until now (density_gui / pulser_gui let the user pick it, default 10 bit).
+# It is a parameter: the quantizer midpoint and full scale come from it, and
+# every scan writes it into its metadata (database/scan_counts.py).
+from scan_counts import ADC_BITS_DEFAULT, counts_to_float  # noqa: E402
+ADC_BITS = ADC_BITS_DEFAULT
+ADC_FULL_SCALE = 2 ** ADC_BITS          # counts; midpoint = ADC_FULL_SCALE / 2
 
 DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'data')
 
@@ -823,7 +826,7 @@ class EcosGUI(QMainWindow):
         if not self._running or self._inspection_mode:
             return
         try:
-            quant = 1024
+            quant = ADC_FULL_SCALE
             self._timed_get_ascan()
             ch1 = self._raw_to_float(self._sedaq.DataADC1, self._reclen, quant)
             ch2 = self._raw_to_float(self._sedaq.DataADC2, self._reclen, quant)
@@ -1160,7 +1163,7 @@ class EcosGUI(QMainWindow):
         disconnected or failing every capture is all zeros, and an unbounded
         retry would hang the GUI thread with no message.
         """
-        quant = 1024
+        quant = ADC_FULL_SCALE
         reclen = self._reclen if reclen is None else reclen
         accs  = {ch: np.zeros(reclen) for ch in channels}
         n     = 0
@@ -1285,6 +1288,8 @@ class EcosGUI(QMainWindow):
             acquire_fn=self._seq_acquire,
             gains_fn=self._scan_gains,
             set_gains_fn=self._scan_set_gains,
+            counts_fn=self._last_counts_fn,
+            adc_bits=ADC_BITS,
             temp_factory=self._open_seq_arduino,
             sos_fn=water_temp2sos if _HW_AVAILABLE else self._approx_cw,
             cw_fn=self._scanner_cw_no_read,
@@ -1469,12 +1474,55 @@ class EcosGUI(QMainWindow):
         self._sedaq.set_scanner_state(coords, panel.role_axis('beam'), panel.pe_side())
 
     def _seq_acquire(self, avg_n):
-        """Acquisition step of a sequence: averaged Ch1/Ch2, drawn on the live plots."""
+        """
+        Acquisition step of a sequence (and of the water references): averaged
+        Ch1/Ch2, drawn on the live plots. Acquired as integer sums of counts
+        (_acquire_counts) and turned into the ECOS float with
+        scan_counts.counts_to_float, the same function that reads a saved scan,
+        so the scan files rebuild these floats bit for bit. Mathematically equal
+        to _acquire_avg (mean of the mean-removed captures). The sums of this
+        acquisition stay available through _last_counts_fn.
+        """
         reclen = self._sedaq.RecLen
-        ch1, ch2 = self._acquire_avg(avg_n, (1, 2), reclen)
+        s1, s2 = self._acquire_counts(avg_n, reclen)
+        ch1, o1 = counts_to_float(s1, avg_n, ADC_BITS)
+        ch2, o2 = counts_to_float(s2, avg_n, ADC_BITS)
+        self._last_counts = {'sum': (s1, s2), 'offset': (o1, o2), 'n': int(avg_n)}
         if reclen == self._reclen:
             self._plot_ascans(ch1, ch2)
         return ch1, ch2
+
+    def _last_counts_fn(self):
+        return getattr(self, '_last_counts', {'sum': (None, None), 'offset': (0.0, 0.0), 'n': 0})
+
+    def _acquire_counts(self, avg_n, reclen=None):
+        """
+        Integer sums over avg_n captures of (raw − midpoint), both channels, whole
+        record (int64). Same retry rule as _acquire_avg: a constant capture on any
+        channel (all zeros after the mean removal there) is discarded and retried,
+        up to AVG_MAX_ATTEMPTS_FACTOR * avg_n captures.
+        """
+        reclen = self._reclen if reclen is None else reclen
+        mid = ADC_FULL_SCALE // 2
+        sums = [np.zeros(reclen, dtype=np.int64), np.zeros(reclen, dtype=np.int64)]
+        n = tries = 0
+        max_tries = AVG_MAX_ATTEMPTS_FACTOR * avg_n
+        while n < avg_n:
+            if tries >= max_tries:
+                raise AcquisitionError(
+                    f"Acquisition failed: only {n} of {avg_n} valid captures after "
+                    f"{tries} attempts (constant signals; is the digitizer connected?)"
+                )
+            tries += 1
+            self._timed_get_ascan()
+            raws = [np.array(list(buf[:reclen]), dtype=np.int64)
+                    for buf in (self._sedaq.DataADC1, self._sedaq.DataADC2)]
+            if any(np.all(r == r[0]) for r in raws):
+                continue
+            for acc, r in zip(sums, raws):
+                acc += r - mid
+            n += 1
+        return sums[0], sums[1]
 
     def _open_seq_arduino(self):
         """One Arduino instance per sequence (its constructor waits 2 s for the

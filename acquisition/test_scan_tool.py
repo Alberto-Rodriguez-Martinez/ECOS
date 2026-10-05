@@ -1,7 +1,9 @@
 # -*- coding: utf-8 -*-
 """
 test_scan_tool.py — line scan, water references and saving (scan_tool.py,
-BD_Experimentos_PVA.save_scan_raw_32), task_scanner_phase5.md "Verificación" 1–6.
+BD_Experimentos_PVA.save_scan_raw_32), task_scanner_phase5.md "Verificación" 1–6,
+and the integer storage of task_scan_int16.md (exact rebuild, size, conversion
+metadata, gains per channel) with the reference drift comparison.
 
 Run from the repo root with the 32-bit interpreter of the machine (CLAUDE.md):
     python -m unittest discover -s acquisition
@@ -25,14 +27,34 @@ import test_focus_tool as tf  # noqa: E402  (module import: its tests are not co
 from BD_Experimentos_PVA import (  # noqa: E402
     experiment_name, load_scan_raw_32, save_scan_raw_32,
 )
+from scan_counts import counts_to_float, sum_dtype  # noqa: E402
 from scan_tool import (  # noqa: E402
     LONG_SCAN_S, MAGNITUDES, PointContext, ScanParams, ScanPlan, compute_magnitudes,
-    estimate_scan_s, line_positions, register_magnitude,
+    estimate_scan_s, line_positions, reference_drift, register_magnitude,
 )
 from sim_sedaq import SimParams, SimSeDaq  # noqa: E402
 
 FS = tf.FS
 LIMIT = tf.LIMIT
+MID = 512               # 10-bit quantizer midpoint (the assumed resolution)
+
+
+def acquire_counts(sim, avg_n):
+    """What ecos_gui._acquire_counts does: Σ(raw − midpoint) over avg_n captures,
+    whole record, both channels (constant captures skipped)."""
+    s1 = np.zeros(sim.RecLen, dtype=np.int64)
+    s2 = np.zeros(sim.RecLen, dtype=np.int64)
+    k = 0
+    while k < avg_n:
+        sim.GetAScan()
+        r1 = np.asarray(sim.DataADC1[:sim.RecLen], dtype=np.int64)
+        r2 = np.asarray(sim.DataADC2[:sim.RecLen], dtype=np.int64)
+        if np.all(r1 == r1[0]) or np.all(r2 == r2[0]):
+            continue
+        s1 += r1 - MID
+        s2 += r2 - MID
+        k += 1
+    return s1, s2
 OFFSET = 0.003          # the fake scanner lands this far from every target (real ≠ requested)
 
 
@@ -99,28 +121,160 @@ class TestScanSaveFormat(unittest.TestCase):
         self.assertEqual(experiment_name('', 'x', '', '', 'SCAN', '20261002_091500'),
                          'PVA_XX_PG_YY_X_CNNN_SCAN_20261002_091500')
 
-    def test_roundtrip_and_validation(self):
-        ch = np.random.default_rng(0).normal(size=(1, 3, 50))
-        kw = dict(specimen={'pieza': 'A'}, protocol={}, equipment1={'params': {'Smin': 100,
-                                                                               'Smax': 150}},
+    def kwargs(self, n_avg=20, n_point=3, n_samp=50, seed=0, **over):
+        rng = np.random.default_rng(seed)
+        s = rng.integers(-MID * n_avg, MID * n_avg, size=(1, n_point, n_samp))
+        kw = dict(specimen={'pieza': 'A'}, protocol={},
+                  equipment1={'params': {'Smin': 100, 'Smax': 100 + n_samp}},
                   equipment2={}, scanner_session={'beam_axis': 'Y'}, scan={'type': 'line'},
-                  signals_ch1=ch, signals_ch2=ch * 2, coords=np.zeros((1, 3, 4)),
-                  point_time=np.arange(3.0).reshape(1, 3),
+                  signals_ch1=s, signals_ch2=-s, offsets_ch1=rng.normal(size=(1, n_point)) * 1e-3,
+                  offsets_ch2=rng.normal(size=(1, n_point)) * 1e-3, n_avg=n_avg,
+                  gains=(65.0, 35.0), coords=np.zeros((1, n_point, 4)),
+                  point_time=np.arange(float(n_point)).reshape(1, n_point),
                   temperatures=[{'label': 'start', 'point': -1, 'time': 1.0, 'T1': float('nan'),
                                  'T2': 24.0}],
                   operator='Ana', base_dir=self.dir, exp_name='PVA_10_PG_05_A_C005_SCAN_x')
+        kw.update(over)
+        return kw
+
+    def test_roundtrip_and_validation(self):
+        kw = self.kwargs()
         path = save_scan_raw_32(**kw)
         meta, data = load_scan_raw_32(path)
-        self.assertEqual(meta['schema_version'], 'scan-32-1.0')
+        self.assertEqual(meta['schema_version'], 'scan-32-2.0')
         self.assertEqual(meta['experiment']['operator'], 'Ana')
         self.assertFalse(os.path.exists(os.path.join(path, 'results.json')))
-        np.testing.assert_allclose(data['signals_ch2'], (ch * 2).astype(np.float32))
+        np.testing.assert_array_equal(data['signals_ch2_sum'], -kw['signals_ch1'])
+        self.assertEqual(data['signals_ch1_sum'].dtype, np.int16)
+        self.assertEqual(data['signals_ch1'].dtype, np.float64)
         self.assertTrue(np.isnan(data['temp_T1'][0]))
         with self.assertRaises(FileExistsError):
             save_scan_raw_32(**kw)
-        bad = dict(kw, exp_name='other', signals_ch2=ch[:, :2])
+        for bad in (dict(signals_ch2=kw['signals_ch2'][:, :2]),               # shapes
+                    dict(signals_ch1=kw['signals_ch1'] * 0.5),                # not integer
+                    dict(signals_ch1=kw['signals_ch1'] * 0 + MID * 20 + 1)):  # not a sum of 20
+            with self.subTest(bad=list(bad)):
+                with self.assertRaises(ValueError):
+                    save_scan_raw_32(**dict(kw, exp_name='other', **bad))
+
+    def test_dtype_follows_the_averages(self):
+        """int16 while |Σ| ≤ 512·N fits (N ≤ 63 at 10 bits), int32 beyond: no limit on N."""
+        self.assertIs(sum_dtype(63), np.int16)
+        self.assertIs(sum_dtype(64), np.int32)
+        self.assertIs(sum_dtype(100), np.int32)
+        path = save_scan_raw_32(**self.kwargs(n_avg=100))
+        meta, data = load_scan_raw_32(path)
+        self.assertEqual(meta['conversion']['dtype'], 'int32')
+        self.assertEqual(data['signals_ch1_sum'].dtype, np.int32)
+
+    def test_conversion_metadata_and_gains_per_channel(self):
+        """Points 3 and 4: midpoint, bits, averages, dtype and the gain of each channel."""
+        ref = {'sum1': np.arange(50) * 3, 'sum2': -np.arange(50), 'offset1': 0.01,
+               'offset2': -0.02, 'avg_n': 100, 'gains': [20.0, 10.0], 'coords': [1, 2, 3, 0],
+               'time': 1.0, 'T1': 24.0, 'T2': 24.1}
+        path = save_scan_raw_32(**self.kwargs(references={'initial': ref}))
+        meta, data = load_scan_raw_32(path)
+        c = meta['conversion']
+        self.assertEqual((c['quantizer_bits'], c['quantizer_midpoint'], c['full_scale_counts']),
+                         (10, 512, 1024))
+        self.assertEqual((c['n_avg'], c['dtype']), (20, 'int16'))
+        self.assertEqual(c['gain_db'], {'ch1': 65.0, 'ch2': 35.0})
+        r = c['references']['initial']
+        self.assertEqual((r['n_avg'], r['dtype']), (100, 'int32'))
+        self.assertEqual(r['gain_db'], {'ch1': 20.0, 'ch2': 10.0})
+        # each channel rebuilt with its own sums and offset, the reference with its own N
+        np.testing.assert_array_equal(data['ref_initial_ch1'],
+                                      counts_to_float(ref['sum1'], 100, 10, 0.01)[0])
+        np.testing.assert_array_equal(data['ref_initial_ch2'],
+                                      counts_to_float(ref['sum2'], 100, 10, -0.02)[0])
+
+    def test_size_about_half_of_float32(self):
+        """Point 2, on realistic data: an averaged simulated scan, 41 points × 3500 samples."""
+        sim = SimSeDaq(SimParams(snr_db=30.0), reclen=8192, seed=4)
+        sums1, sums2, f1, f2, o1, o2 = [], [], [], [], [], []
+        smin, smax = tf.WIDE
+        for k in range(41):
+            sim.set_scanner_state({'X': 40.0 + 0.5 * k, 'Y': 50.0, 'Z': 25.0, 'R': 0.0})
+            s1, s2 = acquire_counts(sim, 20)
+            x1, a1 = counts_to_float(s1, 20)
+            x2, a2 = counts_to_float(s2, 20)
+            sums1.append(s1[smin:smax]); sums2.append(s2[smin:smax])
+            f1.append(x1[smin:smax]); f2.append(x2[smin:smax]); o1.append(a1); o2.append(a2)
+        n_samp = smax - smin
+        kw = self.kwargs(n_point=41, n_samp=n_samp,
+                         signals_ch1=np.array(sums1).reshape(1, 41, n_samp),
+                         signals_ch2=np.array(sums2).reshape(1, 41, n_samp),
+                         offsets_ch1=np.array(o1).reshape(1, 41),
+                         offsets_ch2=np.array(o2).reshape(1, 41),
+                         equipment1={'params': {'Smin': smin, 'Smax': smax}})
+        path = save_scan_raw_32(**kw)
+        new = os.path.getsize(os.path.join(path, 'scan.npz'))
+        f32 = os.path.join(self.dir, 'float32.npz')
+        np.savez_compressed(f32, signals_ch1=np.array(f1, dtype=np.float32),
+                            signals_ch2=np.array(f2, dtype=np.float32))
+        old = os.path.getsize(f32)
+        raw_new = sum(np.asarray(a).nbytes for a in (kw['signals_ch1'].astype(np.int16),
+                                                     kw['signals_ch2'].astype(np.int16)))
+        raw_old = 2 * np.array(f1, dtype=np.float32).nbytes
+        print(f'\n[size] signals uncompressed: int16 {raw_new / 1e6:.2f} MB, float32 '
+              f'{raw_old / 1e6:.2f} MB; compressed scan.npz {new / 1e6:.2f} MB vs float32 .npz '
+              f'{old / 1e6:.2f} MB (ratio {new / old:.2f})')
+        self.assertEqual(raw_new * 2, raw_old)            # exactly half before compression
+        self.assertLess(new / old, 0.7)                   # deflate also shrinks float32
+        import zipfile
+        with zipfile.ZipFile(os.path.join(path, 'scan.npz')) as z:     # still compressed
+            self.assertTrue(all(i.compress_type == zipfile.ZIP_DEFLATED for i in z.infolist()))
+        # exact: the floats read back are the very ones computed when "measuring"
+        _, data = load_scan_raw_32(path)
+        np.testing.assert_array_equal(data['signals_ch1'][0], np.array(f1))
+        np.testing.assert_array_equal(data['signals_ch2'][0], np.array(f2))
+
+    def test_old_float32_schema_is_refused(self):
+        path = save_scan_raw_32(**self.kwargs())
+        meta_path = os.path.join(path, 'meta.json')
+        with open(meta_path, encoding='utf-8') as f:
+            meta = json.load(f)
+        meta['schema_version'] = 'scan-32-1.0'
+        with open(meta_path, 'w', encoding='utf-8') as f:
+            json.dump(meta, f)
         with self.assertRaises(ValueError):
-            save_scan_raw_32(**bad)
+            load_scan_raw_32(path)
+
+
+class TestReferenceDrift(unittest.TestCase):
+
+    def refs(self, **change):
+        sim = SimSeDaq(SimParams(snr_db=60.0), reclen=8192, seed=5)
+        sim.set_scanner_state({'X': 90.0, 'Y': 50.0, 'Z': 4.0, 'R': 0.0})
+        out = []
+        for params in ({}, change):
+            for k, v in params.items():
+                setattr(sim.params, k, v)
+            s1, s2 = acquire_counts(sim, 20)
+            smin, smax = 1000, 7000
+            out.append({'ch1': counts_to_float(s1, 20)[0][smin:smax],
+                        'ch2': counts_to_float(s2, 20)[0][smin:smax]})
+        return out
+
+    def test_no_drift(self):
+        a, b = self.refs()
+        d = reference_drift(a, b)
+        self.assertTrue(d['ch1']['clear'])
+        self.assertLess(abs(d['ch1']['d_db']), 0.05)
+        self.assertLess(abs(d['ch1']['d_tof_ns']), 1.0)
+        self.assertEqual(d['exceeds'], [])
+
+    def test_amplitude_and_tof_drift_detected(self):
+        """Water 1 m/s slower (≈ −0.3 °C) and 10 % less transmission on Ch1."""
+        sim_cw = SimParams().c_w
+        a, b = self.refs(c_w=sim_cw - 1.0, tt_amp=SimParams().tt_amp * 0.9)
+        d = reference_drift(a, b, tol_db=0.5, tol_ns=20.0)
+        self.assertAlmostEqual(d['ch1']['d_db'], 20 * np.log10(0.9), delta=0.05)
+        # TT path in water: (tt_separation − thickness) = 50 mm → Δt = 50 mm · Δc / c²
+        expected_ns = 50e-3 * 1.0 / sim_cw ** 2 * 1e9
+        self.assertAlmostEqual(d['ch1']['d_tof_ns'], expected_ns, delta=2.0)   # later: positive
+        self.assertIn('ch1 amplitude', d['exceeds'])
+        self.assertIn('ch1 ToF', d['exceeds'])
 
 
 # ===========================================================================
@@ -241,8 +395,18 @@ class ScanHarness(unittest.TestCase):
         self.panel = Panel(self.sim)
         self.worker = Worker(self.panel, worker_speed)
         self.live = {'on': True}
+        self.measured = []                  # every float pair handed to the tools
+
+        def acquire(n):
+            s1, s2 = acquire_counts(self.sim, n)
+            x1, o1 = counts_to_float(s1, n)
+            x2, o2 = counts_to_float(s2, n)
+            self.last_counts = {'sum': (s1, s2), 'offset': (o1, o2), 'n': n}
+            self.measured.append((x1, x2))
+            return x1, x2
+
         self.seq = ScanSequencer(
-            self.worker, self.sim, lambda n: tf.acquire(self.sim, n),
+            self.worker, self.sim, acquire,
             coords_fn=self.panel.current_coords,
             enter_exclusive=lambda: self.live.update(on=False),
             leave_exclusive=lambda: self.live.update(on=True))
@@ -264,8 +428,9 @@ class ScanHarness(unittest.TestCase):
         self.locks = []
         self.tool = ScanTool(
             self.seq, self.panel, lambda: tf.WIDE, pg.PlotWidget(),
-            acquire_fn=lambda n: tf.acquire(self.sim, n), gains_fn=lambda: self.scan_gains,
-            set_gains_fn=set_gains, temp_factory=factory if temp else None,
+            acquire_fn=acquire, gains_fn=lambda: self.scan_gains,
+            set_gains_fn=set_gains, counts_fn=lambda: self.last_counts,
+            temp_factory=factory if temp else None,
             sos_fn=lambda T: 1402.7 + 4.88 * T - 0.0482 * T ** 2,
             cw_fn=lambda: (self.sim.params.c_w, 'synthetic SeDaq'),
             info_fn=lambda: {'specimen': {'pieza': 'P3A'}, 'protocol': {},
@@ -317,6 +482,15 @@ class TestLineScan(ScanHarness):
                 self.assertEqual(counts, list(range(1, 10)))            # one map update per point
                 meta, d = self.load_saved()
                 n_samp = tf.WIDE[1] - tf.WIDE[0]
+                # exact rebuild of what was measured (task_scan_int16 point 1)
+                smin, smax = tf.WIDE
+                scanned = self.measured[:9]            # then one acquisition on the way back
+                np.testing.assert_array_equal(
+                    d['signals_ch1'][0], np.array([m[0][smin:smax] for m in scanned]))
+                np.testing.assert_array_equal(
+                    d['signals_ch2'][0], np.array([m[1][smin:smax] for m in scanned]))
+                self.assertEqual(meta['conversion']['gain_db'], {'ch1': 65.0, 'ch2': 35.0})
+                self.assertEqual(meta['conversion']['dtype'], 'int16')
                 self.assertEqual(d['signals_ch1'].shape, (1, 9, n_samp))
                 self.assertEqual(d['signals_ch2'].shape, (1, 9, n_samp))
                 self.assertEqual(d['coords'].shape, (1, 9, 4))
@@ -485,9 +659,16 @@ class TestWaterReferences(ScanHarness):
             np.testing.assert_allclose(d[f'ref_{which}_gains'], [20.0, 10.0])
             self.assertAlmostEqual(d[f'ref_{which}_coords'][0], 90.0, delta=0.01)
             self.assertEqual(int(d[f'ref_{which}_avg_n']), 3)
+            self.assertEqual(meta['conversion']['references'][which]['gain_db'],
+                             {'ch1': 20.0, 'ch2': 10.0})
             self.assertEqual(float(d[f'ref_{which}_T1']), 24.5)
         self.assertEqual(list(d['temp_label']), ['start', 'ref_initial', 'ref_final', 'end'])
         self.assertEqual(meta['scan']['manual_axis_order'], ['Z', 'X'])
+        drift = meta['scan']['reference_drift']                # compared, shown and saved
+        for key in ('ch1', 'ch2', 'exceeds', 'tol_db', 'tol_ns'):   # (3 averages at low gains:
+            self.assertIn(key, drift)                               #  values are noise here;
+                                                                    #  TestDriftOnScreen checks them)
+        self.assertTrue(any('Reference drift Ch1' in st for st in self.statuses))
         self.assertEqual(sorted(meta['scan']['references_taken']), ['final', 'initial'])
         # in water (sample out) there is no front echo: the reference PE channel is quiet there
         self.assertLess(np.max(np.abs(d['ref_initial_ch2'])), np.max(np.abs(d['signals_ch2'])))
@@ -524,6 +705,33 @@ class TestWaterReferences(ScanHarness):
         self.assertEqual(self.worker.moves, [])
         self.assertEqual((self.sim.gain1, self.sim.gain2), self.scan_gains)
         self.assertEqual(os.listdir(self.base), [])
+
+
+class TestDriftOnScreen(ScanHarness):
+
+    def test_drift_warning_when_water_changes(self):
+        """The final reference after the water got 2 m/s slower: warned and shown."""
+        self.make()
+        drifts = []
+        self.tool.drift.connect(drifts.append)
+        self.assertIsNone(self.tool.start(ScanParams(
+            start=-1, end=1, step=1, settle_ms=0, avg_n=2, references=True, ref_gain1=65.0,
+            ref_gain2=35.0, ref_avg_n=10, drift_tol_db=0.5, drift_tol_ns=20.0)))
+        self.panel.manual_move('X', 90.0)
+        self.tool.continue_reference()
+        self.tool.accept_reference()
+        self.wait(lambda: self.tool.state == 'ref_review')
+        self.sim.params.c_w -= 2.0
+        self.tool.repeat_reference()                     # the final one, in the slower water
+        self.tool.accept_reference()
+        self.wait(lambda: self.dones)
+        self.assertEqual(len(drifts), 1)
+        self.assertIn('ch1 ToF', drifts[0]['exceeds'])
+        self.assertGreater(drifts[0]['ch1']['d_tof_ns'], 20.0)
+        self.assertTrue(any('Drift above the limits' in w for w in self.warnings))
+        self.assertIn('Reference drift Ch1', self.statuses[-1])
+        meta, _ = self.load_saved()
+        self.assertIn('ch1 ToF', meta['scan']['reference_drift']['exceeds'])
 
 
 class TestEstimateMatchesReality(ScanHarness):

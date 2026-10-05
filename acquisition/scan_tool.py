@@ -29,9 +29,20 @@ point; ONE Arduino instance for the whole scan session, closed at the end.
 Without PT100: NaN and a warning at the start, never the (modal) manual dialog.
 
 Saving: one folder per scan, database/<PVA_..._SCAN_<ts>>/ meta.json + scan.npz
-(BD_Experimentos_PVA.save_scan_raw_32, schema scan-32-1.0), automatically at
+(BD_Experimentos_PVA.save_scan_raw_32, schema scan-32-2.0), automatically at
 the end, or on demand after a STOP. "Save to another folder…" writes a copy.
-No results: they are computed later, in the analysis.
+No results: they are computed later, in the analysis. The signals are stored as
+the integer sums of counts of the averaged captures plus a per-point offset
+(database/scan_counts.py): the host hands them over with counts_fn() after
+every acquisition, and the floats every tool sees are computed from them with
+scan_counts.counts_to_float, so the file rebuilds them bit for bit.
+
+Reference drift: with both water references, the final one is compared with
+the initial one per channel (amplitude difference in dB, ToF difference by
+cross-correlation, ECOS_US_ToolBox.CalcToFAscanCosine_XCRFFT). Shown on screen,
+saved in meta.json, and warned about above configurable thresholds: it measures
+the drift during the scan (temperature, gain, coupling) and says whether the
+scan can be trusted.
 
 Settle and averages are the scan's own, NOT the focus ones (5000 ms / 100 were
 measured with 1 mm steps): defaults DEFAULT_SCAN_SETTLE_MS / DEFAULT_SCAN_AVG_N,
@@ -54,6 +65,8 @@ from echo_tracking import (
     MIN_WINDOW_SAMPLES, FrontEchoTracker, band_samples,
 )
 from flatness_tool import line_flags
+from ECOS_US_ToolBox import CalcToFAscanCosine_XCRFFT, Envelope
+from echo_tracking import CONFIDENT_CONTRAST
 from focus_tool import (
     DEFAULT_EMISSION_SAMPLE, MOVE_MM_S, POSITION_DECIMALS, FocusDebugDump, acq_time,
     format_duration, resolve_cw,
@@ -61,6 +74,9 @@ from focus_tool import (
 
 _DB_DIR = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), '..',
                                         'database'))
+if _DB_DIR not in sys.path:
+    sys.path.insert(0, _DB_DIR)
+from scan_counts import ADC_BITS_DEFAULT, counts_to_float  # noqa: E402
 
 PE_CHANNEL = 2
 # PENDIENTES DE CARACTERIZAR en función del paso (task_scanner_phase5.md 1):
@@ -70,6 +86,8 @@ DEFAULT_SCAN_AVG_N = 20
 DEFAULT_SCAN_STEP_MM = 0.5
 DEFAULT_REF_AVG_N = 100
 LONG_SCAN_S = 30 * 60          # warn above half an hour
+DEFAULT_DRIFT_DB = 0.5         # reference drift warnings: amplitude [dB] …
+DEFAULT_DRIFT_NS = 20.0        # … and ToF [ns] (~0.1 °C of water over a 60 mm path)
 DEFAULT_DUMP_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                 '..', 'data', 'scan_debug')
 AXES4 = ('X', 'Y', 'Z', 'R')
@@ -171,6 +189,8 @@ class ScanParams:
     threshold: float = DEFAULT_THRESHOLD
     emission_sample: int = DEFAULT_EMISSION_SAMPLE
     debug_dump: bool = False
+    drift_tol_db: float = DEFAULT_DRIFT_DB
+    drift_tol_ns: float = DEFAULT_DRIFT_NS
 
 
 class ScanPlan:
@@ -223,8 +243,10 @@ def estimate_scan_s(plan, acq_s, move_mm_s=MOVE_MM_S):
 @dataclass
 class ScanData:
     """Everything acquired in one scan session (one line)."""
-    ch1: List[np.ndarray] = field(default_factory=list)
-    ch2: List[np.ndarray] = field(default_factory=list)
+    sum1: List[np.ndarray] = field(default_factory=list)    # Σ(raw − midpoint), window, Ch1
+    sum2: List[np.ndarray] = field(default_factory=list)    # same, Ch2
+    off1: List[float] = field(default_factory=list)         # whole-record offset, Ch1
+    off2: List[float] = field(default_factory=list)
     coords: List[List[float]] = field(default_factory=list)      # real X, Y, Z, R
     times: List[float] = field(default_factory=list)
     requested: List[float] = field(default_factory=list)
@@ -236,10 +258,56 @@ class ScanData:
     axis_order: List[str] = field(default_factory=list)
     manual_log: List[tuple] = field(default_factory=list)
     reference_position: Optional[dict] = None
+    drift: Optional[dict] = None
 
     @property
     def n(self):
         return len(self.coords)
+
+
+def reference_drift(initial, final, fs=ACQ_FS, tol_db=DEFAULT_DRIFT_DB, tol_ns=DEFAULT_DRIFT_NS):
+    """
+    Final vs initial water reference, per channel: envelope maximum of each, the
+    difference in dB (final − initial) and the ToF difference by cross-correlation
+    (positive: the final one arrives later). A channel without a clear signal in
+    both references (contrast < CONFIDENT_CONTRAST) is reported as such, not compared.
+    initial/final: {'ch1', 'ch2'} float arrays (the Smin–Smax window).
+    Returns {'ch1': {...}, 'ch2': {...}, 'exceeds': [...], 'tol_db', 'tol_ns'}.
+    """
+    out = {'tol_db': float(tol_db), 'tol_ns': float(tol_ns), 'exceeds': []}
+    for ch in ('ch1', 'ch2'):
+        a, b = np.asarray(initial[ch], dtype=float), np.asarray(final[ch], dtype=float)
+        ea, eb = Envelope(a), Envelope(b)
+        ca = float(np.max(ea) / np.median(ea)) if np.median(ea) > 0 else float('inf')
+        cb = float(np.max(eb) / np.median(eb)) if np.median(eb) > 0 else float('inf')
+        r = {'amp_initial': float(np.max(ea)), 'amp_final': float(np.max(eb)),
+             'clear': bool(ca >= CONFIDENT_CONTRAST and cb >= CONFIDENT_CONTRAST)}
+        if r['clear']:
+            r['d_db'] = 20.0 * math.log10(r['amp_final'] / r['amp_initial'])
+            dtof, _, _ = CalcToFAscanCosine_XCRFFT(b, a)
+            r['d_tof_samples'] = float(dtof)
+            r['d_tof_ns'] = float(dtof) / fs * 1e9
+            if abs(r['d_db']) > tol_db:
+                out['exceeds'].append(f'{ch} amplitude')
+            if abs(r['d_tof_ns']) > tol_ns:
+                out['exceeds'].append(f'{ch} ToF')
+        out[ch] = r
+    return out
+
+
+def drift_lines(drift):
+    lines = []
+    for ch, name in (('ch1', 'Ch1'), ('ch2', 'Ch2 (PE)')):
+        r = drift[ch]
+        if not r['clear']:
+            lines.append(f'Reference drift {name}: no clear signal in the references, not compared.')
+            continue
+        lines.append(f'Reference drift {name}: {r["d_db"]:+.2f} dB, ToF {r["d_tof_ns"]:+.1f} ns '
+                     f'(final − initial; limits ±{drift["tol_db"]:g} dB, ±{drift["tol_ns"]:g} ns).')
+    if drift['exceeds']:
+        lines.append('⚠ Drift above the limits (' + ', '.join(drift['exceeds']) + '): temperature, '
+                     'gain or coupling changed during the scan; check before trusting it.')
+    return lines
 
 
 def scan_messages(xs, flags, measures):
@@ -352,12 +420,18 @@ class ScanTool(QObject):
     saved = pyqtSignal(str)
     done = pyqtSignal(str)
 
+    drift = pyqtSignal(object)
+
     def __init__(self, sequencer, panel, window_fn, plot_widget, acquire_fn, gains_fn,
-                 set_gains_fn, temp_factory=None, sos_fn=None, cw_fn=None, info_fn=None,
-                 base_dir=None, show_plot_fn=None, acq_time_fn=None, lock_fn=None,
-                 dump_dir=None, parent=None):
+                 set_gains_fn, counts_fn=None, temp_factory=None, sos_fn=None, cw_fn=None,
+                 info_fn=None, base_dir=None, show_plot_fn=None, acq_time_fn=None, lock_fn=None,
+                 dump_dir=None, adc_bits=ADC_BITS_DEFAULT, parent=None):
         """
         acquire_fn(avg_n) -> (ch1, ch2) full averaged records (references)
+        counts_fn() -> {'sum': (s1, s2), 'offset': (o1, o2), 'n': avg_n} of the LAST
+                     acquisition (the sequencer's or acquire_fn's): integer sums of
+                     (raw − midpoint) over the whole record, as scan_counts defines
+        adc_bits: ADC resolution assumed for the conversion (written in every file)
         gains_fn() -> (gain1, gain2) of the Acquisition tab (the scan gains)
         set_gains_fn(g1, g2): Gain1 then Gain2, always both (pulser fault)
         temp_factory() -> Arduino-like (getTemperatures, close) or None: opened ONCE
@@ -373,6 +447,8 @@ class ScanTool(QObject):
         self._window_fn = window_fn
         self._plot = ScanPlot(plot_widget)
         self._acquire = acquire_fn
+        self._counts_fn = counts_fn
+        self.adc_bits = int(adc_bits)
         self._gains_fn = gains_fn
         self._set_gains = set_gains_fn
         self._temp_factory = temp_factory
@@ -565,15 +641,27 @@ class ScanTool(QObject):
         self._take_reference('initial')
         return None
 
+    def _last_counts(self, smin, smax):
+        """Window of the integer sums of the last acquisition, and the offsets."""
+        lc = self._counts_fn()
+        if int(lc['n']) <= 0:
+            raise ValueError('no counts for the last acquisition')
+        s1, s2 = (np.array(np.asarray(s)[smin:smax], dtype=np.int64) for s in lc['sum'])
+        return (s1, s2), (float(lc['offset'][0]), float(lc['offset'][1]))
+
     def _take_reference(self, which):
         p = self.params
         self._set_gains(p.ref_gain1, p.ref_gain2)          # Gain1, then Gain2 again
-        ch1, ch2 = self._acquire(p.ref_avg_n)
+        self._acquire(p.ref_avg_n)
         smin, smax = self.window
+        (s1, s2), (o1, o2) = self._last_counts(smin, smax)
+        n = int(p.ref_avg_n)
         self._pending_ref = {
-            'ch1': np.array(ch1[smin:smax], dtype=float), 'ch2': np.array(ch2[smin:smax], dtype=float),
+            'sum1': s1, 'sum2': s2, 'offset1': o1, 'offset2': o2, 'avg_n': n,
+            'ch1': counts_to_float(s1, n, self.adc_bits, o1)[0],
+            'ch2': counts_to_float(s2, n, self.adc_bits, o2)[0],
             'gains': [float(p.ref_gain1), float(p.ref_gain2)], 'coords': self._coords4(),
-            'time': time.time(), 'avg_n': int(p.ref_avg_n),
+            'time': time.time(),
         }
         self._review = which
         self._plot.show_reference(which, self._pending_ref['ch1'], self._pending_ref['ch2'],
@@ -598,6 +686,8 @@ class ScanTool(QObject):
         self.data.references[which] = ref
         self._restore_gains()
         self._pending_ref = None
+        if which == 'final' and 'initial' in self.data.references:
+            self._compare_references()
         self._plot.reset(self.plan.axis, self.magnitude)
         self._redraw()
         if which == 'initial':
@@ -606,6 +696,17 @@ class ScanTool(QObject):
         else:
             self._move('back', self._return_path(), 'Back to the start point…')
         return None
+
+    def _compare_references(self):
+        p = self.params
+        d = reference_drift(self.data.references['initial'], self.data.references['final'],
+                            ACQ_FS, p.drift_tol_db, p.drift_tol_ns)
+        self.data.drift = d
+        self.drift.emit(d)
+        lines = drift_lines(d)
+        if d['exceeds']:
+            self.warning.emit(lines[-1])
+        self.status.emit('\n'.join(lines))
 
     def cancel_reference(self):
         """Initial: cancel the session (nothing moves). Final: skip it and go back."""
@@ -673,8 +774,11 @@ class ScanTool(QObject):
         sig = ch2 if PE_CHANNEL == 2 else ch1
         m = self._tracker.measure(sig, self.plan.beam_x)
         seg, env = self._tracker.point_signals(-1)
-        self.data.ch1.append(np.array(ch1[smin:smax], dtype=np.float32))
-        self.data.ch2.append(np.array(ch2[smin:smax], dtype=np.float32))
+        (s1, s2), (o1, o2) = self._last_counts(smin, smax)
+        self.data.sum1.append(s1)
+        self.data.sum2.append(s2)
+        self.data.off1.append(o1)
+        self.data.off2.append(o2)
         self._last = (seg, env, np.array(ch1[smin:smax], dtype=float),
                       np.array(sig, dtype=float) if self._dump is not None else None)
         return m
@@ -809,6 +913,8 @@ class ScanTool(QObject):
             self.warning.emit(f'Automatic save failed ({e}): use "Save to another folder…".')
             text = f'Scan {how}: {self.data.n} points. NOT saved.'
         msgs = scan_messages(self.positions_read(), self.data.flags, self.data.measures)
+        if self.data.drift is not None:
+            msgs = drift_lines(self.data.drift) + msgs
         self._end(how, '\n'.join([text] + msgs))
 
     def exp_name(self):
@@ -830,8 +936,8 @@ class ScanTool(QObject):
         smin, smax = self.window
         n = d.n
         n_samp = smax - smin
-        ch1 = np.array(d.ch1[:n], dtype=np.float32).reshape(1, n, n_samp)
-        ch2 = np.array(d.ch2[:n], dtype=np.float32).reshape(1, n, n_samp)
+        sum1 = np.array(d.sum1[:n], dtype=np.int64).reshape(1, n, n_samp)
+        sum2 = np.array(d.sum2[:n], dtype=np.int64).reshape(1, n, n_samp)
         equipment1 = dict(info.get('equipment1', {'nombre': 'SEDAQ'}))
         params = dict(equipment1.get('params', {}))
         params.update(Gain_Ch1=self._scan_gains[0], Gain_Ch2=self._scan_gains[1],
@@ -858,17 +964,24 @@ class ScanTool(QObject):
             'tracking': {'band_us': p.band_us, 'threshold': p.threshold,
                          'edge_margin': p.edge_margin, 'emission_sample': p.emission_sample},
             'flags': {str(k): f for k, f in enumerate(d.flags) if f},
+            'reference_drift': d.drift,
         }
+        refs = {w: {k: r[k] for k in ('sum1', 'sum2', 'offset1', 'offset2', 'avg_n', 'gains',
+                                      'coords', 'time', 'T1', 'T2')}
+                for w, r in d.references.items()}
         name = self.exp_name()
         path = save_scan_raw_32(
             specimen=info.get('specimen', {}), protocol=info.get('protocol', {}),
             equipment1=equipment1, equipment2=info.get('equipment2', {}),
             scanner_session=(self._panel.session_dict() if hasattr(self._panel, 'session_dict')
                              else {}),
-            scan=scan, signals_ch1=ch1, signals_ch2=ch2,
+            scan=scan, signals_ch1=sum1, signals_ch2=sum2,
+            offsets_ch1=np.array(d.off1[:n], dtype=float).reshape(1, n),
+            offsets_ch2=np.array(d.off2[:n], dtype=float).reshape(1, n),
+            n_avg=p.avg_n, gains=self._scan_gains, adc_bits=self.adc_bits,
             coords=np.array(d.coords, dtype=float).reshape(1, n, 4),
             point_time=np.array(d.times, dtype=float).reshape(1, n),
-            temperatures=d.temperatures, references=d.references,
+            temperatures=d.temperatures, references=refs,
             operator=p.operator, comment=p.comment, base_dir=base_dir, exp_name=name,
             extra_arrays={'positions_requested': np.array(d.requested, dtype=float).reshape(1, n)})
         if os.path.abspath(base_dir) == os.path.abspath(self.base_dir) or self.last_saved_path is None:
@@ -974,6 +1087,13 @@ class ScanGroup(QGroupBox):
         self._txt_comment = QLineEdit('')
         form.addRow('Operator:', self._txt_operator)
         form.addRow('Comment:', self._txt_comment)
+        self._spin_drift_db = dspin(0.01, 20.0, DEFAULT_DRIFT_DB, 2, 0.1, ' dB')
+        self._spin_drift_ns = dspin(0.1, 10000.0, DEFAULT_DRIFT_NS, 1, 5.0, ' ns')
+        self._spin_drift_db.setToolTip('Warn when the final water reference differs from the '
+                                       'initial one by more than this in amplitude.')
+        self._spin_drift_ns.setToolTip('… or by more than this in time of flight.')
+        form.addRow('Drift limit, amplitude:', self._spin_drift_db)
+        form.addRow('Drift limit, ToF:', self._spin_drift_ns)
         self._chk_dump = QCheckBox('Save debug dump (large: full records; data/scan_debug)')
         form.addRow(self._chk_dump)
 
@@ -1005,6 +1125,9 @@ class ScanGroup(QGroupBox):
         self._btn_copy = QPushButton('Save to another folder…')
         row(self._btn_copy)
 
+        self._lbl_drift = QLabel('Reference drift: —')
+        self._lbl_drift.setWordWrap(True)
+        form.addRow(self._lbl_drift)
         self._lbl_warn = QLabel()
         self._lbl_warn.setWordWrap(True)
         self._lbl_warn.setStyleSheet('color: rgb(230, 120, 0);')
@@ -1029,6 +1152,7 @@ class ScanGroup(QGroupBox):
         tool.status.connect(self._lbl_status.setText)
         tool.warning.connect(self._lbl_warn.setText)
         tool.state_changed.connect(self._on_state)
+        tool.drift.connect(self._on_drift)
         sequencer.state_changed.connect(lambda st: self._on_state(tool.state, st))
         for w in (self._spin_start, self._spin_end, self._spin_step, self._spin_settle,
                   self._spin_avg, self._spin_ravg):
@@ -1047,7 +1171,8 @@ class ScanGroup(QGroupBox):
             avg_n=self._spin_avg.value(), references=self._chk_refs.isChecked(),
             ref_gain1=self._spin_rg1.value(), ref_gain2=self._spin_rg2.value(),
             ref_avg_n=self._spin_ravg.value(), operator=self._txt_operator.text().strip(),
-            comment=self._txt_comment.text(), debug_dump=self._chk_dump.isChecked())
+            comment=self._txt_comment.text(), debug_dump=self._chk_dump.isChecked(),
+            drift_tol_db=self._spin_drift_db.value(), drift_tol_ns=self._spin_drift_ns.value())
 
     def _refresh_estimate(self, *_):
         _, text, long_ = self._tool.estimate(self.params())
@@ -1074,6 +1199,12 @@ class ScanGroup(QGroupBox):
             self._tool.resume()
         else:
             self._tool.pause()
+
+    def _on_drift(self, drift):
+        self._lbl_drift.setText('\n'.join(drift_lines(drift)))
+        self._lbl_drift.setStyleSheet(
+            'background: rgb(200, 40, 40); color: white;' if drift['exceeds'] else
+            'background: rgb(40, 160, 70); color: white;')
 
     def _on_copy(self):
         folder = QFileDialog.getExistingDirectory(self, 'Save the scan to another folder')
