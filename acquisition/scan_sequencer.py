@@ -142,7 +142,7 @@ class ScanSequencer(QObject):
     # -- control ---------------------------------------------------------------
     def start(self, positions, settle_ms, avg_n, measure_fn, *,
               temp_after=(), reclen=None, validate_fn=None, record_temperature=True,
-              owner=None):
+              owner=None, no_move=False):
         """
         positions   list of {axis: target_mm}, axes among X/Y/Z
         settle_ms   wait after each move before acquiring
@@ -155,6 +155,11 @@ class ScanSequencer(QObject):
         record_temperature  False: no Arduino is opened and no temperature is read
                     (tools that store nothing, e.g. focus)
         owner       the caller, checked against a reservation (reserve())
+        no_move     True: never ask the worker to move, not even a null move; each
+                    point is taken as reached where the scanner is, then settle
+                    (the interval between measures) and acquire. Used by the
+                    stability test, which measures precisely what happens without
+                    touching the mechanics: no motor is energized between measures.
 
         Returns None when the sequence started, otherwise the reason it could
         not (nothing has been touched in that case).
@@ -184,6 +189,7 @@ class ScanSequencer(QObject):
         self._settle_ms = max(0, int(settle_ms))
         self._avg_n = max(1, int(avg_n))
         self._measure = measure_fn
+        self._no_move = bool(no_move)
         self._record_temp = bool(record_temperature)
         self._temp_after = set(temp_after) if self._record_temp else set()
         self._index = 0
@@ -317,6 +323,10 @@ class ScanSequencer(QObject):
 
     def _request_move(self):
         self._token += 1
+        if getattr(self, '_no_move', False):
+            token = self._token          # nothing goes to the worker: "reached" where it is
+            QTimer.singleShot(0, lambda: self._on_point_moved(token, True))
+            return
         self._worker.enqueue(('move_point', self._token,
                               list(self._positions[self._index].items())))
 

@@ -93,6 +93,7 @@ try:
     from focus_tool import FocusTool, FocusGroup, window_peak
     from flatness_tool import FlatnessTool, FlatnessGroup
     from scan_tool import ScanTool, ScanGroup
+    from stability_tool import StabilityTool, StabilityGroup
     _SCANNER_PANEL_ERR = None
 except Exception as _sp_err:   # e.g. pyserial missing: the rest of the GUI still works
     ScannerPanel = ScanSequencer = None
@@ -1285,6 +1286,20 @@ class EcosGUI(QMainWindow):
                                            acq_time_fn=lambda: getattr(self, '_t_ascan', None),
                                            parent=self)
         panel.add_tool_widget(FlatnessGroup(self._flatness_tool, seq), tab='calibration')
+
+        # Stability test (diagnostic, Calibration): nothing moves; its own plot tab.
+        self._plot_stability = pg.GraphicsLayoutWidget()
+        self._left_tabs.addTab(self._plot_stability, "Stability")
+        self._stability_tool = StabilityTool(
+            seq, panel, self._get_smin_smax, self._plot_stability,
+            show_plot_fn=lambda: self._left_tabs.setCurrentWidget(self._plot_stability),
+            temp_factory=self._open_seq_arduino,
+            sos_fn=water_temp2sos if _HW_AVAILABLE else self._approx_cw,
+            cw_fn=self._scanner_cw_no_read, gains_fn=self._scan_gains,
+            acq_time_fn=lambda: getattr(self, '_t_ascan', None), parent=self)
+        panel.add_tool_widget(StabilityGroup(self._stability_tool, seq), tab='calibration')
+        self._stability_tool.echo_used.connect(self._mark_echo)
+        self._stability_tool.done.connect(lambda _how: self._clear_echo_mark())
         self._flatness_tool.echo_used.connect(self._mark_echo)
         self._flatness_tool.done.connect(lambda _ok: self._clear_echo_mark())
 

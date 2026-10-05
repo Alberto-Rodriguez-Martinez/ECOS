@@ -641,14 +641,17 @@ class FocusDebugDump:
     def __len__(self):
         return len(self.entries)
 
-    def add(self, phase, x, measure, seg, env, record, window, extra=None):
+    def add(self, phase, x, measure, seg, env, record, window, extra=None, records=None):
         """extra: optional {name: scalar} per point, saved as arrays named after the keys
-        (only keys present on every point). The focus tool passes none."""
+        (only keys present on every point). records: optional {name: 1-D array} per
+        point (e.g. the full Ch1 record), stacked as (n, L) arrays. The focus tool
+        passes neither."""
         self.entries.append(dict(
             phase=phase, x=float(x), measure=measure, mode_at_measure=measure.mode,
             amp_at_measure=measure.amp, seg=np.array(seg, dtype=float),
             env=np.array(env, dtype=float), record=np.array(record, dtype=float),
-            smin=int(window[0]), smax=int(window[1]), flags='', extra=dict(extra or {})))
+            smin=int(window[0]), smax=int(window[1]), flags='', extra=dict(extra or {}),
+            records={k: np.array(v, dtype=float) for k, v in (records or {}).items()}))
 
     def set_extra(self, k, **values):
         """Update the extra columns of entry k (e.g. after a re-lock revised its measure)."""
@@ -696,8 +699,13 @@ class FocusDebugDump:
             **self._extra_arrays())
 
     def _extra_arrays(self):
-        keys = set.intersection(*[set(d['extra']) for d in self.entries]) if self.entries else set()
-        return {k: np.array([d['extra'][k] for d in self.entries]) for k in sorted(keys)}
+        if not self.entries:
+            return {}
+        keys = set.intersection(*[set(d['extra']) for d in self.entries])
+        out = {k: np.array([d['extra'][k] for d in self.entries]) for k in sorted(keys)}
+        rec = set.intersection(*[set(d.get('records', {})) for d in self.entries])
+        out.update({k: np.stack([d['records'][k] for d in self.entries]) for k in sorted(rec)})
+        return out
 
     def save(self, directory=DEFAULT_DUMP_DIR, stamp=None):
         """Write <prefix>_<stamp>.npz (never overwrites). Returns the path."""

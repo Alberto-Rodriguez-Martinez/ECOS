@@ -92,6 +92,7 @@ Tres subpestañas bajo una cabecera fija. Primero eran dos, «Movimiento y calib
 │ Calibración:                                 │
 │   Foco (5.4), con todos sus parámetros       │
 │   Planitud (5.5), con todos sus parámetros   │
+│   Test de estabilidad (5.5 bis)              │
 │                                              │
 │ Barridos (5.6):                              │
 │   Eje de la línea, rango, paso               │
@@ -109,7 +110,7 @@ Tres subpestañas bajo una cabecera fija. Primero eran dos, «Movimiento y calib
 - En la interfaz (en inglés, como el resto de ECOS) las subpestañas se llaman *Motion*, *Calibration* y *Scans*.
 - **«Movimiento» es la inicial**: es con lo que se empieza una sesión.
 - **La cabecera fija queda por encima de las tres** y no pertenece a ninguna. El foco y la planitud mueven el escáner y vuelven al centro al terminar, así que la posición tiene que verse desde «Calibración» sin cambiar de pestaña, y el STOP tiene que estar alcanzable desde cualquiera de las tres.
-- Al lanzar el foco o la planitud, la gráfica grande pasa a la vista del escáner, como antes.
+- Al lanzar el foco o la planitud, la gráfica grande pasa a la vista del escáner, como antes. El test de estabilidad tiene su propia pestaña en la gráfica grande, «Stability», con cuatro paneles frente al tiempo.
 - **Barridos: una sola sección para línea y superficie.** Una línea es el caso de una sola línea, igual que en el formato de datos (N_línea = 1). La casilla «Superficie» activa los campos del segundo eje (inicio, fin y paso; el modo relativo o absoluto es el del primero) y el recorrido: **zigzag**, que alterna el sentido del primer eje, o **un solo sentido**, en el que todas las líneas se recorren igual para que la holgura no desplace las líneas alternas.
 - Preparado para la fase 6: `ScanParams` lleva ya los campos (`surface`, `start2`, `end2`, `step2`, `path`). `ScanPlan` genera las líneas en los dos recorridos (`lines`, `all_positions`) y el tiempo estimado ya las cuenta. Solo falta la adquisición en superficie: hasta entonces, Inicio con «Superficie» marcada se rechaza con un mensaje.
 - `ScannerPanel.add_tool_widget(widget, tab='motion' | 'calibration' | 'scans')` coloca cada herramienta en su subpestaña. Las subpestañas se muestran siempre en ese orden, sea cual sea el orden en que se añadan. «Calibración» y «Barridos» se crean al añadir su primer widget, así que el panel independiente (sin ECOS) solo muestra «Movimiento».
@@ -196,6 +197,29 @@ Implementada en `acquisition/flatness_tool.py` (fase 4, `task_scanner_phase4.md`
 - Gráfica: las dos líneas como desplazamiento de la cara (µm, desde el ToF) frente a la posición relativa al centro, con sus rectas y los puntos poco fiables marcados.
 - Botones Ejecutar y **Repetir** (mismos parámetros: corriges a mano y vuelves a medir).
 - **No guarda nada** en la base de datos. Volcado de depuración opcional: un `.npz` por ejecución en `data/flatness_debug/`, con el formato del foco más las columnas `line`, `line_position`, `line_offset`, `tof_samples` y `tof_us`.
+
+### 5.5 bis Test de estabilidad (pestaña Calibración)
+Herramienta de **diagnóstico permanente**, no una fase. Está en `acquisition/stability_tool.py` (`StabilityTool`, `StabilityGroup`).
+
+**Motivo.** El 05/10, seis barridos consecutivos de la misma línea en tres minutos mostraron una **deriva de −2,46 µm/min, lineal, con un residuo de 0,78 µm**, en el sentido de que la cara se acerca al transductor de pulso-eco. Hay que saber si satura y a qué se debe. En un barrido de superficie de dieciséis minutos la deriva acumulada sería de unos **39 µm**, comparable a la estructura real de la cara, y además se confundiría con una inclinación en el eje lento.
+
+**Qué hace.** Se queda en la posición actual **sin mover ningún eje** y toma N medidas separadas por un intervalo de T segundos.
+- Reutiliza el secuenciador con la opción `no_move`: no se envía al worker ni un movimiento nulo, así que no se energiza ningún motor entre medidas, que es justo lo que se mide. El intervalo lo marca el tiempo de asentamiento.
+- Valores por defecto: **240 medidas cada 5 s (veinte minutos) y 20 promedios**. El tiempo total estimado se ve antes de empezar.
+- Pide el escáner conectado, para registrar la posición.
+- STOP activo: al parar se guarda lo medido hasta ese momento.
+
+**Por punto:**
+- **Ch2 (pulso-eco), eco frontal:** seguido con `FrontEchoTracker`. Su cambio de tiempo de vuelo respecto a la primera medida se mide por **correlación cruzada** (`CalcToFAscanCosine_XCRFFT`) de una puerta de ±banda alrededor del eco seguido, que deja fuera el eco trasero de una muestra fina. Se convierte en desplazamiento de la cara, c_w·Δt/2 (negativo: la cara se acerca al PE), y también se mide la amplitud. La interpolación del pico de la envolvente oscila ±0,3 muestras (±2 µm) con la SNR del simulador; vale para el foco, pero no para derivas de µm. Se guarda igualmente como referencia (`tof_ch2_samples`).
+- **Ch1 (transmisión a través de la pieza):** cambio de tiempo de vuelo por correlación cruzada con el primer registro completo, y máximo de la envolvente.
+- **Temperatura en cada punto**, con una sola instancia de `Arduino` durante toda la medida. La serie de temperatura es tan importante como la de tiempo de vuelo: la medida existe para saber si la temperatura explica la deriva. Si una lectura tarda más de 0,5 s, se lee cada pocos puntos (`temp_every`), se avisa y queda en los metadatos (`temp_read_s`, `temp_note`).
+- **Registros completos de los dos canales.**
+
+**Por qué los dos canales.** Si la pieza se hincha, la cara se acerca y el espesor crece, y Ch1 lo ve. Si lo que se mueve es el portamuestras, la cara se acerca y el espesor no cambia: Ch1 queda plano. Así la medida distingue las dos causas. Está comprobado con el simulador en los dos casos.
+
+**Salida.** Cuatro paneles frente al tiempo (desplazamiento de la cara, ΔToF de Ch1, amplitudes y temperaturas) y las tasas de deriva en vivo (µm/min, ns/min, °C/min, con su residuo RMS). Además, el volcado de depuración, que se escribe siempre (`data/stability_debug/`):
+- por punto: `record` (Ch2 completo), `record_ch1`, `t_s`, `epoch`, `T1`, `T2`, `temp_read`, `face_um`, `ch1_dtof_ns`, `tof_ch2_samples`, `amp_ch2_db`, `amp_ch1_db`, y las columnas del foco (ventana, envolvente, pico, banda, motivo);
+- en `meta_json`: lo que escriben las otras herramientas (`settle_ms` = intervalo, `avg_n`, `gain_ch1_db`, `gain_ch2_db`, `temperature`), más la **posición**, el **intervalo** (`interval_s`), el **número de medidas** (`n_requested`, `n_measured`), `temp_every` y las tasas de deriva ajustadas.
 
 ### 5.6 Barridos
 - Tipo: línea (lateral o Z) o superficie (lateral × Z).
