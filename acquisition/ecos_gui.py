@@ -1303,10 +1303,15 @@ class EcosGUI(QMainWindow):
         self._flatness_tool.echo_used.connect(self._mark_echo)
         self._flatness_tool.done.connect(lambda _ok: self._clear_echo_mark())
 
-        # Line scan (phase 5): saves to ../database; references with their own gains.
+        # Line and surface scans (phases 5 and 6): save to ../database; references
+        # with their own gains. A surface draws its 2-D maps in their own tab.
         self._scan_session_lock = False
+        self._plot_scan_map = pg.GraphicsLayoutWidget()
+        self._left_tabs.addTab(self._plot_scan_map, "Scan map")
         self._scan_tool = ScanTool(
             seq, panel, self._get_smin_smax, self._plot_scan,
+            map_widget=self._plot_scan_map,
+            show_map_fn=lambda: self._left_tabs.setCurrentWidget(self._plot_scan_map),
             acquire_fn=self._seq_acquire,
             gains_fn=self._scan_gains,
             set_gains_fn=self._scan_set_gains,

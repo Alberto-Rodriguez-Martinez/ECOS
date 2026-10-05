@@ -1,6 +1,6 @@
 # Especificación: pestaña Escáner en ECOS
 
-Estado: aprobada. Fase 1 implementada y probada en hardware (21–24/09). Fase 3 (foco) cerrada tras las pruebas en hardware (30/09). Fases 4 (planitud) y 5 (barrido en línea, referencias en agua y guardado) implementadas y probadas con el SeDaq sintético, pendientes de prueba en hardware. Formato de barrido `scan-32-2.0` (señales enteras, task_scan_int16.md). Última revisión: 2026-10-05.
+Estado: aprobada. Fase 1 implementada y probada en hardware (21–24/09). Fase 3 (foco) cerrada tras las pruebas en hardware (30/09). Fases 4 (planitud) y 5 (barrido en línea, referencias en agua y guardado) implementadas y probadas con el SeDaq sintético, pendientes de prueba en hardware. Fase 6 (barrido en superficie, espesor por punto, punto testigo) implementada y probada con el SeDaq sintético y en la GUI con el escáner simulado; el espesor, comprobado además sobre los barridos reales del 05/10; pendiente de prueba en hardware. Formato de barrido `scan-32-3.0` (se siguen leyendo los `scan-32-2.0`). Última revisión: 2026-10-05.
 
 ## 1. Contexto
 
@@ -99,7 +99,13 @@ Tres subpestañas bajo una cabecera fija. Primero eran dos, «Movimiento y calib
 │   [ ] Superficie → segundo eje (el otro de   │
 │       lateral/Z), su rango y paso, recorrido │
 │       en zigzag o en un solo sentido         │
-│   Asentamiento, promedios, mapa              │
+│   Asentamiento, asentamiento del cambio de   │
+│   línea, promedios                           │
+│   Mapa: magnitud, escala, ToF corregido,     │
+│   amplitud al lado                           │
+│   Espesor (c nominal, correlación mínima)    │
+│   Punto testigo (posición, cada N líneas,    │
+│   umbral de salto)                           │
 │   Referencias en agua (ganancias, promedios) │
 │   Operador, comentario, límites de deriva    │
 │   Tiempo estimado; Inicio / Pausa / Parar;   │
@@ -112,7 +118,7 @@ Tres subpestañas bajo una cabecera fija. Primero eran dos, «Movimiento y calib
 - **La cabecera fija queda por encima de las tres** y no pertenece a ninguna. El foco y la planitud mueven el escáner y vuelven al centro al terminar, así que la posición tiene que verse desde «Calibración» sin cambiar de pestaña, y el STOP tiene que estar alcanzable desde cualquiera de las tres.
 - Al lanzar el foco o la planitud, la gráfica grande pasa a la vista del escáner, como antes. El test de estabilidad tiene su propia pestaña en la gráfica grande, «Stability», con cuatro paneles frente al tiempo.
 - **Barridos: una sola sección para línea y superficie.** Una línea es el caso de una sola línea, igual que en el formato de datos (N_línea = 1). La casilla «Superficie» activa los campos del segundo eje (inicio, fin y paso; el modo relativo o absoluto es el del primero) y el recorrido: **zigzag**, que alterna el sentido del primer eje, o **un solo sentido**, en el que todas las líneas se recorren igual para que la holgura no desplace las líneas alternas.
-- Preparado para la fase 6: `ScanParams` lleva ya los campos (`surface`, `start2`, `end2`, `step2`, `path`). `ScanPlan` genera las líneas en los dos recorridos (`lines`, `all_positions`) y el tiempo estimado ya las cuenta. Solo falta la adquisición en superficie: hasta entonces, Inicio con «Superficie» marcada se rechaza con un mensaje.
+- Fase 6: con «Superficie» marcada, Inicio adquiere la superficie (ya no se rechaza). El recorrido por defecto es el zigzag. El mapa de una superficie se dibuja en su propia pestaña de la gráfica grande, «Scan map»; el de una línea sigue en «Scanner».
 - `ScannerPanel.add_tool_widget(widget, tab='motion' | 'calibration' | 'scans')` coloca cada herramienta en su subpestaña. Las subpestañas se muestran siempre en ese orden, sea cual sea el orden en que se añadan. «Calibración» y «Barridos» se crean al añadir su primer widget, así que el panel independiente (sin ECOS) solo muestra «Movimiento».
 
 ## 5. Pestaña Escáner (columna derecha)
@@ -228,8 +234,9 @@ Herramienta de **diagnóstico permanente**, no una fase. Está en `acquisition/s
 - Espera tras cada movimiento (ms), configurable. Número de promedios por punto.
 - Tiempo estimado mostrado antes de empezar.
 - Mapa en vivo con la magnitud que elija el usuario:
-  - Amplitud máxima en la ventana.
+  - Espesor entre los ecos 1 y 2 (por defecto, fase 6).
   - Tiempo de vuelo.
+  - Amplitud máxima en la ventana.
   - Energía en la ventana.
   - Ampliable a otras magnitudes.
 - Pausa, continuar y parar. Al parar, se ofrece guardar lo adquirido hasta ese momento.
@@ -264,10 +271,10 @@ Cada referencia (inicial y final) se guarda en el archivo del barrido con: seña
 ```
 PVA_10_PG_5_A_C005_SCAN_20260925_171200/
   meta.json    specimen, protocol, equipment (parámetros del pulser), bloque scanner_session,
-               parámetros del barrido, conversión, operator y comentario. schema_version: "scan-32-2.0"
+               parámetros del barrido, conversión, operator y comentario. schema_version: "scan-32-3.0"
   scan.npz     señales (N_línea × N_punto × N_muestras) por canal, coordenadas reales de cada
-               punto, temperaturas con su marca de tiempo e índice, y las referencias en agua
-               con su ganancia, posición, hora y temperatura
+               punto, temperaturas con su marca de tiempo e índice, las referencias en agua
+               con su ganancia, posición, hora y temperatura, y la serie del punto testigo
 ```
 
 - Sin `results.json`: en un barrido los resultados se calculan después, en el análisis.
@@ -308,7 +315,7 @@ En `acquisition/scan_tool.py` (`ScanTool`, `ScanGroup`). Reutiliza el secuenciad
 **Temperatura:** una sola instancia de `Arduino` para toda la sesión. Se lee al empezar, en cada referencia y al terminar, con `point` = índice del último punto adquirido (−1 antes del primero). c_w sale de esas lecturas con `water_temp2sos`. Sin PT100: NaN, aviso y nunca un diálogo.
 
 **Guardado**
-- `BD_Experimentos_PVA.save_scan_raw_32` / `load_scan_raw_32`, esquema **`scan-32-2.0`**, carpeta `database/PVA_..._SCAN_<ts>/` con `meta.json` + `scan.npz` (comprimido). Contenido: coordenadas reales, tiempos, temperaturas (`temp_label`, `temp_point`, `temp_time`, `temp_T1`, `temp_T2`) y referencias `ref_<initial|final>_{sum1, sum2, offset1, offset2, avg_n, gains, coords, time, T1, T2}`.
+- `BD_Experimentos_PVA.save_scan_raw_32` / `load_scan_raw_32`, esquema **`scan-32-2.0`** (fase 5; desde la fase 6, `scan-32-3.0`, más abajo), carpeta `database/PVA_..._SCAN_<ts>/` con `meta.json` + `scan.npz` (comprimido). Contenido: coordenadas reales, tiempos, temperaturas (`temp_label`, `temp_point`, `temp_time`, `temp_T1`, `temp_T2`) y referencias `ref_<initial|final>_{sum1, sum2, offset1, offset2, avg_n, gains, coords, time, T1, T2}`.
 - **Señales en enteros** (desde `scan-32-2.0`, 2026-10-05; `database/scan_counts.py`):
   - Lo que se mide en cada punto es la media de N capturas, cada una con su media del registro restada, como hace ECOS. Esa media no es un entero: el promediado da resolución por debajo del bit menos significativo, y eso es información real. Por eso no se guarda la media redondeada a cuentas, sino la **suma entera** de (cuenta − punto medio) de las N capturas, más un **desplazamiento por punto y canal**. El desplazamiento es la media del registro completo, que no se puede recalcular porque solo se guarda la ventana.
   - El flotante de ECOS es `x = suma / (fondo_escala · N) − desplazamiento`. Lo calcula la misma función (`counts_to_float`) al medir (`ecos_gui._seq_acquire`, que adquiere por sumas) y al leer, así que la lectura lo reconstruye **bit a bit**.
@@ -329,6 +336,51 @@ En `acquisition/scan_tool.py` (`ScanTool`, `ScanGroup`). Reutiliza el secuenciad
 
 **Parámetros de medida en los volcados** (foco, planitud y barrido, 05/10): los tres escriben en `meta_json`, con las mismas claves, `settle_ms`, `avg_n`, `gain_ch1_db`, `gain_ch2_db` y `temperature`. Este último es un diccionario con `T1`, `T2`, `time` y `source` de la última lectura real de los PT100, o `null` si no la hay; las temperaturas supuestas o manuales no cuentan. Así se pueden comparar volcados entre sí sin deducir por la hora del archivo con qué se midió cada uno. En el foco y la planitud la temperatura es la leída al lanzar la herramienta; en el barrido, la lectura de inicio.
 
+#### Implementación del barrido en superficie (fase 6, `task_scanner_phase6.md`)
+En `acquisition/scan_tool.py`, sobre el mismo `ScanTool`: una línea es el caso de una sola línea. Reutiliza el secuenciador (fase 2), el seguimiento del eco frontal (fase 3) y el barrido en línea (fase 5); no hay bucle nuevo ni detector de ecos nuevo.
+
+**Qué lo motiva (medidas del 05/10, línea de 21 puntos con paso de 0,5 mm):** el ruido sigue 1/√N y es electrónico (0,93–0,99 µm de temblor con 20 promedios; asentar 1000 ms no mejora a 100 ms); el temblor lo manda la SNR del eco (0,41 µm sobre acero a 0 dB, 0,99 µm sobre PVA), así que no será uniforme en el mapa; el PVA **deriva −4,34 µm/min a tirones** (97,5 µm en 21 min, saltos aislados de 5–7 µm; el acero, +0,32 µm/min sin saltos: es la muestra, no el escáner); y el **espesor entre los ecos 1 y 2 es inmune a esa deriva** (residuo de 0,20 µm frente a 2,4 µm de la posición de la cara).
+
+**Secuencia (`scan_schedule`)**
+- Todo el barrido es **una sola secuencia** del secuenciador: los puntos de todas las líneas en el orden del recorrido y las visitas al testigo. Pausa, continuar y parar funcionan en cualquier punto.
+- **Recorrido**: zigzag por defecto; un solo sentido como opción.
+- **Orden de ejes fijo**: dentro de una línea solo se mueve el eje de la línea; en un cambio de línea, en una visita al testigo y al volver de él se mueve **primero el otro eje** y después el de la línea; al volver al inicio, primero el eje de la línea y después el otro. Queda escrito en `meta.json["scan"]["axis_order"]`.
+- **Asentamiento por punto**: el secuenciador admite un asentamiento por posición. Tras un **movimiento largo** (primer punto de cada línea, incluido el primero del barrido, y cada visita al testigo) se usa `line_settle_ms`, **1000 ms por defecto, no caracterizado**; entre puntos vecinos, los 100 ms medidos (válidos para pasos ≤ 0,5 mm).
+- Se guarda la posición **real** releída en cada punto, como en la fase 5.
+
+**Espesor por punto (`echo_tracking.echo_pair_delay`)**
+- Eco 1: el frontal seguido. Eco 2: el **primer lóbulo claro** de la envolvente después del eco 1 (`echo_lobes`, la misma regla que el primer pico), con las dos puertas de ±banda sin solaparse. Retardo = distancia entre picos + desplazamiento por **correlación cruzada** de las dos puertas (`CalcToFAscanCosine_XCRFFT`, que toma el máximo de |xcorr|, así que mide también un eco 2 invertido; la polaridad se guarda).
+- **Coeficiente de correlación** de las puertas alineadas en cada punto, como indicador de calidad: por debajo de `min_corr` (0,9) el punto se marca `low_corr` (eco deformado: cara inclinada).
+- **Comprobación antes de empezar**: una adquisición en la posición de inicio; si el eco 2 no está dentro de Smin–Smax (o toca el margen de borde), se avisa antes de mover nada, el espesor queda **deshabilitado** para todo el barrido y la magnitud no se ofrece en el mapa. En cada punto, sin eco 2: NaN y marca `no_back`. Nunca se da un número medido contra el borde de la ventana.
+- Espesor en mm con una velocidad **nominal** de la muestra (1540 m/s, editable), solo para el mapa en vivo; lo que se mide y se guarda es el retardo (`echo_delay_us`). Es la **magnitud por defecto** del mapa.
+- Comprobado sobre los seis barridos reales consecutivos del 05/10 (13:51–13:53): eco 2 encontrado en los 21 puntos, polaridad invertida, correlación 0,89–0,99 y repetibilidad punto a punto de **0,21 µm** (mediana), la misma que se midió.
+
+**Punto testigo**
+- Opcional, **activado por defecto**. Posición: el primer punto del barrido (por defecto), la posición al pulsar Inicio o una absoluta (lateral, Z). Se visita **antes de la primera línea, cada N líneas (N = 1 por defecto) y después de la última**.
+- Cada visita se mide como un punto normal, con su propio seguimiento (las líneas conservan su ancla), y se guarda con su posición real, tiempo de vuelo, amplitud, espesor, marca de tiempo e índice de línea (las líneas completadas antes de la visita), más sus señales.
+- **Desplazamiento de la cara** respecto a la primera visita por **correlación cruzada** de una puerta de ±banda alrededor del eco seguido, como en el test de estabilidad: el pico de la envolvente oscila ±0,3 muestras (±2 µm) en el simulador, que vale para un mapa pero no para saltos de pocos µm. El tiempo de vuelo de cada visita sigue siendo el del pico de la envolvente, como en cualquier punto: el estimador del barrido no cambia.
+- **Saltos**: tendencia = mediana de la velocidad de todos los intervalos entre visitas (robusta al propio salto); un intervalo cuyo desplazamiento se aparta de ella más que el umbral (**4 µm** por defecto, ≈ 3σ de la diferencia de dos visitas con el temblor del 05/10, por debajo de los saltos de 5–7 µm) deja **en duda las líneas medidas en él**. Una visita sin eco también. Con menos de tres intervalos la tendencia no es robusta.
+- **No se corrige nada en el archivo.** La corrección de deriva es del análisis y **nunca se aplica al espesor**. El mapa en vivo puede mostrar el tiempo de vuelo corregido (casilla, interpolando el testigo en el tiempo), indicándolo en el título.
+- El tiempo estimado cuenta las visitas y sus movimientos.
+
+**Temperatura:** además del inicio, el final y las referencias, **al acabar cada línea** de una superficie, con su marca de tiempo, el índice del último punto y el **índice de línea** (`temp_line`). Sin PT100, NaN y aviso al empezar, sin diálogos. Cada archivo lleva en `meta.json["scan"]["temperature_note"]` que **el PT100 está en el fondo de la vasija y no en el camino del haz**: 0,07 K en la capa límite alrededor de una pieza recién metida valen 5 µm de tiempo de vuelo (05/10), así que sigue la tendencia pero no da la temperatura del agua que atraviesa el haz. Es una limitación del montaje, no del programa.
+
+**Mapa en vivo 2-D (`SurfaceMap`, pestaña «Scan map»)**
+- Lateral en horizontal y Z en vertical, creciendo hacia abajo, como ve la cara el transductor PE. Se dibuja según llegan los puntos (línea a línea), no al final.
+- Magnitudes: espesor (por defecto), tiempo de vuelo de la cara, amplitud, energía y correlación del espesor; el registro de la fase 5 sigue permitiendo añadir más sin tocar el barrido.
+- **Mapa de amplitud al lado** (casilla, activada): la amplitud dice dónde fiarse del otro.
+- Barra de color con unidades; escala automática o fija.
+- pyqtgraph 0.11: `ImageItem` alimentado con una imagen RGBA coloreada aquí, colores como tuplas RGB; la barra de color es otro `ImageItem` (`ColorBarItem` no existe en 0.11). Gris: medido sin valor; transparente: aún sin medir.
+
+**Tiempo estimado:** sobre la secuencia completa: recorrido de cada movimiento (6,7 mm/s), asentamiento de cada entrada (con el del cambio de línea), promedios de cada punto y visita, una **sobrecarga por movimiento de 0,2 s** (medida el 05/10: 0,43 s por punto con 5 promedios y 0,57 s con 20, de los que unos 0,28 s son movimiento y proceso, 0,075 s de ellos el recorrido, 9,5 ms cada A-scan y el resto el asentamiento), la lectura de temperatura de cada línea (cronometrada; hasta la primera no se cuenta, y se dice) y las referencias. Aviso por encima de media hora. Con el escáner de prueba de los tests coincide con el real a un 3 %; en la GUI con el escáner simulado (que pasa por el sondeo de 0,1 s del driver) queda un 22–28 % por debajo.
+
+**Formato `scan-32-3.0`** (`save_scan_raw_32` / `load_scan_raw_32`)
+- El cubo va en **orden espacial**: `[k, j]` es la línea k en la posición j de `positions_requested`, sea cual sea el recorrido (una línea en zigzag se adquiere con j decreciente). `acq_index` y `point_time` dan el orden de adquisición. `N_línea` = líneas con algún punto adquirido.
+- **Línea parcial**: al parar a mitad se guarda la línea entera, con los puntos que faltan rellenos (señales 0; offsets, coordenadas y tiempos NaN, así que al leer las señales salen NaN); `point_valid` marca lo adquirido, y `line_partial`, `meta.json["scan"]["line_status"]` y `partial_line` marcan la línea. Vale también para una línea suelta parada.
+- Nuevo en `scan.npz`: `point_valid`, `acq_index`, `positions_requested` (N_línea × N_punto), `line_position_requested`, `line_partial`, `line_doubtful`; `live_<magnitud>` (los valores del mapa en vivo, como metadatos), `echo_delay_us` y `echo_polarity`; `temp_line`; y la serie del testigo `witness_*` (señales con la misma conversión, `witness_ch1/2` al leer, offsets, coordenadas reales y pedidas, tiempo, línea, visita, `tof_us`, `amplitude`, `face_um`, `thickness_mm`, `thickness_corr`, `lost`).
+- Nuevo en `meta.json["scan"]`: `type` (`line` o `surface`), `axis2`, `path`, rango del segundo eje, `lines_requested`, `n_lines`, `n_lines_acquired`, `line_status`, `partial_line`, `array_order`, `axis_order`, `temperature_note`, `line_settle_ms`, `thickness` (método, puerta, c nominal, correlación mínima, si estaba habilitado y por qué no) y `witness` (modo, posición, periodo, umbral, visitas, tendencia, desviación de cada intervalo, líneas en duda y líneas posteriores a la última visita). `flags` se indexa ahora por `"línea,j"`.
+- `load_scan_raw_32` sigue leyendo los `scan-32-2.0` (los barridos en línea del 05/10): una línea con todos los puntos válidos (`point_valid` se añade al leer).
+
 ## 6. Seguridad
 
 - `SN` (`unlimitedDiffMove*`) solo se usa en el **modo de movimiento libre**, activado explícitamente por el usuario con confirmación y con aviso visible en pantalla. Nunca en foco, planitud ni barridos.
@@ -345,8 +397,8 @@ En `acquisition/scan_tool.py` (`ScanTool`, `ScanGroup`). Reutiliza el secuenciad
 3. Foco.
 4. Planitud.
 5. Barrido en línea, referencias en agua y guardado (el guardado se adelantó desde la fase 6: el formato ya admite las dos dimensiones y la línea es el caso de una fila).
-6. Barrido en superficie (añade la segunda dimensión y la lectura de temperatura al acabar cada línea).
-   - **Nota para la fase 6 (05/10, no implementado):** los 100 ms de asentamiento valen entre puntos contiguos de una línea. El cambio de línea en un barrido **en un solo sentido** es un retorno de decenas de milímetros y excitará la mecánica mucho más. Hará falta un asentamiento propio para ese movimiento, o usar zigzag, que no tiene retorno.
+6. Barrido en superficie (añade la segunda dimensión y la lectura de temperatura al acabar cada línea), con el espesor por punto y el punto testigo (`task_scanner_phase6.md`, sección 5.6).
+   - El cambio de línea tiene su propio asentamiento (1000 ms por defecto, **no caracterizado**): en un solo sentido es un retorno de decenas de milímetros. El zigzag, el recorrido por defecto, no tiene retorno.
 
 Cada fase termina con prueba en hardware y commit.
 
@@ -358,6 +410,9 @@ Cada fase termina con prueba en hardware y commit.
 - Estimador de tiempo de vuelo que se reutiliza de ECOS: `LongVelocity_Thickness` usa `CalcToFAscanCosine_XCRFFT`, que es el candidato.
 - **Resolución real del ADC**: no se puede leer del equipo y se suponen 10 bits (sección 5.6). Confirmarla con la documentación del SeDaq.
 - Relación entre el parámetro de velocidad y los mm/s de cada eje: calibrar si se necesita una velocidad concreta.
+- **Asentamiento del cambio de línea** (fase 6): 1000 ms supuestos, sin caracterizar. Medirlo como el de los 100 ms (dos barridos iguales con valores distintos), en zigzag y en un solo sentido.
+- **Umbral de salto del testigo** (4 µm): elegido con el temblor del 05/10; comprobar la tasa de falsos saltos en hardware.
+- **Sobrecarga por movimiento** del tiempo estimado (0,2 s): medida con pasos de 0,5 mm; comprobar en superficie, con los cambios de línea y las visitas al testigo.
 
 ### Resueltos
 - `BITS_OPTIONS` en `ecos_gui.py` era código muerto: se ha sustituido por el parámetro `ADC_BITS` (10 bits supuestos), que usan `_update_plots`, `_acquire_avg` y la adquisición por sumas, y que se escribe en cada barrido (05/10).

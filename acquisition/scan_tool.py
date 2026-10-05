@@ -1,9 +1,28 @@
 # -*- coding: utf-8 -*-
 """
-scan_tool.py — Line scan with live map, water references and saving (scanner phase 5).
+scan_tool.py — Line and surface scans with live maps, water references, thickness,
+witness point and saving (scanner phases 5 and 6).
 ECOS project - Universidad Miguel Hernandez - Dpto. Ingenieria de Comunicaciones
 
-See task_scanner_phase5.md and scanner_tab_spec.md section 5.6.
+See task_scanner_phase5.md, task_scanner_phase6.md and scanner_tab_spec.md 5.6.
+
+Phase 6 (surface). A line is the case of a single line. The whole scan is one
+sequence (scan_schedule): every point of every line in the order of the path
+(zigzag by default, or always the same direction) and the witness visits, with
+a fixed axis order and its own settle per entry (a longer, not characterized
+one after every long move: line change, witness visit). Per point, besides the
+phase-5 values:
+    - thickness: echo 1 → echo 2 by cross-correlation (echo_pair_delay) and the
+      correlation coefficient as its quality. Checked at Start: if echo 2 does
+      not fit in Smin–Smax it is disabled and not offered. Immune to the drift
+      of the sample, so it is the default magnitude of the map;
+    - witness point: a fixed point measured again every N lines. Saved raw; the
+      lines where it jumps off the trend are marked as doubtful. The drift is
+      corrected only in the analysis (and, if asked, on the live ToF map), and
+      never on the thickness.
+The temperature is also read at the end of every line. The live map of a
+surface is 2-D (SurfaceMap), drawn as the lines come in. Saved in spatial order
+(N_line × N_point), a stopped line padded and marked as partial.
 
 A line scan moves the lateral axis or Z (never the beam axis, never R) over a
 range [start, end] with a step, absolute or relative to the position at Start.
@@ -115,6 +134,12 @@ DEFAULT_WITNESS_EVERY = 1
 DEFAULT_WITNESS_JUMP_UM = 4.0
 WITNESS_MODES = ('first', 'start', 'custom')
 LONG_SCAN_S = 30 * 60          # warn above half an hour
+# Per-move overhead besides the travel at MOVE_MM_S: command, read-back of the axes
+# and processing. MEASURED on 05/10 (line of 21 points, 0.5 mm steps, no water
+# references): 0.43 s per point with 5 averages and 0.57 s with 20, of which about
+# 0.28 s is movement and processing (0.075 s of it the travel), 9.5 ms each A-scan
+# and the rest the settle.
+MOVE_OVERHEAD_S = 0.2
 DEFAULT_DRIFT_DB = 0.5         # reference drift warnings: amplitude [dB] …
 DEFAULT_DRIFT_NS = 20.0        # … and ToF [ns] (~0.1 °C of water over a 60 mm path)
 DEFAULT_DUMP_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)),
@@ -262,8 +287,27 @@ class ScanParams:
     path: str = 'zigzag'                 # 'zigzag' or 'same' (always the same direction)
 
 
-SURFACE_PENDING = ('Surface scans are prepared but not implemented yet (phase 6): '
-                   'uncheck «Surface» to run a line.')
+SCAN_ARRAYS_DOC = {
+    'point_valid': 'bool (N_line, N_point): the point was acquired (False on the rest of a '
+                   'partial line; its signals are 0, offsets, coords and times NaN)',
+    'acq_index': 'int64 (N_line, N_point): acquisition order of each point, -1 if not acquired',
+    'positions_requested': 'float64 (N_line, N_point): planned position on the line axis',
+    'line_position_requested': 'float64 (N_line,): planned position on the other axis',
+    'line_partial': 'bool (N_line,): line stopped before its end',
+    'line_doubtful': 'bool (N_line,): the witness jumped (or was lost) while it was measured',
+    'live_<magnitude>': 'float64 (N_line, N_point): live-map values (thickness [mm] at the '
+                        'nominal c_sample, thickness_corr, tof [µs], amplitude, energy); metadata '
+                        'only, the results are computed in the analysis',
+    'echo_delay_us': 'float64 (N_line, N_point): echo 1 → echo 2 by cross-correlation (NaN '
+                     'where there is no echo 2)',
+    'echo_polarity': 'int8 (N_line, N_point): +1 / -1 polarity of echo 2 relative to echo 1, '
+                     '0 not measured',
+}
+PT100_NOTE = ('The PT100 probes are at the bottom of the tank, NOT in the beam path. Measured '
+              'on 05/10: 0.07 K in the boundary layer around a freshly immersed piece is worth '
+              '5 µm of time of flight. These temperatures follow the trend of the water; they '
+              'are not the temperature of the water the beam crosses. A limitation of the '
+              'set-up, not of the program.')
 
 
 class ScanPlan:
@@ -476,19 +520,22 @@ def witness_correction(t, times, values):
     return np.interp(t, ts[ok], vs[ok] - vs[ok][0])
 
 
-def estimate_scan_s(plan, acq_s, move_mm_s=MOVE_MM_S):
+def estimate_scan_s(plan, acq_s, move_mm_s=MOVE_MM_S, overhead_s=0.0, temp_s=0.0):
     """Seconds, over the whole schedule (scan_schedule): travel of every move (lines,
     line changes, witness visits) and back to the start, the settle of each entry
-    (long-move settle included), the averages of every point and witness visit, and
-    the two reference acquisitions (the manual steps are not included)."""
+    (long-move settle included), the averages of every point and witness visit, a
+    per-move overhead (command, read-back, processing: MOVE_OVERHEAD_S on the real
+    equipment), one temperature reading per line (temp_s each) and the two
+    reference acquisitions (the manual steps are not included)."""
     p = plan.params
     total, cur = 0.0, dict(plan.start_coords)
     for e in scan_schedule(plan):
         travel = sum(abs(v - cur.get(a, v)) for a, v in e.pos.items())
         cur.update(e.pos)
-        total += travel / move_mm_s + e.settle_ms / 1000.0 + p.avg_n * acq_s
+        total += travel / move_mm_s + e.settle_ms / 1000.0 + p.avg_n * acq_s + overhead_s
     total += sum(abs(cur[a] - plan.start_coords[a]) for a in (plan.axis, plan.other)) \
-        / move_mm_s
+        / move_mm_s + overhead_s
+    total += len(plan.lines) * temp_s
     if p.references:
         total += 2 * p.ref_avg_n * acq_s
     return total
@@ -649,7 +696,7 @@ def _pts(xs):
 #  Qt part
 # ===========================================================================
 import pyqtgraph as pg  # noqa: E402
-from PyQt5.QtCore import QObject, QTimer, pyqtSignal  # noqa: E402
+from PyQt5.QtCore import QObject, QRectF, QTimer, pyqtSignal  # noqa: E402
 from PyQt5.QtWidgets import (  # noqa: E402
     QCheckBox, QComboBox, QDoubleSpinBox, QFileDialog, QFormLayout, QGroupBox, QHBoxLayout,
     QLabel, QLineEdit, QPushButton, QSpinBox, QWidget,
@@ -708,6 +755,126 @@ class ScanPlot:
         pw.enableAutoRange()
 
 
+# Colour map of the surface maps (viridis anchors), as RGB tuples; NaN and the
+# points not measured yet get their own colours.
+_CMAP_ANCHORS = ((68, 1, 84), (59, 82, 139), (33, 145, 140), (94, 201, 98), (253, 231, 37))
+_COL_NAN = (120, 120, 120, 255)          # measured, no value (echo lost, no echo 2)
+_COL_EMPTY = (0, 0, 0, 0)                # not measured yet
+
+
+def colour_lut(n=256):
+    """(n, 3) uint8 lookup table interpolated through _CMAP_ANCHORS."""
+    anchors = np.array(_CMAP_ANCHORS, dtype=float)
+    x = np.linspace(0.0, 1.0, len(anchors))
+    t = np.linspace(0.0, 1.0, n)
+    return np.stack([np.interp(t, x, anchors[:, c]) for c in range(3)], axis=1).astype(np.uint8)
+
+
+_LUT = colour_lut()
+
+
+def map_levels(values, scale=None):
+    """(lo, hi) of a map: the fixed scale, or the finite range of the values."""
+    if scale is not None:
+        lo, hi = float(scale[0]), float(scale[1])
+    else:
+        v = np.asarray(values, dtype=float)
+        v = v[np.isfinite(v)]
+        lo, hi = (float(v.min()), float(v.max())) if v.size else (0.0, 1.0)
+    if not hi > lo:
+        pad = max(abs(lo) * 1e-3, 1e-12)
+        lo, hi = lo - pad, hi + pad
+    return lo, hi
+
+
+def map_rgba(grid, measured, lo, hi):
+    """RGBA uint8 image of a 2-D grid: LUT colour, _COL_NAN where measured but NaN,
+    transparent where not measured yet."""
+    g = np.asarray(grid, dtype=float)
+    out = np.zeros(g.shape + (4,), dtype=np.uint8)
+    ok = np.isfinite(g) & measured
+    idx = np.clip(((g[ok] - lo) / (hi - lo) * (len(_LUT) - 1)).round(), 0, len(_LUT) - 1)
+    out[ok, :3] = _LUT[idx.astype(int)]
+    out[ok, 3] = 255
+    out[measured & ~np.isfinite(g)] = _COL_NAN
+    out[~measured] = _COL_EMPTY
+    return out
+
+
+class SurfaceMap:
+    """
+    Live 2-D maps of a surface scan in a GraphicsLayoutWidget (pyqtgraph 0.11:
+    ImageItem fed with an RGBA array coloured here, colours as RGB tuples, and a
+    colour bar built from an ImageItem, since ColorBarItem is later than 0.11).
+    Lateral horizontal, Z vertical and growing downwards, as the PE transducer
+    sees the face. The main map (chosen magnitude) and optionally the amplitude
+    beside it: the amplitude says where to trust the other one.
+    """
+
+    def __init__(self, layout_widget):
+        self.widget = layout_widget
+        self.panels = {}                # name -> (plot, image, bar plot, bar image, marks)
+        self.last = {}                  # name -> (grid lat × z, levels): for inspection
+
+    def reset(self, names, titles, units, lat_vals, z_vals):
+        """names: magnitudes shown (main first); lat_vals / z_vals: ascending grid centres."""
+        w = self.widget
+        w.clear()
+        self.panels, self.last = {}, {}
+        self._lat = np.asarray(lat_vals, dtype=float)
+        self._z = np.asarray(z_vals, dtype=float)
+        dl = float(np.median(np.diff(self._lat))) if self._lat.size > 1 else 1.0
+        dz = float(np.median(np.diff(self._z))) if self._z.size > 1 else 1.0
+        rect = QRectF(self._lat[0] - dl / 2, self._z[0] - dz / 2,
+                      dl * self._lat.size, dz * self._z.size)
+        for col, name in enumerate(names):
+            plot = w.addPlot(row=0, col=2 * col, title=titles[name])
+            plot.setLabel('bottom', 'Lateral', units='mm')
+            plot.setLabel('left', 'Z (down)', units='mm')
+            for ax in ('bottom', 'left'):
+                plot.getAxis(ax).enableAutoSIPrefix(False)
+            plot.getViewBox().invertY(True)
+            plot.getViewBox().setAspectLocked(True)
+            img = pg.ImageItem()
+            # 0.11: setRect scales by the image size, so the (empty) image goes first
+            img.setImage(np.zeros((self._lat.size, self._z.size, 4), dtype=np.uint8),
+                         autoLevels=False)
+            img.setRect(rect)
+            plot.addItem(img)
+            marks = pg.ScatterPlotItem(symbol='x', size=9, pen=pg.mkPen(_COL_FLAG, width=2),
+                                       brush=pg.mkBrush(_COL_FLAG))
+            plot.addItem(marks)
+            bar = w.addPlot(row=0, col=2 * col + 1)
+            bar.setMaximumWidth(80)
+            bar.hideAxis('bottom')
+            bar.setLabel('left', '', units=units[name] or None)
+            bar.getAxis('left').enableAutoSIPrefix(False)
+            bar.setMouseEnabled(x=False, y=False)
+            bar_img = pg.ImageItem()
+            bar_img.setImage(map_rgba(np.linspace(0.0, 1.0, 256)[None, :],
+                                      np.ones((1, 256), bool), 0.0, 1.0), autoLevels=False)
+            bar.addItem(bar_img)
+            self.panels[name] = (plot, img, bar, bar_img, marks)
+
+    def set_title(self, name, title):
+        if name in self.panels:
+            self.panels[name][0].setTitle(title)
+
+    def set_data(self, name, grid, measured, marks_xy=(), scale=None):
+        """grid, measured: (n_lat, n_z); marks_xy: [(lat, z)] of marked points."""
+        if name not in self.panels:
+            return
+        plot, img, bar, bar_img, marks = self.panels[name]
+        lo, hi = map_levels(np.asarray(grid)[measured], scale)
+        img.setImage(map_rgba(grid, measured, lo, hi), autoLevels=False)
+        bar_img.setRect(QRectF(0.0, lo, 1.0, hi - lo))
+        bar.setYRange(lo, hi, padding=0)
+        bar.setXRange(0.0, 1.0, padding=0)
+        xy = list(marks_xy)
+        marks.setData([p[0] for p in xy], [p[1] for p in xy])
+        self.last[name] = (np.array(grid, dtype=float), (lo, hi))
+
+
 class ScanTool(QObject):
     """
     Line scan session (see the module docstring). States:
@@ -736,7 +903,8 @@ class ScanTool(QObject):
     def __init__(self, sequencer, panel, window_fn, plot_widget, acquire_fn, gains_fn,
                  set_gains_fn, counts_fn=None, temp_factory=None, sos_fn=None, cw_fn=None,
                  info_fn=None, base_dir=None, show_plot_fn=None, acq_time_fn=None, lock_fn=None,
-                 dump_dir=None, adc_bits=ADC_BITS_DEFAULT, hold_live_fn=None, parent=None):
+                 dump_dir=None, adc_bits=ADC_BITS_DEFAULT, hold_live_fn=None, map_widget=None,
+                 show_map_fn=None, move_overhead_s=MOVE_OVERHEAD_S, parent=None):
         """
         acquire_fn(avg_n) -> (ch1, ch2) full averaged records (references)
         counts_fn() -> {'sum': (s1, s2), 'offset': (o1, o2), 'n': avg_n} of the LAST
@@ -755,12 +923,24 @@ class ScanTool(QObject):
         info_fn() -> {specimen, protocol, equipment1, equipment2, name_parts}
         base_dir: automatic save folder (default ../database)
         lock_fn(bool): host locks/unlocks the Acquisition tab for the whole session
+        map_widget: pg.GraphicsLayoutWidget for the 2-D maps of a surface scan (one is
+                     created, not shown, when None); show_map_fn() brings it to front
+        move_overhead_s: per-move overhead for the estimate (MOVE_OVERHEAD_S, measured)
         """
         super().__init__(parent)
         self._seq = sequencer
         self._panel = panel
         self._window_fn = window_fn
         self._plot = ScanPlot(plot_widget)
+        self.map_widget = map_widget if map_widget is not None else pg.GraphicsLayoutWidget()
+        self._map = SurfaceMap(self.map_widget)
+        self._show_map = show_map_fn
+        self._move_overhead_s = float(move_overhead_s)
+        self.map_scale = None            # None: automatic; (lo, hi): fixed (main map)
+        self.drift_corrected = False     # face ToF map corrected with the witness (live only)
+        self.companion = True            # amplitude map beside the main one
+        self._map_names = []
+        self.last_temp_read_s = None
         self._acquire = acquire_fn
         self._counts_fn = counts_fn
         self.adc_bits = int(adc_bits)
@@ -820,20 +1000,26 @@ class ScanTool(QObject):
         """(seconds, text, long) before starting; (None, reason, False) if not possible."""
         try:
             plan = self._plan_for(params)
+            n_wit = sum(e.kind == 'witness' for e in scan_schedule(plan))
         except Exception as e:
             return None, f'Estimate not available ({e}).', False
         acq_s, timed = acq_time(self._acq_time_fn)
-        total = estimate_scan_s(plan, acq_s)
+        temp_s = (self.last_temp_read_s or 0.0) if params.surface else 0.0
+        total = estimate_scan_s(plan, acq_s, overhead_s=self._move_overhead_s, temp_s=temp_s)
         long_ = total > LONG_SCAN_S
         refs = ' + two water references (manual steps not included)' if params.references else ''
+        wit = f' + witness point × {n_wit}' if n_wit else ''
         where = (f'{len(plan.xs)} points along {plan.axis} ({plan.xs[0]:g} → {plan.xs[-1]:g} mm)'
                  if not params.surface else
                  f'{plan.n_points} points: {len(plan.lines)} lines along {plan.axis} × '
                  f'{len(plan.xs)} points, {plan.axis2} {plan.ys[0]:g} → {plan.ys[-1]:g} mm, '
                  f'{"zigzag" if params.path == "zigzag" else "same direction"}')
-        text = (f'Estimated time ≈ {format_duration(total)}: {where}{refs}; per point '
-                f'{params.settle_ms / 1000.0:g} s settle + {params.avg_n} × {acq_s * 1e3:.0f} ms '
-                f'({"timed" if timed else "assumed"}).')
+        text = (f'Estimated time ≈ {format_duration(total)}: {where}{wit}{refs}; per point '
+                f'{params.settle_ms / 1000.0:g} s settle ({params.line_settle_ms / 1000.0:g} s '
+                f'after a line change or a witness visit) + {params.avg_n} × {acq_s * 1e3:.0f} ms '
+                f'({"timed" if timed else "assumed"}) + {self._move_overhead_s:g} s per move.')
+        if params.surface and self.last_temp_read_s is None:
+            text += ' Temperature reading per line not timed yet (not included).'
         if long_:
             text += ' ⚠ Longer than half an hour.'
         return total, text, long_
@@ -843,8 +1029,6 @@ class ScanTool(QObject):
         """Start a scan session. None if started, else the reason it could not."""
         if self.state != 'idle':
             return 'A scan session is already in progress.'
-        if params.surface:
-            return SURFACE_PENDING
         if self._seq.active:
             return 'A sequence is already running.'
         reason = self._seq.reserved_reason(self) or self._panel.sequence_blocker()
@@ -862,6 +1046,7 @@ class ScanTool(QObject):
         self.plan, self.params = plan, params
         self._schedule, self._witness_pos = schedule, witness_pos
         self._doubt_lines = {}
+        self._witness_ref = None
         self._line_start = self._dump_line_start = 0
         self.window = (int(smin), int(smax))
         self._check_thickness(params)
@@ -892,9 +1077,7 @@ class ScanTool(QObject):
         self._resolve_cw()
         for text in plan.notices:
             self.warning.emit(text)
-        self._plot.reset(plan.axis, self.magnitude)
-        if self._show_plot is not None:
-            self._show_plot()
+        self._reset_view()
         if params.references:
             self._enter_ref_out('initial')
         else:
@@ -913,16 +1096,23 @@ class ScanTool(QObject):
             self.warning.emit('PT100 not available: the temperatures of this scan are stored '
                               'as NaN (not available).')
 
-    def _read_temperature(self, label, point):
+    def _read_temperature(self, label, point, line=None):
+        """One reading, with its time, the index of the last acquired point and the
+        line (the last line with acquired points when not given; −1 before any)."""
         t1 = t2 = float('nan')
         if self._arduino is not None:
+            t0 = time.monotonic()
             try:
                 r1, r2 = self._arduino.getTemperatures()
                 t1 = float('nan') if r1 is None else float(r1)
                 t2 = float('nan') if r2 is None else float(r2)
             except Exception as e:
                 self.warning.emit(f'Temperature read failed ({e}): stored as NaN.')
-        entry = {'label': label, 'point': int(point), 'time': time.time(), 'T1': t1, 'T2': t2}
+            self.last_temp_read_s = time.monotonic() - t0
+        if line is None:
+            line = self.data.line[-1] if self.data.line else -1
+        entry = {'label': label, 'point': int(point), 'line': int(line), 'time': time.time(),
+                 'T1': t1, 'T2': t2}
         self.data.temperatures.append(entry)
         return entry
 
@@ -1091,8 +1281,7 @@ class ScanTool(QObject):
         self._pending_ref = None
         if which == 'final' and 'initial' in self.data.references:
             self._compare_references()
-        self._plot.reset(self.plan.axis, self.magnitude)
-        self._redraw()
+        self._reset_view()
         if which == 'initial':
             self._move('to_start', self._return_path(), 'Back to the start point (one move '
                        'per axis, reverse order)…')
@@ -1257,15 +1446,21 @@ class ScanTool(QObject):
             self._line_done(e.line)
 
     def _line_done(self, k):
-        """Line k complete."""
+        """Line k complete: in a surface scan, the temperature with its line index (one
+        Arduino for the whole session; NaN without PT100, never a dialog)."""
+        if self.params.surface:
+            self._read_temperature('line_end', self.data.n - 1, k)
 
     # -- witness point ---------------------------------------------------------
     def _on_witness(self, e, coords, value):
         """
         One visit: measured as a scan point (own tracker, so the lines keep their
         anchor), stored raw with its time and the number of lines done. The face
-        position of every visit is relative to the first one; the jumps off the
-        trend mark the lines measured in between as doubtful. Nothing is corrected.
+        displacement since the first visit is measured as the stability test does,
+        by cross-correlation of a ±band gate around the tracked echo: the envelope
+        peak of a scan point jitters ±0.3 samples (±2 µm) in the simulator, fine
+        for a map but not for jumps of a few µm. The jumps off the trend mark the
+        lines measured in between as doubtful. Nothing is corrected.
         """
         d, p = self.data, self.params
         seg, env, seg1, record, pair, ((s1, s2), (o1, o2)) = self._last
@@ -1286,6 +1481,7 @@ class ScanTool(QObject):
             v['lost'] = 'weak' in f or 'outside' in f
             v['tof_us'] = (float('nan') if v['lost'] else
                            (m.index_frac - p.emission_sample) / ACQ_FS * 1e6)
+        d.witness[-1]['face_um'] = self._witness_face_um(seg, value, lost)
         if self._dump is not None:
             self._dump.add('witness', self.plan.beam_x, value, seg, env, record, self.window,
                            extra=dict(line_position=e.pos[self.plan.axis], line=e.line, **mags))
@@ -1294,14 +1490,26 @@ class ScanTool(QObject):
             self.warning.emit(f'Witness point: no clear front echo at visit {e.j}: the drift is '
                               'not known around it (the lines next to it are marked).')
 
+    def _witness_face_um(self, seg, m, lost):
+        """Face displacement [µm, + away from the PE transducer] since the first visit
+        with an echo: cross-correlation of a ±band gate around the tracked echo
+        against that visit's gate, plus the shift of the gate itself."""
+        if lost:
+            return float('nan')
+        h = self._witness_tracker.band
+        c = int(m.index) - self.window[0]
+        gate = np.array(seg[max(c - h, 0):c + h], dtype=float)
+        if self._witness_ref is None:
+            self._witness_ref = (c, gate)
+        c0, ref = self._witness_ref
+        if len(gate) != len(ref):
+            return float('nan')                          # gate cut by the window edge
+        shift, _, _ = CalcToFAscanCosine_XCRFFT(gate, ref)
+        return self.c_w * (float(shift) + c - c0) / ACQ_FS / 2.0 * 1e6
+
     def _update_witness(self):
-        """Face position of every visit (µm, + away from the PE transducer, relative to
-        the first visit with an echo) and the lines in doubt."""
+        """The trend of the witness and the lines in doubt."""
         d, p = self.data, self.params
-        tofs = [v['tof_us'] for v in d.witness]
-        t0 = next((t for t in tofs if t == t), float('nan'))
-        for v in d.witness:
-            v['face_um'] = self.c_w * (v['tof_us'] - t0) / 2.0
         dev, rate = witness_jumps([v['time'] for v in d.witness],
                                   [v['face_um'] for v in d.witness])
         d.witness_dev, d.witness_rate = dev, rate
@@ -1346,17 +1554,105 @@ class ScanTool(QObject):
         if name in THICKNESS_MAGNITUDES and self.state != 'idle' and not self.thickness_on:
             name = 'amplitude'                 # not offered in this scan (see _check_thickness)
         self.magnitude = name
-        if self.plan is not None and self.state not in ('ref_review',):
-            self._plot.reset(self.plan.axis, name)
-            self._redraw()
+        self._refresh_view()
+
+    def set_map_scale(self, auto, lo=None, hi=None):
+        """Main map scale: automatic, or fixed to [lo, hi]."""
+        self.map_scale = None if auto or lo is None or hi is None else (float(lo), float(hi))
+        self._refresh_view()
+
+    def set_drift_corrected(self, on):
+        """Show the face ToF corrected with the witness (live map only, never saved)."""
+        self.drift_corrected = bool(on)
+        self._refresh_view()
+
+    def set_companion(self, on):
+        """Amplitude map beside the main one (surface)."""
+        self.companion = bool(on)
+        self._refresh_view()
+
+    def _refresh_view(self):
+        if self.plan is not None and self.state != 'ref_review':
+            self._reset_view(bring_to_front=False)
+
+    def _reset_view(self, bring_to_front=True):
+        """The 1-D plot for a line, the 2-D maps for a surface; then redraw."""
+        if self.plan.params.surface:
+            self._setup_map()
+            if bring_to_front and self._show_map is not None:
+                self._show_map()
+        else:
+            self._plot.reset(self.plan.axis, self.magnitude)
+            if bring_to_front and self._show_plot is not None:
+                self._show_plot()
+        self._redraw()
 
     def _redraw(self):
         d = self.data
         if d is None or not d.coords:
             return
+        if self.plan.params.surface:
+            self._redraw_map()
+            return
         flagged = [point_marked(self.magnitude, f) for f in d.flags]
-        self._plot.set_data(self.positions_read(), [m[self.magnitude] for m in d.magnitudes],
-                            flagged)
+        self._plot.set_data(self.positions_read(), self._map_values(self.magnitude), flagged)
+
+    def _map_values(self, name):
+        """Per acquired point; the face ToF minus the witness drift when asked (live)."""
+        d = self.data
+        vals = np.array([m.get(name, float('nan')) for m in d.magnitudes], dtype=float)
+        if name == 'tof' and self.drift_corrected and d.witness:
+            # the witness displacement back to time of flight: Δt [µs] = 2·face [µm] / c_w
+            vals = vals - witness_correction(d.times, [v['time'] for v in d.witness],
+                                             [2.0 * v['face_um'] / self.c_w for v in d.witness])
+        return vals
+
+    def _map_title(self, name):
+        mag = MAGNITUDES[name]
+        title = mag.label + (f' [{mag.unit}]' if mag.unit else '')
+        if name == 'tof' and self.drift_corrected:
+            title += ' — drift-corrected with the witness (live only, not saved)'
+        if name == self._map_names[0] and self._doubt_lines:
+            title += ' — doubtful lines: ' + ', '.join(str(k) for k in sorted(self._doubt_lines))
+        return title
+
+    def _setup_map(self):
+        plan = self.plan
+        xs = np.asarray(plan.xs, dtype=float)
+        ys = np.asarray([plan.line_y(k) for k in range(len(plan.lines))], dtype=float)
+        rank_x = np.argsort(np.argsort(xs))
+        rank_y = np.argsort(np.argsort(ys))
+        lat_is_x = plan.axis != 'Z'
+        self._map_index = (rank_x, rank_y, lat_is_x)
+        xs_s, ys_s = np.sort(xs), np.sort(ys)
+        lat, z = (xs_s, ys_s) if lat_is_x else (ys_s, xs_s)
+        names = [self.magnitude]
+        if self.companion and self.magnitude != 'amplitude':
+            names.append('amplitude')
+        self._map_names = names
+        self._map.reset(names, {n: self._map_title(n) for n in names},
+                        {n: MAGNITUDES[n].unit for n in names}, lat, z)
+        self._map_cells = (lat, z)
+
+    def _cell(self, k, j):
+        rank_x, rank_y, lat_is_x = self._map_index
+        return (rank_x[j], rank_y[k]) if lat_is_x else (rank_y[k], rank_x[j])
+
+    def _redraw_map(self):
+        d = self.data
+        lat, z = self._map_cells
+        for name in self._map_names:
+            grid = np.full((lat.size, z.size), np.nan)
+            measured = np.zeros(grid.shape, dtype=bool)
+            marks = []
+            for v, k, j, f in zip(self._map_values(name), d.line, d.j, d.flags):
+                cell = self._cell(k, j)
+                grid[cell], measured[cell] = v, True
+                if point_marked(name, f):
+                    marks.append((lat[cell[0]], z[cell[1]]))
+            self._map.set_title(name, self._map_title(name))
+            self._map.set_data(name, grid, measured, marks,
+                               self.map_scale if name == self._map_names[0] else None)
 
     def _on_finished(self, status, text):
         if self._phase is None or self.state == 'idle':
@@ -1406,8 +1702,8 @@ class ScanTool(QObject):
             return
         self._set_state('stopped')
         can_ref = self.params.references and 'final' not in self.data.references
-        self.status.emit(f'{text} Not moved. {self.data.n} of {self.plan.n_points} points acquired: '
-                         'save them' + (', take the final reference first' if can_ref else '')
+        self.status.emit(f'{text} Not moved. {self.data.n} of {self.plan.n_points} points '
+                         'acquired: save them' + (', take the final reference first' if can_ref else '')
                          + ' or discard.')
 
     def save_acquired(self, final_reference=False):
@@ -1476,8 +1772,10 @@ class ScanTool(QObject):
         smin, smax = self.window
         n = d.n
         n_samp = smax - smin
-        sum1 = np.array(d.sum1[:n], dtype=np.int64).reshape(1, n, n_samp)
-        sum2 = np.array(d.sum2[:n], dtype=np.int64).reshape(1, n, n_samp)
+        n_line, n_point = (max(d.line) + 1 if n else 0), len(plan.xs)
+        cube = self._cube
+        valid = cube([True] * n, False, bool)
+        line_status = ['complete' if valid[k].all() else 'partial' for k in range(n_line)]
         equipment1 = dict(info.get('equipment1', {'nombre': 'SEDAQ'}))
         params = dict(equipment1.get('params', {}))
         params.update(Gain_Ch1=self._scan_gains[0], Gain_Ch2=self._scan_gains[1],
@@ -1485,14 +1783,30 @@ class ScanTool(QObject):
                       AvgSamplesNum=p.avg_n)
         equipment1['params'] = params
         scan = {
-            'type': 'line', 'timestamp_start': time.strftime('%Y-%m-%dT%H:%M:%S',
-                                                             time.localtime(self._t_start)),
+            'type': 'surface' if p.surface else 'line',
+            'timestamp_start': time.strftime('%Y-%m-%dT%H:%M:%S', time.localtime(self._t_start)),
             'axis_role': p.axis_role, 'axis': plan.axis, 'beam_axis': plan.beam_axis,
             'range_mode': p.mode, 'start_mm': p.start, 'end_mm': p.end, 'step_mm': p.step,
             'first_mm': plan.first, 'last_mm': plan.last, 'positions_requested': plan.xs,
-            'n_points': len(plan.xs), 'n_acquired': n,
+            'axis2': plan.other, 'path': p.path if p.surface else None,
+            'start2_mm': p.start2 if p.surface else None,
+            'end2_mm': p.end2 if p.surface else None,
+            'step2_mm': p.step2 if p.surface else None,
+            'lines_requested': [plan.line_y(k) for k in range(len(plan.lines))],
+            'n_lines': len(plan.lines), 'n_lines_acquired': n_line,
+            'line_status': line_status,
+            'partial_line': line_status.index('partial') if 'partial' in line_status else None,
+            'n_points': plan.n_points, 'n_points_per_line': n_point, 'n_acquired': n,
             'status': getattr(self, '_completion', 'completed'),
-            'completed': n == len(plan.xs),
+            'completed': n == plan.n_points,
+            'array_order': 'spatial: [k, j] is line k at the j-th position of '
+                           'positions_requested, whatever the path (a zigzag line is acquired '
+                           'with j decreasing); point_valid marks what was acquired, acq_index '
+                           'and point_time give the acquisition order',
+            'axis_order': f'fixed: along a line only {plan.axis} moves; at a line change or a '
+                          f'witness visit {plan.other} moves first, then {plan.axis}; back to '
+                          f'the start {plan.axis} first, then {plan.other}',
+            'temperature_note': PT100_NOTE,
             'start_point': plan.start_coords,
             'settle_ms': p.settle_ms, 'avg_n': p.avg_n,
             'settle_avg_note': 'default settle 100 ms measured 2026-10-05, valid for steps '
@@ -1504,7 +1818,8 @@ class ScanTool(QObject):
             'manual_moves': [{'axis': a, 'value': v, 'time': t} for a, v, t in d.manual_log],
             'tracking': {'band_us': p.band_us, 'threshold': p.threshold,
                          'edge_margin': p.edge_margin, 'emission_sample': p.emission_sample},
-            'flags': {str(k): f for k, f in enumerate(d.flags) if f},
+            'flags': {f'{k},{j}': f for k, j, f in zip(d.line, d.j, d.flags) if f},
+            'flags_key': 'line,j',
             'reference_drift': d.drift,
             'thickness': {
                 'enabled': self.thickness_on, 'reason_off': self.thickness_reason or None,
@@ -1534,16 +1849,24 @@ class ScanTool(QObject):
             equipment1=equipment1, equipment2=info.get('equipment2', {}),
             scanner_session=(self._panel.session_dict() if hasattr(self._panel, 'session_dict')
                              else {}),
-            scan=scan, signals_ch1=sum1, signals_ch2=sum2,
-            offsets_ch1=np.array(d.off1[:n], dtype=float).reshape(1, n),
-            offsets_ch2=np.array(d.off2[:n], dtype=float).reshape(1, n),
+            scan=scan,
+            signals_ch1=cube(d.sum1, 0, np.int64, (n_samp,)),
+            signals_ch2=cube(d.sum2, 0, np.int64, (n_samp,)),
+            offsets_ch1=cube(d.off1), offsets_ch2=cube(d.off2),
             n_avg=p.avg_n, gains=self._scan_gains, adc_bits=self.adc_bits,
-            coords=np.array(d.coords, dtype=float).reshape(1, n, 4),
-            point_time=np.array(d.times, dtype=float).reshape(1, n),
+            coords=cube(d.coords, tail=(4,)), point_time=cube(d.times),
             temperatures=d.temperatures, references=refs, witness=self._witness_arrays(),
             operator=p.operator, comment=p.comment, base_dir=base_dir, exp_name=name,
-            extra_arrays=dict(self._point_arrays(n),
-                              positions_requested=np.array(d.requested, dtype=float).reshape(1, n)))
+            extra_arrays=dict(
+                self._point_cubes(),
+                point_valid=valid, acq_index=cube(range(n), -1, np.int64),
+                positions_requested=np.tile(np.asarray(plan.xs, dtype=float), (n_line, 1)),
+                line_position_requested=np.array(
+                    [plan.line_y(k) for k in range(n_line)], dtype=float),
+                line_partial=np.array([s == 'partial' for s in line_status], dtype=bool),
+                line_doubtful=np.array([k in self._doubt_lines for k in range(n_line)],
+                                       dtype=bool)),
+            files_extra=SCAN_ARRAYS_DOC)
         if os.path.abspath(base_dir) == os.path.abspath(self.base_dir) or self.last_saved_path is None:
             self.last_saved_path = path
         self.saved.emit(path)
@@ -1582,8 +1905,12 @@ class ScanTool(QObject):
             'interval_deviation_um': [float(x) if np.isfinite(x) else None for x in dev],
             'doubtful_lines': {str(k): r for k, r in sorted(self._doubt_lines.items())},
             'lines_after_last_visit': list(range(last_after, n_lines)),
-            'face_um_note': 'c_w·(tof − tof of the first visit)/2, + away from the PE '
-                            'transducer, with the c_w of this scan',
+            'face_um_note': 'face displacement since the first visit, + away from the PE '
+                            'transducer: cross-correlation of a ±gate_samples gate around the '
+                            'tracked front echo against the first visit (as the stability '
+                            'test), c_w of this scan. tof_us is the envelope peak, as for '
+                            'every scan point',
+            'gate_samples': self._witness_tracker.band,
             'note': 'raw data: no drift correction is applied in this file. The analysis '
                     'corrects the position of the face (ToF) with the witness series, '
                     'never the thickness, which is immune to the drift.',
@@ -1591,18 +1918,26 @@ class ScanTool(QObject):
                           'duration; with fewer than three intervals the trend is not robust',
         }
 
-    def _point_arrays(self, n):
+    def _cube(self, flat, fill=float('nan'), dtype=float, tail=()):
+        """Per-point values (acquisition order) into the (N_line, N_point, *tail) array
+        of the file, in spatial order; `fill` where nothing was acquired."""
+        d = self.data
+        n_line = max(d.line) + 1 if d.line else 0
+        out = np.full((n_line, len(self.plan.xs)) + tuple(tail), fill, dtype=dtype)
+        for v, k, j in zip(flat, d.line, d.j):
+            out[k, j] = v
+        return out
+
+    def _point_cubes(self):
         """Per-point live values (live_<magnitude>) and the echo 1 → echo 2 measure."""
         d = self.data
-        out = {f'live_{name}': np.array([m.get(name, float('nan')) for m in d.magnitudes[:n]],
-                                        dtype=float).reshape(1, n)
+        out = {f'live_{name}': self._cube([m.get(name, float('nan')) for m in d.magnitudes])
                for name in MAGNITUDES}
-        pairs = d.pairs[:n]
-        out['echo_delay_us'] = np.array(
+        out['echo_delay_us'] = self._cube(
             [q.delay_samples / ACQ_FS * 1e6 if q is not None and q.found else float('nan')
-             for q in pairs], dtype=float).reshape(1, n)
-        out['echo_polarity'] = np.array([q.polarity if q is not None else 0 for q in pairs],
-                                        dtype=np.int8).reshape(1, n)
+             for q in d.pairs])
+        out['echo_polarity'] = self._cube([q.polarity if q is not None else 0 for q in d.pairs],
+                                          0, np.int8)
         return out
 
     def save_copy(self, base_dir):
@@ -1644,8 +1979,7 @@ class ScanTool(QObject):
 class ScanGroup(QGroupBox):
     """
     Scan controls, for the «Scans» sub-tab (spec 4 and 5.6). A line is the case
-    of a single line: «Surface» enables the second-axis fields and the path,
-    ready for phase 6 (the surface acquisition itself).
+    of a single line: «Surface» enables the second-axis fields and the path.
     """
 
     def __init__(self, tool, sequencer, parent=None):
@@ -1694,8 +2028,9 @@ class ScanGroup(QGroupBox):
         form.addRow('Step:', self._spin_step)
 
         self._chk_surface = QCheckBox('Surface')
-        self._chk_surface.setToolTip('Several lines along the second axis (phase 6). A line '
-                                     'scan is a surface of one line, as in the data format.')
+        self._chk_surface.setToolTip('Several lines along the second axis, drawn line by line '
+                                     'as a 2-D map. A line scan is a surface of one line, as in '
+                                     'the data format.')
         self._lbl_axis2 = QLabel()
         self._spin_start2 = dspin(-500.0, 500.0, -5.0, 2, 0.5, ' mm')
         self._spin_end2 = dspin(-500.0, 500.0, 5.0, 2, 0.5, ' mm')
@@ -1725,6 +2060,23 @@ class ScanGroup(QGroupBox):
         form.addRow('Settle, line change:', self._spin_line_settle)
         form.addRow('Averages (scan):', self._spin_avg)
         form.addRow('Map:', self._cmb_mag)
+        self._chk_auto = QCheckBox('Automatic colour scale')
+        self._chk_auto.setChecked(True)
+        self._spin_lo = dspin(-1e6, 1e6, 0.0, 4, 0.01, '')
+        self._spin_hi = dspin(-1e6, 1e6, 1.0, 4, 0.01, '')
+        self._spin_lo.setToolTip('Fixed scale of the main map, in its units.')
+        self._spin_hi.setToolTip('Fixed scale of the main map, in its units.')
+        self._chk_corr = QCheckBox('Face ToF drift-corrected with the witness (live only)')
+        self._chk_corr.setToolTip('Only the live map: the file is saved raw. Never applied to '
+                                  'the thickness.')
+        self._chk_companion = QCheckBox('Amplitude map beside it (surface)')
+        self._chk_companion.setChecked(True)
+        self._chk_companion.setToolTip('The amplitude says where the other map can be trusted.')
+        form.addRow(self._chk_auto)
+        form.addRow('Scale min:', self._spin_lo)
+        form.addRow('Scale max:', self._spin_hi)
+        form.addRow(self._chk_corr)
+        form.addRow(self._chk_companion)
 
         self._chk_witness = QCheckBox('Witness point (drift of the sample)')
         self._chk_witness.setChecked(True)
@@ -1883,6 +2235,12 @@ class ScanGroup(QGroupBox):
         self._cmb_path.currentIndexChanged.connect(self._refresh_estimate)
         for w in (self._spin_line_settle, self._spin_wlat, self._spin_wz, self._spin_wevery):
             w.valueChanged.connect(self._refresh_estimate)
+        self._chk_auto.toggled.connect(self._on_scale)
+        self._spin_lo.valueChanged.connect(self._on_scale)
+        self._spin_hi.valueChanged.connect(self._on_scale)
+        self._chk_corr.toggled.connect(tool.set_drift_corrected)
+        self._chk_companion.toggled.connect(tool.set_companion)
+        self._on_scale()
         self._chk_witness.toggled.connect(self._on_witness_widgets)
         self._cmb_witness.currentIndexChanged.connect(self._on_witness_widgets)
         self._on_witness_widgets()
@@ -1897,6 +2255,12 @@ class ScanGroup(QGroupBox):
         self._update_axis2_label()
         self._btn_start.setText('Start surface scan' if on else 'Start scan')
         self._refresh_estimate()
+
+    def _on_scale(self, *_):
+        auto = self._chk_auto.isChecked()
+        self._spin_lo.setEnabled(not auto)
+        self._spin_hi.setEnabled(not auto)
+        self._tool.set_map_scale(auto, self._spin_lo.value(), self._spin_hi.value())
 
     def _on_witness_widgets(self, *_):
         on = self._chk_witness.isChecked()

@@ -15,6 +15,7 @@ import sys
 import tempfile
 import time
 import unittest
+from dataclasses import replace
 
 os.environ.setdefault('QT_QPA_PLATFORM', 'offscreen')
 _HERE = os.path.dirname(os.path.abspath(__file__))
@@ -98,7 +99,8 @@ class TestLineAndMagnitudes(unittest.TestCase):
         # the witness at the first point: visited before and after the line, +2 × (0.8 s
         # + 20 × 10 ms) and the travel 51 → 49 → 50 instead of 51 → 50: +2 mm
         wit = ScanPlan(ScanParams(start=-1, end=1, step=1, settle_ms=500, line_settle_ms=800,
-                                  avg_n=20, witness=True), coords, 'X', 'Y', {'X': LIMIT, 'Z': LIMIT})
+                                  avg_n=20, witness=True), coords, 'X', 'Y',
+                       {'X': LIMIT, 'Z': LIMIT})
         self.assertAlmostEqual(estimate_scan_s(wit, 0.01, 6.7) - estimate_scan_s(plan, 0.01, 6.7),
                                2 * (0.8 + 0.2) + 2 / 6.7)
         long_plan = ScanPlan(ScanParams(start=-50, end=40, step=0.05, settle_ms=1000, avg_n=20),
@@ -165,7 +167,7 @@ class TestWitnessPure(unittest.TestCase):
     def test_jumps_off_the_trend(self):
         t = np.arange(7) * 30.0                         # a visit every 30 s
         face = -0.07 * t                                # −4.2 µm/min, steady …
-        face[4:] -= 6.0                                 # … and a 6 µm jerk between visits 3 and 4
+        face[4:] -= 6.0                                 # … and a 6 µm jerk: visits 3 → 4
         dev, rate = witness_jumps(t, face)
         self.assertAlmostEqual(rate, -0.07)
         np.testing.assert_allclose(dev, [0, 0, 0, -6.0, 0, 0], atol=1e-9)
@@ -176,6 +178,32 @@ class TestWitnessPure(unittest.TestCase):
         doubt = witness_doubt(visits, dev, 3.0)
         self.assertEqual(sorted(doubt), [1, 2, 3])
         self.assertEqual(doubt[1], 'witness echo lost')
+
+    def test_surface_schedule_axis_order_and_settle(self):
+        """Fixed order: the other axis first at every line change and witness visit; the
+        long-move settle on the first point of each line and on the witness."""
+        for path in ('zigzag', 'same'):
+            with self.subTest(path=path):
+                sched = scan_schedule(self.plan(surface=True, start2=-1, end2=1, step2=1,
+                                                path=path))
+                kinds = ''.join('w' if e.kind == 'witness' else 'p' for e in sched)
+                self.assertEqual(kinds, 'wpppwpppwpppw')
+                lines = [[e for e in sched if e.kind == 'point' and e.line == k] for k in range(3)]
+                firsts = [ln[0] for ln in lines]
+                for e in sched:
+                    keys = list(e.pos)
+                    if len(keys) == 2:
+                        self.assertEqual(keys, ['Z', 'X'])
+                    long_move = e.kind == 'witness' or any(e is f for f in firsts)
+                    self.assertEqual(e.settle_ms, 1000 if long_move else 100)
+                self.assertEqual([e.pos['X'] for e in lines[1]],
+                                 [51.0, 50.0, 49.0] if path == 'zigzag' else [49.0, 50.0, 51.0])
+                self.assertEqual([e.j for e in lines[1]],
+                                 [2, 1, 0] if path == 'zigzag' else [0, 1, 2])
+                self.assertEqual(lines[1][0].pos.get('Z'), 25.0)
+        every2 = scan_schedule(self.plan(surface=True, start2=-2, end2=2, step2=1,
+                                         witness_every=2))
+        self.assertEqual([e.line for e in every2 if e.kind == 'witness'], [0, 2, 4, 5])
 
     def test_live_correction(self):
         t, v = [0.0, 10.0, 20.0], [5.0, 6.0, 8.0]
@@ -216,7 +244,7 @@ class TestScanSaveFormat(unittest.TestCase):
         kw = self.kwargs()
         path = save_scan_raw_32(**kw)
         meta, data = load_scan_raw_32(path)
-        self.assertEqual(meta['schema_version'], 'scan-32-2.0')
+        self.assertEqual(meta['schema_version'], 'scan-32-3.0')
         self.assertEqual(meta['experiment']['operator'], 'Ana')
         self.assertFalse(os.path.exists(os.path.join(path, 'results.json')))
         np.testing.assert_array_equal(data['signals_ch2_sum'], -kw['signals_ch1'])
@@ -303,6 +331,20 @@ class TestScanSaveFormat(unittest.TestCase):
         _, data = load_scan_raw_32(path)
         np.testing.assert_array_equal(data['signals_ch1'][0], np.array(f1))
         np.testing.assert_array_equal(data['signals_ch2'][0], np.array(f2))
+
+    def test_schema_2_still_read(self):
+        """A 2.0 file (phase-5 line scans on the real equipment) is still read: a line,
+        every point acquired."""
+        path = save_scan_raw_32(**self.kwargs())
+        meta_path = os.path.join(path, 'meta.json')
+        with open(meta_path, encoding='utf-8') as f:
+            meta = json.load(f)
+        meta['schema_version'] = 'scan-32-2.0'
+        with open(meta_path, 'w', encoding='utf-8') as f:
+            json.dump(meta, f)
+        _, data = load_scan_raw_32(path)
+        self.assertTrue(data['point_valid'].all())
+        self.assertEqual(data['point_valid'].shape, (1, 3))
 
     def test_old_float32_schema_is_refused(self):
         path = save_scan_raw_32(**self.kwargs())
@@ -580,7 +622,8 @@ class ScanHarness(unittest.TestCase):
                                             'cycles': '5'}},
             base_dir=self.base, lock_fn=self.locks.append, hold_live_fn=self.holds.append,
             dump_dir=os.path.join(self.base, '_debug'),
-            acq_time_fn=getattr(self, 'acq_time', None))
+            acq_time_fn=getattr(self, 'acq_time', None),
+            move_overhead_s=0.0)                    # the fake worker answers at once
         self.statuses, self.warnings, self.dones, self.states = [], [], [], []
         self.tool.status.connect(self.statuses.append)
         self.tool.warning.connect(self.warnings.append)
@@ -695,7 +738,14 @@ class TestLineScan(ScanHarness):
         self.assertIsNone(self.tool.save_acquired())
         self.assertEqual(self.dones, ['stopped'])
         meta, d = self.load_saved()
-        self.assertEqual(d['signals_ch1'].shape[1], 5)
+        # the whole line, padded: the 5 acquired points are marked, the line is partial
+        self.assertEqual(d['signals_ch1'].shape[:2], (1, 17))
+        self.assertEqual(int(d['point_valid'].sum()), 5)
+        self.assertTrue(d['point_valid'][0, :5].all())
+        self.assertTrue(np.isnan(d['signals_ch1'][0, 5:]).all())
+        self.assertTrue(np.isnan(d['coords'][0, 5:]).all())
+        self.assertEqual(meta['scan']['line_status'], ['partial'])
+        self.assertTrue(d['line_partial'][0])
         self.assertFalse(meta['scan']['completed'])
         self.assertEqual(meta['scan']['n_points'], 17)
         self.assertEqual(len(self.worker.moves), n_moves)          # saving does not move
@@ -835,7 +885,8 @@ class TestWitness(ScanHarness):
         k = int(np.argmax(Envelope(s['witness_ch2'][0])))
         gates = s['witness_ch2'][:, k - 60:k + 61]
         shift, _, _ = CalcToFAscanCosine_XCRFFT(gates[1], gates[0])
-        self.assertAlmostEqual(c_w * shift / FS / 2.0 * 1e6, rate * dt, delta=1.0 + 0.03 * abs(rate * dt))
+        self.assertAlmostEqual(c_w * shift / FS / 2.0 * 1e6, rate * dt,
+                               delta=1.0 + 0.03 * abs(rate * dt))
         # the live value (envelope peak, the scan estimator: ±0.3 samples in the simulator)
         self.assertAlmostEqual(s['witness_face_um'][1] - s['witness_face_um'][0], rate * dt,
                                delta=5.0 + 0.1 * abs(rate * dt))
@@ -857,6 +908,184 @@ class TestWitness(ScanHarness):
         meta, s = self.load_saved()
         self.assertEqual(meta['scan']['witness'], {'enabled': False})
         self.assertNotIn('witness_sum1', s)
+
+
+class TestSurface(ScanHarness):
+    """Phase 6 verification 1, 2, 4–8 on the simulator."""
+
+    def surf(self, **kw):
+        base = dict(start=-1, end=1, step=1, surface=True, start2=-1, end2=1, step2=1,
+                    settle_ms=0, line_settle_ms=0, avg_n=2, c_sample=SimParams().c_sample)
+        base.update(kw)
+        return ScanParams(**base)
+
+    def test_full_surface_both_paths(self):
+        """1 and 2: map drawn as the lines come in, real coordinates, spatial order."""
+        n_samp = tf.WIDE[1] - tf.WIDE[0]
+        for path in ('zigzag', 'same'):
+            with self.subTest(path=path):
+                self.make(**THICK)
+                shown = []
+                self.seq.point_done.connect(
+                    lambda *_: self.tool._phase == 'scan' and shown.append(
+                        int(np.isfinite(self.tool._map.last['thickness'][0]).sum())
+                        if 'thickness' in self.tool._map.last else 0))
+                self.assertIsNone(self.tool.start(self.surf(path=path)))
+                self.assertEqual(self.tool._map_names, ['thickness', 'amplitude'])
+                self.wait(lambda: self.dones)
+                self.assertEqual(self.dones, ['completed'], self.statuses[-1])
+                # 4 witness visits (no new cell) around 3 lines of 3 points, one cell per point
+                self.assertEqual(shown, [0, 1, 2, 3, 3, 4, 5, 6, 6, 7, 8, 9, 9])
+                grid, levels = self.tool._map.last['thickness']
+                self.assertEqual(grid.shape, (3, 3))                    # lateral × Z
+                np.testing.assert_allclose(grid, 3.0, atol=0.003)
+                meta, d = self.load_saved()
+                self.assertEqual(meta['scan']['type'], 'surface')
+                self.assertEqual(meta['scan']['path'], path)
+                self.assertEqual(meta['scan']['n_lines'], 3)
+                self.assertEqual(d['signals_ch2'].shape, (3, 3, n_samp))  # N_line = 3
+                self.assertTrue(d['point_valid'].all())
+                self.assertEqual(meta['scan']['line_status'], ['complete'] * 3)
+                # real coordinates, in spatial order whatever the path
+                for k, z in enumerate((24.0, 25.0, 26.0)):
+                    np.testing.assert_allclose(d['coords'][k, :, 0],
+                                               np.array([49.0, 50.0, 51.0]) + OFFSET)
+                    np.testing.assert_allclose(d['coords'][k, :, 2], z + OFFSET)
+                order = d['acq_index'][1]
+                self.assertTrue(np.all(np.diff(order) < 0) if path == 'zigzag'
+                                else np.all(np.diff(order) > 0))
+                np.testing.assert_allclose(d['live_thickness'], 3.0, atol=0.003)
+                self.assertEqual(d['live_thickness_corr'].shape, (3, 3))
+                # back home: X, then Z
+                self.assertEqual(self.worker.moves[-2:], [('X', 50.0), ('Z', 25.0)])
+                self.assertIn('witness', meta['scan']['axis_order'])
+                self.assertIn('NOT in the beam path', meta['scan']['temperature_note'])
+
+    def test_witness_rebuilds_drift_and_marks_the_jump(self):
+        """4 and 5: steady drift + a jump during line 2; thickness unaffected."""
+        self.make(**THICK)
+        rate = -50.0                                          # µm/s
+        self.sim.params.drift_um_per_min = rate * 60.0
+        self.sim.restart_drift()
+        jump = {'t': None}
+
+        def on_point(*_):
+            d = self.tool.data
+            if jump['t'] is None and d.line and d.line[-1] == 2:
+                self.sim.params.face_offset_um = -40.0         # a jerk towards the PE
+                jump['t'] = time.time()
+        self.seq.point_done.connect(on_point)
+        p = self.surf(start2=-2, end2=2, settle_ms=20, line_settle_ms=50)   # 4 µm limit
+        self.assertIsNone(self.tool.start(p))
+        self.wait(lambda: self.dones)
+        meta, s = self.load_saved()
+        w = meta['scan']['witness']
+        self.assertEqual(w['n_visits'], 6)
+        self.assertEqual(list(s['witness_line']), [0, 1, 2, 3, 4, 5])
+        self.assertEqual(list(w['doubtful_lines']), ['2'])               # only that line
+        self.assertIn('jump', w['doubtful_lines']['2'])
+        self.assertEqual(list(s['line_doubtful']), [False, False, True, False, False])
+        self.assertTrue(any('doubtful' in x for x in self.warnings))
+        # the saved series rebuilds the drift (cross-correlation, as the analysis would)
+        c_w = meta['scan']['c_w']
+        k = int(np.argmax(Envelope(s['witness_ch2'][0])))
+        g = s['witness_ch2'][:, k - 60:k + 61]
+        face = np.array([CalcToFAscanCosine_XCRFFT(g[i], g[0])[0] for i in range(6)])
+        face = c_w * face / FS / 2.0 * 1e6
+        t = s['witness_time'] - s['witness_time'][0]
+        truth = rate * t + np.where(s['witness_time'] > jump['t'], -40.0, 0.0)
+        np.testing.assert_allclose(face, truth, atol=1.5 + 0.03 * np.max(np.abs(truth)))
+        # stored raw, and the thickness never sees the drift nor the jump
+        self.assertTrue(np.isfinite(s['live_tof']).all())
+        np.testing.assert_allclose(s['live_thickness'], 3.0, atol=0.003)
+        # the live ToF map can show it corrected, saying so
+        self.tool.set_magnitude('tof')
+        raw = self.tool._map.last['tof'][0]
+        self.tool.set_drift_corrected(True)
+        corrected = self.tool._map.last['tof'][0]
+        self.assertIn('drift-corrected', self.tool._map.panels['tof'][0].titleLabel.text)
+        self.assertLess(np.std(corrected), 0.5 * np.std(raw))
+        np.testing.assert_array_equal(np.sort(s['live_tof'].ravel()), np.sort(raw.ravel()))
+
+    def test_pause_resume_stop_mid_line(self):
+        """6: the partial line is saved and marked."""
+        self.make()
+        seen = {'n': 0}
+        paused = []
+
+        # sequence: witness, line 0 (5 points), witness, line 1 …
+        def on_point(*_):
+            seen['n'] += 1
+            if seen['n'] == 8:                     # 1st point of line 1: pause, then resume
+                self.tool.pause()
+                QTimer.singleShot(50, lambda: (paused.append(self.seq.state),
+                                               self.tool.resume()))
+            if seen['n'] == 9:                     # 2nd point of line 1: stop there
+                self.tool.stop()
+        self.seq.point_done.connect(on_point)
+        self.assertIsNone(self.tool.start(self.surf(start=-2, end=2)))     # 5 points per line
+        self.wait(lambda: self.tool.state == 'stopped')
+        self.assertEqual(paused, ['paused'])
+        self.assertIn('save them', self.statuses[-1])
+        self.assertIsNone(self.tool.save_acquired())
+        meta, d = self.load_saved()
+        self.assertEqual(d['signals_ch1'].shape[:2], (2, 5))
+        self.assertEqual(meta['scan']['line_status'], ['complete', 'partial'])
+        self.assertEqual(meta['scan']['partial_line'], 1)
+        self.assertEqual(d['point_valid'][0].tolist(), [True] * 5)
+        # zigzag: line 1 runs backwards, so its acquired points are the last ones
+        self.assertEqual(d['point_valid'][1].tolist(), [False, False, False, True, True])
+        self.assertTrue(np.isnan(d['signals_ch1'][1, 0]).all())
+        self.assertEqual(meta['scan']['witness']['lines_after_last_visit'], [1])
+        self.assertFalse(meta['scan']['completed'])
+
+    def test_temperature_per_line(self):
+        """7: one temperature per line with its index; without PT100, NaN, a warning, no
+        dialog."""
+        for temp in (True, False):
+            with self.subTest(pt100=temp):
+                self.make(temp=temp)
+                modal = []
+                self.seq.point_done.connect(lambda *_: modal.append(
+                    QApplication.activeModalWidget()))
+                self.assertIsNone(self.tool.start(self.surf(witness=False)))
+                self.wait(lambda: self.dones)
+                meta, d = self.load_saved()
+                self.assertEqual(list(d['temp_label']),
+                                 ['start', 'line_end', 'line_end', 'line_end', 'end'])
+                self.assertEqual(list(d['temp_line']), [-1, 0, 1, 2, 2])
+                self.assertEqual(list(d['temp_point']), [-1, 2, 5, 8, 8])
+                self.assertTrue(all(w is None for w in modal))
+                if temp:
+                    self.assertEqual(list(d['temp_T1']), [24.5] * 5)
+                    self.assertEqual(len(self.arduinos), 1)
+                else:
+                    self.assertTrue(np.isnan(d['temp_T1']).all())
+                    self.assertTrue(any('PT100 not available' in w for w in self.warnings))
+
+    def test_estimate_with_witness_vs_elapsed(self):
+        """8: line changes with their settle and the witness visits, real moves at 6.7 mm/s."""
+        sim = SimSeDaq(SimParams(), reclen=8192, seed=0)
+        t0 = time.perf_counter()
+        for _ in range(20):
+            tf.acquire(sim, 1)
+        per_scan = (time.perf_counter() - t0) / 20
+        self.acq_time = lambda: per_scan
+        self.make(worker_speed=6.7)
+        p = self.surf(start=-2, end=2, start2=-1, end2=1, settle_ms=60, line_settle_ms=300,
+                      avg_n=3)
+        estimate, text, _ = self.tool.estimate(p)
+        self.assertIn('witness point × 4', text)
+        no_wit, _, _ = self.tool.estimate(replace(p, witness=False))
+        self.assertGreater(estimate - no_wit, 4 * 0.3)               # the visits are counted
+        t0 = time.monotonic()
+        self.assertIsNone(self.tool.start(p))
+        self.wait(lambda: self.dones, 60000)
+        elapsed = time.monotonic() - t0
+        print(f'\n[estimate] surface with witness: estimated {estimate:.2f} s, '
+              f'elapsed {elapsed:.2f} s')
+        self.assertLess(abs(elapsed - estimate) / estimate, 0.35,
+                        f'estimate {estimate:.2f} s, elapsed {elapsed:.2f} s')
 
 
 class TestWaterReferences(ScanHarness):
@@ -944,7 +1173,7 @@ class TestWaterReferences(ScanHarness):
         self.wait(lambda: self.dones)
         self.assertEqual(self.dones, ['stopped'])
         meta, d = self.load_saved()
-        self.assertEqual(d['signals_ch1'].shape[1], 3)
+        self.assertEqual(int(d['point_valid'].sum()), 3)
         self.assertIn('ref_final_ch1', d)
         self.assertFalse(meta['scan']['completed'])
 
@@ -1093,9 +1322,13 @@ class TestSurfacePrepared(unittest.TestCase):
 
 class TestScanGroup(ScanHarness):
 
-    def test_surface_checkbox_and_refusal(self):
+    def test_surface_checkbox_starts_a_surface(self):
         self.make()
         g = ScanGroup(self.tool, self.seq)
+        self.assertEqual(g._cmb_path.currentData(), 'zigzag')           # the default path
+        self.assertEqual(g.params().line_settle_ms, 1000)
+        self.assertTrue(g.params().witness)
+        self.assertEqual((g.params().witness_mode, g.params().witness_every), ('first', 1))
         self.assertFalse(g._spin_start2.isEnabled())
         self.assertFalse(g._cmb_path.isEnabled())
         g._chk_surface.setChecked(True)
@@ -1106,8 +1339,20 @@ class TestScanGroup(ScanHarness):
         p = g.params()
         self.assertTrue(p.surface)
         self.assertIn('lines along', g._lbl_estimate.text())
-        self.assertIn('phase 6', self.tool.start(p))
-        self.assertEqual(self.tool.state, 'idle')
+        self.assertIn('witness point ×', g._lbl_estimate.text())
+        g._spin_start.setValue(-1.0)
+        g._spin_end.setValue(1.0)
+        g._spin_step.setValue(1.0)
+        g._spin_start2.setValue(-1.0)
+        g._spin_end2.setValue(1.0)
+        g._spin_step2.setValue(1.0)
+        self.assertIsNone(self.tool.start(replace(g.params(), settle_ms=0, line_settle_ms=0,
+                                                  avg_n=1)))
+        self.assertEqual(self.tool.state, 'scan')
+        self.tool.stop()
+        self.wait(lambda: self.tool.state in ('stopped', 'idle'))
+        if self.tool.state == 'stopped':
+            self.tool.discard()
 
     def test_ref_gain_ch2_prefilled_from_acquisition(self):
         self.make()

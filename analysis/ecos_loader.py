@@ -6,7 +6,8 @@ Covers three experiment types stored under database/:
   - US  : PVA_{XX}_PG_{YY}_{LETTER}_C{NNN}_US_{YYYYMMDD_HHMMSS}/
   - DENS: PVA_{XX}_PG_{YY}_{LETTER}_C{NNN}_DENS_{YYYYMMDD_HHMMSS}/
   - SCAN: PVA_{XX}_PG_{YY}_{LETTER}_C{NNN}_SCAN_{YYYYMMDD_HHMMSS}/  (scanner, schema
-          scan-32-1.0: meta.json + scan.npz, no results.json). Catalogued by
+          scan-32-3.0, 2.0 still read: meta.json + scan.npz, no results.json;
+          lines and surfaces). Catalogued by
           scan_database / build_scan_catalog; build_catalog stays US + DENS, since a
           scan has no results to merge until it is analysed.
 """

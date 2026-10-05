@@ -96,9 +96,14 @@ def save_experiment_raw_32(
                         Signal_Ref=np.asarray(Signal_Ref, dtype=np.float64))
     return str(d)
 
-SCAN_SCHEMA_VERSION = "scan-32-2.0"
+SCAN_SCHEMA_VERSION = "scan-32-3.0"
+# 3.0 (2026-10, phase 6): surface scans. The cube is in spatial order with a partial
+#     line padded (point_valid; signals 0, offsets/coords/times NaN there), the witness
+#     point series (witness_*), the line index of every temperature (temp_line) and
+#     per-point thickness values. A 2.0 file is still read (a line, all points valid).
 # 2.0 (2026-10): signals stored as integer sums of counts + conversion metadata.
 # 1.0 (float32 signals) is not readable any more: no real scan was ever saved with it.
+SCAN_SCHEMA_READABLE = ("scan-32-2.0", SCAN_SCHEMA_VERSION)
 _SCAN_REF_FIELDS = ("sum1", "sum2", "offset1", "offset2", "avg_n", "gains", "coords",
                     "time", "T1", "T2")
 
@@ -141,10 +146,11 @@ def save_scan_raw_32(
     base_dir="data_32",
     exp_name=None,
     extra_arrays=None,  # optional {name: array} also stored in scan.npz
+    files_extra=None,   # optional {name: description} of extra_arrays, into meta "files"
 ):
     """
     Raw data of a scan (line or surface), one folder per scan:
-        <exp_name>/meta.json   schema scan-32-2.0: experiment (id, timestamps,
+        <exp_name>/meta.json   schema scan-32-3.0: experiment (id, timestamps,
                                operator), specimen, protocol, equipment, scanner_session,
                                scan, conversion, comment, and the description of scan.npz
         <exp_name>/scan.npz    (compressed) integer signals per channel
@@ -199,6 +205,7 @@ def save_scan_raw_32(
         "point_time": tpt,
         "temp_label": np.array([str(t["label"]) for t in temperatures]),
         "temp_point": np.array([int(t["point"]) for t in temperatures], dtype=np.int64),
+        "temp_line": np.array([int(t.get("line", -1)) for t in temperatures], dtype=np.int64),
         "temp_time": np.array([float(t["time"]) for t in temperatures], dtype=np.float64),
         "temp_T1": np.array([float(t["T1"]) for t in temperatures], dtype=np.float64),
         "temp_T2": np.array([float(t["T2"]) for t in temperatures], dtype=np.float64),
@@ -237,19 +244,22 @@ def save_scan_raw_32(
                   "scanner after each move (not the requested target)",
         "point_time": "float64 (N_line, N_point): epoch [s] of each acquisition",
         "temp_*": "one entry per reading: label, point (index of the last acquired point, "
-                  "-1 before the first), time (epoch), T1, T2 [°C] (NaN without PT100)",
+                  "-1 before the first), line (index of its line, -1 before the first), time "
+                  "(epoch), T1, T2 [°C] (NaN without PT100). PT100 at the bottom of the tank, "
+                  "not in the beam path: see scan.temperature_note",
         "ref_<initial|final>_*": "water references: sum1, sum2 (N_samples, integer sums), "
                                  "offset1, offset2, avg_n, gains (Ch1, Ch2), coords "
                                  "(X, Y, Z, R), time, T1, T2; conversion in "
                                  "conversion.references",
     }
+    files.update(files_extra or {})
     if witness:
         files["witness_*"] = ("witness point, one entry per visit (phase 6): sum1, sum2 "
                               "(N_visit, N_samples, same conversion as the signals; floats "
                               "witness_ch1/2 on load), offset1/2, coords (real X, Y, Z, R), "
                               "time (epoch), line (lines completed before the visit), tof_us, "
-                              "amplitude, face_um (relative to the first visit, + away from "
-                              "the PE transducer), thickness_mm, thickness_corr, lost. RAW: "
+                              "amplitude, face_um (displacement since the first visit by "
+                              "cross-correlation, + away from the PE transducer), thickness_mm, thickness_corr, lost. RAW: "
                               "no drift correction is applied anywhere in this file")
     meta = {
         "schema_version": SCAN_SCHEMA_VERSION,
@@ -286,9 +296,10 @@ def load_scan_raw_32(exp_dir):
     exp_dir = Path(exp_dir)
     meta = json.loads((exp_dir / "meta.json").read_text(encoding="utf-8"))
     version = meta.get("schema_version")
-    if version != SCAN_SCHEMA_VERSION:
+    if version not in SCAN_SCHEMA_READABLE:
         raise ValueError(f"{exp_dir}: schema {version!r} not supported (only "
-                         f"{SCAN_SCHEMA_VERSION}; float32 scans 1.0 are not readable)")
+                         f"{', '.join(SCAN_SCHEMA_READABLE)}; float32 scans 1.0 are not "
+                         "readable)")
     with np.load(exp_dir / "scan.npz") as npz:
         data = {k: npz[k] for k in npz.files}
     conv = meta["conversion"]
@@ -297,6 +308,8 @@ def load_scan_raw_32(exp_dir):
         data[f"signals_{ch}_sum"] = data[f"signals_{ch}"]
         data[f"signals_{ch}"] = counts_to_float_rows(data[f"signals_{ch}_sum"], n,
                                                      data[f"offsets_{ch}"], bits)
+    if "point_valid" not in data:                  # 2.0: a line, every point acquired
+        data["point_valid"] = np.ones(data["signals_ch1_sum"].shape[:2], dtype=bool)
     if "witness_sum1" in data:                     # same conversion as the signals
         for k in ("1", "2"):
             data[f"witness_ch{k}"] = counts_to_float_rows(data[f"witness_sum{k}"], n,
