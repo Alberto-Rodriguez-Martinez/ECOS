@@ -2,9 +2,13 @@
 ecos_loader.py — Load and catalogue ECOS experiment data.
 
 Designed for Python 64-bit (analysis environment, not the 32-bit acquisition env).
-Covers two experiment types stored under database/:
+Covers three experiment types stored under database/:
   - US  : PVA_{XX}_PG_{YY}_{LETTER}_C{NNN}_US_{YYYYMMDD_HHMMSS}/
   - DENS: PVA_{XX}_PG_{YY}_{LETTER}_C{NNN}_DENS_{YYYYMMDD_HHMMSS}/
+  - SCAN: PVA_{XX}_PG_{YY}_{LETTER}_C{NNN}_SCAN_{YYYYMMDD_HHMMSS}/  (scanner, schema
+          scan-32-1.0: meta.json + scan.npz, no results.json). Catalogued by
+          scan_database / build_scan_catalog; build_catalog stays US + DENS, since a
+          scan has no results to merge until it is analysed.
 """
 
 from __future__ import annotations
@@ -25,7 +29,7 @@ import pandas as pd
 # ---------------------------------------------------------------------------
 
 _FOLDER_RE = re.compile(
-    r"^PVA_(\w+)_PG_(\w+)_([A-Z])_C(\d+)_(US|DENS)_(\d{8}_\d{6})$"
+    r"^PVA_(\w+)_PG_(\w+)_([A-Z])_C(\d+)_(US|DENS|SCAN)_(\d{8}_\d{6})$"
 )
 
 
@@ -198,6 +202,46 @@ def load_density(folder_path: str | Path) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# [2b] Load SCAN experiment (metadata only; the signals are in scan.npz)
+# ---------------------------------------------------------------------------
+
+_SCAN_FIELDS = ["type", "axis_role", "axis", "n_points", "n_acquired", "step_mm",
+                "settle_ms", "avg_n", "status", "c_w", "references_taken"]
+
+
+def load_scan(folder_path: str | Path) -> dict:
+    """Load a SCAN folder's meta.json into a flat dict (specimen + scan summary).
+
+    Raises FileNotFoundError if meta.json or scan.npz is missing.
+    """
+    folder_path = Path(folder_path)
+    meta_path = folder_path / "meta.json"
+    if not meta_path.exists():
+        raise FileNotFoundError(f"meta.json not found in {folder_path}")
+    if not (folder_path / "scan.npz").exists():
+        raise FileNotFoundError(f"scan.npz not found in {folder_path}")
+    with meta_path.open(encoding="utf-8") as f:
+        meta = json.load(f)
+    specimen = meta.get("specimen", {})
+    exp_info = meta.get("experiment", {})
+    scan = meta.get("scan", {})
+
+    record: dict = {}
+    for unified, src in _US_SPECIMEN_MAP.items():
+        record[unified] = specimen.get(src, "")
+    for key in _SCAN_FIELDS:
+        record[f"scan_{key}"] = scan.get(key)
+    record["scan_shape"] = scan.get("shape")
+    record["schema_version"]  = meta.get("schema_version", "")
+    record["experiment_id"]   = exp_info.get("id", "")
+    record["operator"]        = exp_info.get("operator", "")
+    record["timestamp_start"] = exp_info.get("timestamp_start", "")
+    record["comment"]         = meta.get("comment", "")
+    record["folder"]          = str(folder_path)
+    return record
+
+
+# ---------------------------------------------------------------------------
 # [3] Load US signals
 # ---------------------------------------------------------------------------
 
@@ -275,7 +319,7 @@ def scan_database(base_dir: str | Path) -> list[dict]:
     base_dir = Path(base_dir)
     records: list[dict] = []
     failed: list[tuple[str, str]] = []
-    counts = {"US": 0, "DENS": 0}
+    counts = {"US": 0, "DENS": 0, "SCAN": 0}
 
     try:
         entries = sorted(os.listdir(base_dir))
@@ -294,6 +338,8 @@ def scan_database(base_dir: str | Path) -> list[dict]:
         try:
             if exp_type == "US":
                 record = load_us(folder)
+            elif exp_type == "SCAN":
+                record = load_scan(folder)
             else:
                 record = load_density(folder)
             record["type"] = exp_type
@@ -304,7 +350,8 @@ def scan_database(base_dir: str | Path) -> list[dict]:
             print(f"  [WARNING] skipping {name}: {exc}")
 
     print(
-        f"[scan_database] loaded {counts['US']} US, {counts['DENS']} DENS"
+        f"[scan_database] loaded {counts['US']} US, {counts['DENS']} DENS, "
+        f"{counts['SCAN']} SCAN"
         + (f", {len(failed)} failed" if failed else "")
     )
     return records
@@ -349,7 +396,8 @@ _ROUND_RULES = {
 
 def _parse_dt(row: pd.Series) -> pd.Timestamp:
     """Extract a comparable Timestamp from a flat experiment row."""
-    val = row.get("timestamp_start") if row.get("type") == "US" else row.get("datetime")
+    val = (row.get("timestamp_start") if row.get("type") in ("US", "SCAN")
+           else row.get("datetime"))
     try:
         return pd.Timestamp(val)
     except Exception:
@@ -373,7 +421,8 @@ def build_catalog(base_dir: str | Path) -> pd.DataFrame:
     Returns one row per (pva_pct, pg_pct, piece, cycle).
     Specimens with only one measurement type get NaN on the missing side.
     """
-    records = scan_database(base_dir)
+    # Scans are listed by build_scan_catalog: they have no results to merge yet.
+    records = [r for r in scan_database(base_dir) if r.get("type") in ("US", "DENS")]
     if not records:
         return pd.DataFrame()
 
@@ -431,6 +480,16 @@ def build_catalog(base_dir: str | Path) -> pd.DataFrame:
     return merged
 
 
+def build_scan_catalog(base_dir: str | Path) -> pd.DataFrame:
+    """One row per SCAN folder (specimen fields + scan summary), newest last."""
+    records = [r for r in scan_database(base_dir) if r.get("type") == "SCAN"]
+    if not records:
+        return pd.DataFrame()
+    df = pd.DataFrame(records)
+    df["_dt"] = df.apply(_parse_dt, axis=1)
+    return df.sort_values("_dt").drop(columns=["_dt"]).reset_index(drop=True)
+
+
 # ---------------------------------------------------------------------------
 # [7] Export catalog
 # ---------------------------------------------------------------------------
@@ -461,7 +520,7 @@ def check_consistency(base_dir: str | Path) -> list[str]:
     """Check that each experiment folder name matches its JSON metadata.
 
     Parses pva, pg, piece, cycle from the folder name and compares against
-    the corresponding fields in meta.json (US) or density.json (DENS).
+    the corresponding fields in meta.json (US, SCAN) or density.json (DENS).
     Returns a list of warning strings for every mismatch found.
     """
     base_dir = Path(base_dir)
@@ -481,7 +540,7 @@ def check_consistency(base_dir: str | Path) -> list[str]:
         exp_type = parsed["exp_type"]
 
         try:
-            if exp_type == "US":
+            if exp_type in ("US", "SCAN"):
                 with (folder / "meta.json").open(encoding="utf-8") as f:
                     data = json.load(f)
                 specimen = data.get("specimen", {})

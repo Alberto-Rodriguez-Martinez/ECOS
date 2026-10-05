@@ -13,6 +13,30 @@ from datetime import datetime
 import numpy as np
 import matplotlib.pyplot as plt
 
+DEFAULT_OPERATOR = "Sebas"      # save_experiment_raw_32 still writes it fixed
+
+
+def experiment_name(pva_pct, additive_pct, sample_id, cycles, exp_type="US", ts=None,
+                    material="PVA", additive_tag="PG"):
+    """
+    Folder name of an experiment, ECOS convention (analysis/ecos_loader.py):
+        {material}_{XX}_{additive_tag}_{YY}_{LETTER}_C{NNN}_{exp_type}_{YYYYMMDD_HHMMSS}
+    e.g. PVA_10_PG_05_A_C005_SCAN_20261002_091500. Same placeholders as the
+    original builder in ecos_gui.py when a field is missing or not a number
+    (XX, YY, X, NNN). exp_type: "US", "DENS", "SCAN"...
+    """
+    pva = str(pva_pct).strip()
+    add = str(additive_pct).strip()
+    sid = str(sample_id).strip()
+    cyc = str(cycles).strip()
+    letra = sid[-1].upper() if sid else "X"
+    pva = pva.zfill(2) if pva.isdigit() else "XX"
+    add = add.zfill(2) if add.isdigit() else "YY"
+    cyc = cyc.zfill(3) if cyc.isdigit() else "NNN"
+    ts = ts or datetime.now().strftime("%Y%m%d_%H%M%S")
+    return f"{material}_{pva}_{additive_tag}_{add}_{letra}_C{cyc}_{exp_type}_{ts}"
+
+
 def _now_iso():
     try:
         return datetime.now().isoformat()
@@ -68,6 +92,131 @@ def save_experiment_raw_32(
                         Signal_TT=np.asarray(Signal_TT, dtype=np.float64),
                         Signal_Ref=np.asarray(Signal_Ref, dtype=np.float64))
     return str(d)
+
+SCAN_SCHEMA_VERSION = "scan-32-1.0"
+_SCAN_REF_FIELDS = ("ch1", "ch2", "gains", "coords", "time", "T1", "T2", "avg_n")
+
+
+def save_scan_raw_32(
+    *,
+    specimen,           # dict, same structure as save_experiment_raw_32
+    protocol,           # dict
+    equipment1,         # dict: SeDaq/pulser, 'params' with F_muestreo, Smin, Smax, gains...
+    equipment2,         # dict: Arduino / PT100
+    scanner_session,    # dict from ScannerPanel.session_dict() (JSON-serialisable)
+    scan,               # dict: scan parameters (type, axis, range, step, settle, averages...)
+    signals_ch1,        # array (N_line, N_point, N_samples)
+    signals_ch2,        # array (N_line, N_point, N_samples)
+    coords,             # array (N_line, N_point, 4): real X, Y, Z, R read back from the scanner
+    point_time,         # array (N_line, N_point): epoch seconds of each acquisition
+    temperatures,       # list of {label, point, time, T1, T2} (NaN when no PT100)
+    references=None,    # {'initial': {...}, 'final': {...}}, each with _SCAN_REF_FIELDS
+    operator=DEFAULT_OPERATOR,
+    comment="",
+    base_dir="data_32",
+    exp_name=None,
+    extra_arrays=None,  # optional {name: array} also stored in scan.npz
+):
+    """
+    Raw data of a scan (line or surface), one folder per scan:
+        <exp_name>/meta.json   schema "scan-32-1.0": experiment (id, timestamps,
+                               operator), specimen, protocol, equipment, scanner_session,
+                               scan, comment, and the description of scan.npz
+        <exp_name>/scan.npz    signals per channel (N_line × N_point × N_samples),
+                               real coordinates, times, temperatures and references
+    No results.json: results are computed later, in the analysis.
+    save_experiment_raw_32 only takes three 1D signals; this one takes the cubes.
+    Its metadata scheme is reused (specimen, protocol, equipment, experiment), not
+    its signature. Returns the folder path.
+    """
+    ch1 = np.asarray(signals_ch1)
+    ch2 = np.asarray(signals_ch2)
+    xyz = np.asarray(coords, dtype=np.float64)
+    tpt = np.asarray(point_time, dtype=np.float64)
+    if ch1.ndim != 3 or ch2.shape != ch1.shape:
+        raise ValueError("signals must be two arrays (N_line, N_point, N_samples) of equal shape, "
+                         "got %s and %s" % (ch1.shape, ch2.shape))
+    n_line, n_point, n_samp = ch1.shape
+    if xyz.shape != (n_line, n_point, 4):
+        raise ValueError("coords must be (N_line, N_point, 4), got %s" % (xyz.shape,))
+    if tpt.shape != (n_line, n_point):
+        raise ValueError("point_time must be (N_line, N_point), got %s" % (tpt.shape,))
+    params = equipment1.get("params", {})
+    smin, smax = int(params["Smin"]), int(params["Smax"])
+    if n_samp != smax - smin:
+        raise ValueError("N_samples %d != Smax - Smin %d" % (n_samp, smax - smin))
+
+    exp_id = "EXPID-" + uuid.uuid4().hex[:8].upper()
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    d = Path(base_dir) / exp_name if exp_name else Path(base_dir) / f"{ts}_{exp_id}"
+    if d.exists() and any(d.iterdir()):
+        raise FileExistsError(f"{d} already exists and is not empty")
+    d.mkdir(parents=True, exist_ok=True)
+
+    arrays = {
+        "signals_ch1": ch1.astype(np.float32),
+        "signals_ch2": ch2.astype(np.float32),
+        "coords": xyz,
+        "coord_axes": np.array(["X", "Y", "Z", "R"]),
+        "point_time": tpt,
+        "temp_label": np.array([str(t["label"]) for t in temperatures]),
+        "temp_point": np.array([int(t["point"]) for t in temperatures], dtype=np.int64),
+        "temp_time": np.array([float(t["time"]) for t in temperatures], dtype=np.float64),
+        "temp_T1": np.array([float(t["T1"]) for t in temperatures], dtype=np.float64),
+        "temp_T2": np.array([float(t["T2"]) for t in temperatures], dtype=np.float64),
+    }
+    taken = []
+    for which, ref in (references or {}).items():
+        if ref is None:
+            continue
+        taken.append(which)
+        for key in _SCAN_REF_FIELDS:
+            val = np.asarray(ref[key])
+            if key in ("ch1", "ch2"):
+                val = val.astype(np.float32)
+            arrays[f"ref_{which}_{key}"] = val
+    for name, val in (extra_arrays or {}).items():
+        arrays[name] = np.asarray(val)
+
+    files = {
+        "signals_ch1/2": "float32 (N_line, N_point, N_samples): samples Smin..Smax-1 of "
+                         "each averaged record, ecos_gui units (full scale ±0.5)",
+        "coords": "float64 (N_line, N_point, 4): X, Y, Z [mm], R [deg] read back from the "
+                  "scanner after each move (not the requested target)",
+        "point_time": "float64 (N_line, N_point): epoch [s] of each acquisition",
+        "temp_*": "one entry per reading: label, point (index of the last acquired point, "
+                  "-1 before the first), time (epoch), T1, T2 [°C] (NaN without PT100)",
+        "ref_<initial|final>_*": "water references: ch1, ch2 (N_samples), gains (Ch1, Ch2), "
+                                 "coords (X, Y, Z, R), time, T1, T2, avg_n",
+    }
+    meta = {
+        "schema_version": SCAN_SCHEMA_VERSION,
+        "experiment": {"id": exp_id, "type": "SCAN",
+                       "timestamp_start": scan.get("timestamp_start", _now_iso()),
+                       "timestamp_end": _now_iso(), "operator": operator},
+        "specimen": specimen,
+        "protocol": protocol,
+        "equipment": {"device_1_ultrasound": equipment1, "device_2_aux": equipment2},
+        "scanner_session": scanner_session,
+        "scan": dict(scan, shape=[n_line, n_point, n_samp], references_taken=taken),
+        "comment": comment,
+        "notes": "",
+        "files": files,
+    }
+    (d / "meta.json").write_text(json.dumps(meta, ensure_ascii=False, indent=2, default=str),
+                                 encoding="utf-8")
+    np.savez_compressed(d / "scan.npz", **arrays)
+    return str(d)
+
+
+def load_scan_raw_32(exp_dir):
+    """meta (dict) and the arrays of scan.npz (dict of np.ndarray) of a scan folder."""
+    exp_dir = Path(exp_dir)
+    meta = json.loads((exp_dir / "meta.json").read_text(encoding="utf-8"))
+    with np.load(exp_dir / "scan.npz") as npz:
+        data = {k: npz[k] for k in npz.files}
+    return meta, data
+
 
 def load_raw32(exp_dir):
     """
