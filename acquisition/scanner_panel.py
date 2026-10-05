@@ -1475,6 +1475,22 @@ class ScannerPanel(QWidget):
             return 'The scanner is moving.'
         return None
 
+    @property
+    def is_busy(self):
+        """A move is in progress (manual or sequenced)."""
+        return self._busy
+
+    def session_dict(self):
+        """
+        The session as a JSON-serialisable dict: what scanner_session.json holds
+        (beam axis, PE side, limits, jog steps, speeds, R stepping) plus the role
+        mapping and the current position. Saved with every scan (spec 5.6).
+        """
+        d = self._session_file_data()
+        d.update(roles={r: self._role_axis[r] for r in ROLE_ORDER},
+                 position=dict(self._coords), simulator=self._use_sim)
+        return d
+
     def role_axis(self, role):
         """Physical axis ('X'/'Y'/'Z'/'R') currently playing role beam/lateral/Z/R."""
         return self._role_axis[role]
@@ -1692,7 +1708,15 @@ class ScannerPanel(QWidget):
         return {}
 
     def _write_session_file(self):
-        data = {
+        data = self._session_file_data()
+        try:
+            with open(SESSION_FILE, 'w') as f:
+                json.dump(data, f, indent=2)
+        except Exception as e:
+            self._lbl_result.setText(f'Could not save session: {e}')
+
+    def _session_file_data(self):
+        return {
             'beam_axis': self._role_axis['beam'],
             'pe_side': self._pe_side,
             'last_port': ('' if self._use_sim else (self._cmb_port.currentData() or '')),
@@ -1702,11 +1726,6 @@ class ScannerPanel(QWidget):
             'r_stepwise': self._r_stepwise,
             'r_step_pause_ms': self._r_step_pause_ms,
         }
-        try:
-            with open(SESSION_FILE, 'w') as f:
-                json.dump(data, f, indent=2)
-        except Exception as e:
-            self._lbl_result.setText(f'Could not save session: {e}')
 
     # =======================================================================
     #  Enabled/disabled state (spec: controls disabled while moving except

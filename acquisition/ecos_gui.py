@@ -92,11 +92,21 @@ try:
     from scan_sequencer import ScanSequencer, DEFAULT_AVG_N, DEFAULT_SETTLE_MS
     from focus_tool import FocusTool, FocusGroup, window_peak
     from flatness_tool import FlatnessTool, FlatnessGroup
+    from scan_tool import ScanTool, ScanGroup
     _SCANNER_PANEL_ERR = None
 except Exception as _sp_err:   # e.g. pyserial missing: the rest of the GUI still works
     ScannerPanel = ScanSequencer = None
     _SCANNER_PANEL_ERR = str(_sp_err)
     print(f"[ecos_gui] Scanner tab unavailable: {_sp_err}")
+
+# Experiment folder names (ECOS convention, shared with the scans). Kept apart
+# from the hardware imports: the scanner's line scan names and saves its folders
+# in the simulator too.
+try:
+    from BD_Experimentos_PVA import experiment_name
+except Exception as _bd_err:      # keep the original naming if the module cannot load
+    experiment_name = None
+    print(f"[ecos_gui] BD_Experimentos_PVA unavailable: {_bd_err}")
 
 if _ARGS.demo:
     _HW_AVAILABLE = False
@@ -1268,6 +1278,26 @@ class EcosGUI(QMainWindow):
         self._flatness_tool.echo_used.connect(self._mark_echo)
         self._flatness_tool.done.connect(lambda _ok: self._clear_echo_mark())
 
+        # Line scan (phase 5): saves to ../database; references with their own gains.
+        self._scan_session_lock = False
+        self._scan_tool = ScanTool(
+            seq, panel, self._get_smin_smax, self._plot_scan,
+            acquire_fn=self._seq_acquire,
+            gains_fn=self._scan_gains,
+            set_gains_fn=self._scan_set_gains,
+            temp_factory=self._open_seq_arduino,
+            sos_fn=water_temp2sos if _HW_AVAILABLE else self._approx_cw,
+            cw_fn=self._scanner_cw_no_read,
+            info_fn=self._scan_experiment_info,
+            base_dir=_DB_DIR,
+            show_plot_fn=self._show_scanner_plot,
+            acq_time_fn=lambda: getattr(self, '_t_ascan', None),
+            lock_fn=self._scan_lock,
+            parent=self)
+        panel.add_tool_widget(ScanGroup(self._scan_tool, seq))
+        self._scan_tool.echo_used.connect(self._mark_echo)
+        self._scan_tool.done.connect(lambda _how: self._clear_echo_mark())
+
         if isinstance(self._sedaq, SimSeDaq):
             panel.scanner_state_changed.connect(self._push_scanner_state_to_sim)
             self._push_scanner_state_to_sim()
@@ -1364,6 +1394,74 @@ class EcosGUI(QMainWindow):
             return st.Cw_mean, "last temperature reading, PT100 unavailable now"
         return None
 
+    # -- line scan host functions (phase 5) ---------------------------------------
+    def _scan_gains(self):
+        """Gains of the Acquisition tab: the scan gains (restored after a reference)."""
+        return float(self._txt_gain_ch1.text()), float(self._txt_gain_ch2.text())
+
+    def _scan_set_gains(self, g1, g2):
+        """Gain1, then Gain2 again: the pulser loses Gain2 after any Gain1 change."""
+        self._sedaq.SetGain1(g1)
+        self._sedaq.SetGain2(g2)
+
+    def _scan_lock(self, locked):
+        """The Acquisition tab stays locked for the whole scan session, also between
+        its sequences (water-reference steps)."""
+        self._scan_session_lock = bool(locked)
+        self._acq_scroll.setEnabled(not locked and not self._sequencer.active)
+
+    def _scanner_cw_no_read(self):
+        """c_w without opening the Arduino (the scan holds its only instance)."""
+        if isinstance(self._sedaq, SimSeDaq):
+            return self._sedaq.params.c_w, "synthetic SeDaq"
+        if self._state.Cw_mean:
+            return self._state.Cw_mean, "last temperature reading, PT100 unavailable now"
+        return None
+
+    def _specimen_dict(self):
+        return {
+            "fecha_fabricacion":   self._txt_fab_date.text(),
+            "base":                "agua",
+            "porcentaje_pva":      self._txt_pva_pct.text(),
+            "aditivo1":            self._txt_additive.text(),
+            "porcentaje_aditivo1": self._txt_additive_pct.text(),
+            "ciclos":              self._txt_cycles.text(),
+            "pieza":               self._txt_sample_id.text(),
+            "otros":               self._txt_notes.text(),
+            "dopantes":            self._txt_dopants.text(),
+        }
+
+    def _scan_experiment_info(self):
+        """Metadata of a scan, same scheme as Compute & Save (save_experiment_raw_32)."""
+        try:
+            excitation = dict(self._collect_excitation_params(),
+                              type=self._cmb_excitation.currentText())
+        except Exception as e:
+            excitation = {"error": str(e)}
+        return {
+            "specimen": self._specimen_dict(),
+            "protocol": {"description": "Barrido ultrasónico ECOS (escáner)",
+                         "notes": self._txt_notes.text()},
+            "equipment1": {
+                "nombre": "SEDAQ" + (" (synthetic)" if isinstance(self._sedaq, SimSeDaq) else ""),
+                "transductor_pe": "",
+                "transductor_tt": "",
+                "params": {
+                    "Voltaje": self._txt_voltage.text(),
+                    "Fp": DEFAULT_FP,
+                    "F_muestreo": DEFAULT_ACQ_FS,
+                    "RecLen": self._reclen,
+                    "excitation": excitation,
+                    "gen_fs": self._txt_gen_fs.text(),
+                },
+            },
+            "equipment2": {"nombre": "Arduino", "puerto": self._txt_arduino_port.text()},
+            "name_parts": {"pva": self._txt_pva_pct.text(),
+                           "additive": self._txt_additive_pct.text(),
+                           "sample_id": self._txt_sample_id.text(),
+                           "cycles": self._txt_cycles.text()},
+        }
+
     def _push_scanner_state_to_sim(self):
         """Synthetic SeDaq: echoes follow the (simulated) scanner position."""
         panel = self._scanner_panel
@@ -1397,7 +1495,7 @@ class EcosGUI(QMainWindow):
         self._seq_status(f"Point {done}/{n}{eta}")
 
     def _on_seq_finished(self, status, text):
-        self._acq_scroll.setEnabled(True)
+        self._acq_scroll.setEnabled(not getattr(self, '_scan_session_lock', False))
         self._scanner_panel.set_sequence_active(False)
         self._seq_status(f"{status}: {text}")
         self._test_seq_running = False
@@ -1678,6 +1776,11 @@ class EcosGUI(QMainWindow):
         add   = add.zfill(2) if add.isdigit() else "YY"
         cyc   = cyc.zfill(3) if cyc.isdigit() else "NNN"
         ts    = time.strftime("%Y%m%d_%H%M%S")
+        if experiment_name is not None:      # same name, shared builder (also for SCAN)
+            self._txt_exp_name.setText(experiment_name(
+                self._txt_pva_pct.text(), self._txt_additive_pct.text(),
+                self._txt_sample_id.text(), self._txt_cycles.text(), "US", ts))
+            return
         self._txt_exp_name.setText(f"PVA_{pva}_PG_{add}_{letra}_C{cyc}_US_{ts}")
 
     # ==========================================================================
@@ -1694,17 +1797,7 @@ class EcosGUI(QMainWindow):
         except Exception:
             win_len = DEFAULT_WIN_LEN
 
-        specimen = {
-            "fecha_fabricacion":   self._txt_fab_date.text(),
-            "base":                "agua",
-            "porcentaje_pva":      self._txt_pva_pct.text(),
-            "aditivo1":            self._txt_additive.text(),
-            "porcentaje_aditivo1": self._txt_additive_pct.text(),
-            "ciclos":              self._txt_cycles.text(),
-            "pieza":               self._txt_sample_id.text(),
-            "otros":               self._txt_notes.text(),
-            "dopantes":            self._txt_dopants.text(),
-        }
+        specimen = self._specimen_dict()
         equipment1 = {
             "nombre":          "SEDAQ",
             "transductor_pe":  "No enfocado 10MHz",

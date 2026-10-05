@@ -1,6 +1,6 @@
 # Especificación: pestaña Escáner en ECOS
 
-Estado: aprobada. Fase 1 implementada y probada en hardware (21–24/09). Fase 3 (foco) cerrada tras las pruebas en hardware (30/09). Fase 4 (planitud) implementada y probada con el SeDaq sintético, pendiente de prueba en hardware. Última revisión: 2026-09-30.
+Estado: aprobada. Fase 1 implementada y probada en hardware (21–24/09). Fase 3 (foco) cerrada tras las pruebas en hardware (30/09). Fases 4 (planitud) y 5 (barrido en línea, referencias en agua y guardado) implementadas y probadas con el SeDaq sintético, pendientes de prueba en hardware. Última revisión: 2026-10-05.
 
 ## 1. Contexto
 
@@ -201,6 +201,43 @@ PVA_10_PG_5_A_C005_SCAN_20260925_171200/
 - Hace falta **una función nueva** (p. ej. `save_scan_raw_32`): `save_experiment_raw_32` valida que haya exactamente tres señales 1D de igual longitud y no admite un cubo. Se reutiliza su esquema de metadatos, no su firma.
 - `operator` está hoy fijo como «Sebas» en `BD_Experimentos_PVA.py`. En la función nueva debe ser un campo.
 
+#### Implementación del barrido en línea (fase 5, `task_scanner_phase5.md`)
+En `acquisition/scan_tool.py` (`ScanTool`, `ScanGroup`). Reutiliza el secuenciador de la fase 2 y el seguimiento del eco frontal de la fase 3.
+
+**Parámetros y estimación**
+- Eje lateral o Z (nunca el del haz ni R), con inicio, fin y paso, relativos a la posición al pulsar Inicio o absolutos. Los puntos fuera de [0, límite] se recortan, con aviso.
+- Asentamiento y promedios propios del barrido: 500 ms y 20 por defecto, **pendientes de caracterizar en función del paso**. Los del foco (5000 ms / 100) se midieron con pasos de 1 mm.
+- Tiempo estimado siempre visible y actualizado con cada parámetro, en rojo por encima de media hora. Incluye los movimientos (6,7 mm/s), el asentamiento, los promedios (`GetAScan` cronometrado) y las dos referencias, pero no los pasos manuales. Con el simulador, la estimación quedó un 12 % por debajo del tiempo real.
+
+**Por punto**
+- Se guardan los dos canales, muestras Smin..Smax−1, como el resto de ECOS.
+- La posición guardada es la **real**, la que relee el worker con `getAxis` tras cada movimiento; la pedida va aparte.
+- Si el eco frontal se pierde (el haz sale de la pieza), el punto se marca con ToF = NaN y el barrido sigue.
+
+**Mapa en vivo:** registro extensible de magnitudes (`register_magnitude`): amplitud máxima de la envolvente en la ventana, ToF del eco frontal y energía en la ventana. Se calculan todas en cada punto y cambiar la que se muestra solo redibuja.
+
+**Pausa, continuar y parar:** al parar no se mueve nada. Se ofrece guardar lo adquirido, tomar antes la referencia final (si hay referencias) o descartar.
+
+**Referencias en agua (el flujo de arriba, con estas precisiones)**
+- El orden registrado es el del **primer movimiento** de cada eje en el paso manual. También se guarda el registro completo de movimientos manuales.
+- R nunca se devuelve automáticamente: si se movió, se avisa.
+- Tras el barrido, el eje barrido vuelve primero a su inicio (el camino que se acaba de recorrer) y después se va a la referencia en el orden registrado.
+- Cancelar la referencia inicial termina la sesión sin mover nada. Cancelar la final la omite y vuelve al inicio.
+- Las ganancias se aplican siempre como Gain1 y después Gain2.
+
+**Reserva del secuenciador:** durante toda la sesión, incluidos los pasos manuales entre secuencias, ni el foco ni la planitud pueden arrancar. La pestaña Acquisition queda bloqueada.
+
+**Temperatura:** una sola instancia de `Arduino` para toda la sesión. Se lee al empezar, en cada referencia y al terminar, con `point` = índice del último punto adquirido (−1 antes del primero). c_w sale de esas lecturas con `water_temp2sos`. Sin PT100: NaN, aviso y nunca un diálogo.
+
+**Guardado**
+- `BD_Experimentos_PVA.save_scan_raw_32` / `load_scan_raw_32`, esquema `scan-32-1.0`, carpeta `database/PVA_..._SCAN_<ts>/` con `meta.json` + `scan.npz`. Señales en float32 (N_línea × N_punto × N_muestras); coordenadas reales; tiempos; temperaturas (`temp_label`, `temp_point`, `temp_time`, `temp_T1`, `temp_T2`); referencias `ref_<initial|final>_{ch1, ch2, gains, coords, time, T1, T2, avg_n}`.
+- El nombre lo construye `experiment_name` (compartido; Compute & Save sigue dando el mismo nombre US).
+- `operator` es editable, con «Sebas» por defecto.
+- «Guardar en otra carpeta…» escribe una copia.
+- `analysis/ecos_loader.py` reconoce `SCAN`: `load_scan`, `scan_database` y `build_scan_catalog`. `build_catalog` sigue siendo US + DENS, porque un barrido no tiene resultados que fusionar hasta analizarlo.
+
+**Volcado de depuración** opcional (desactivado por defecto: guarda registros completos), en `data/scan_debug/`.
+
 ## 6. Seguridad
 
 - `SN` (`unlimitedDiffMove*`) solo se usa en el **modo de movimiento libre**, activado explícitamente por el usuario con confirmación y con aviso visible en pantalla. Nunca en foco, planitud ni barridos.
@@ -216,8 +253,8 @@ PVA_10_PG_5_A_C005_SCAN_20260925_171200/
 2. Integración como pestaña en `ecos_gui.py` y acceso compartido al SeDaq.
 3. Foco.
 4. Planitud.
-5. Barrido en línea.
-6. Barrido en superficie y guardado.
+5. Barrido en línea, referencias en agua y guardado (el guardado se adelantó desde la fase 6: el formato ya admite las dos dimensiones y la línea es el caso de una fila).
+6. Barrido en superficie (añade la segunda dimensión y la lectura de temperatura al acabar cada línea).
 
 Cada fase termina con prueba en hardware y commit.
 

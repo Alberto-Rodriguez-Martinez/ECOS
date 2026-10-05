@@ -532,6 +532,9 @@ class FlatnessTool(QObject):
                       debug_dump=debug_dump, emission_sample=emission_sample)
         if self._phase is not None or self._seq.active:
             return 'A sequence is already running.'
+        reason = self._seq.reserved_reason(self)
+        if reason:
+            return reason
         reason = self._panel.sequence_blocker()
         if reason:
             return reason

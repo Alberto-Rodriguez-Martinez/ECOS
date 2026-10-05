@@ -118,9 +118,31 @@ class ScanSequencer(QObject):
     def state(self):
         return self._state
 
+    # -- reservation (phase 5) -------------------------------------------------
+    def reserve(self, owner, reason):
+        """
+        A tool that spans several sequences and the gaps between them (a scan
+        with water references: the sample is out of the beam between two
+        sequences) reserves the sequencer: start() then refuses every other
+        caller with `reason`, until release(owner).
+        """
+        self._reserved = (owner, reason)
+
+    def release(self, owner):
+        if getattr(self, '_reserved', None) and self._reserved[0] is owner:
+            self._reserved = None
+
+    def reserved_reason(self, owner=None):
+        """None if `owner` may start a sequence, else why not (another tool's reservation)."""
+        reserved = getattr(self, '_reserved', None)
+        if reserved is None or reserved[0] is owner:
+            return None
+        return reserved[1]
+
     # -- control ---------------------------------------------------------------
     def start(self, positions, settle_ms, avg_n, measure_fn, *,
-              temp_after=(), reclen=None, validate_fn=None, record_temperature=True):
+              temp_after=(), reclen=None, validate_fn=None, record_temperature=True,
+              owner=None):
         """
         positions   list of {axis: target_mm}, axes among X/Y/Z
         settle_ms   wait after each move before acquiring
@@ -132,12 +154,16 @@ class ScanSequencer(QObject):
         validate_fn validate_fn(position) -> None or an error string, per position
         record_temperature  False: no Arduino is opened and no temperature is read
                     (tools that store nothing, e.g. focus)
+        owner       the caller, checked against a reservation (reserve())
 
         Returns None when the sequence started, otherwise the reason it could
         not (nothing has been touched in that case).
         """
         if self._active:
             return 'A sequence is already running.'
+        reason = self.reserved_reason(owner)
+        if reason:
+            return reason
         if self._blocker_fn is not None:
             reason = self._blocker_fn()
             if reason:
