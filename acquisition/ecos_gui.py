@@ -1265,7 +1265,8 @@ class EcosGUI(QMainWindow):
                                      cw_fn=self._scanner_water_cw,
                                      acq_time_fn=lambda: getattr(self, '_t_ascan', None),
                                      parent=self)
-        panel.add_tool_widget(FocusGroup(self._focus_tool, seq, self._get_smin_smax))
+        panel.add_tool_widget(FocusGroup(self._focus_tool, seq, self._get_smin_smax),
+                              tab='calibration')
         # Which echo each point measured (front-echo tracking), marked on the A-scan.
         self._echo_mark = None
         self._focus_tool.echo_used.connect(self._mark_echo)
@@ -1277,7 +1278,7 @@ class EcosGUI(QMainWindow):
                                            cw_fn=self._scanner_water_cw,
                                            acq_time_fn=lambda: getattr(self, '_t_ascan', None),
                                            parent=self)
-        panel.add_tool_widget(FlatnessGroup(self._flatness_tool, seq))
+        panel.add_tool_widget(FlatnessGroup(self._flatness_tool, seq), tab='calibration')
         self._flatness_tool.echo_used.connect(self._mark_echo)
         self._flatness_tool.done.connect(lambda _ok: self._clear_echo_mark())
 

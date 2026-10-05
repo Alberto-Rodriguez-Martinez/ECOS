@@ -882,7 +882,8 @@ class TestScanGroup(ScanHarness):
 
 
 class TestScannerSubTabs(unittest.TestCase):
-    """Spec 4: two sub-tabs (movement & calibration, scans) under a header with the STOP."""
+    """Spec 4: three sub-tabs (movement, calibration, scans) under a header with the
+    position, the STOP and the state."""
 
     def test_layout(self):
         sys.path.insert(0, os.path.join(_HERE, '..'))
@@ -891,16 +892,21 @@ class TestScannerSubTabs(unittest.TestCase):
         panel = ScannerPanel(use_sim=True)
         try:
             self.assertEqual(panel._tabs.count(), 1)              # standalone: no empty tab
-            panel.add_tool_widget(QLabel('focus'))
-            panel.add_tool_widget(QLabel('scan'), tab='scans')
+            panel.add_tool_widget(QLabel('scan'), tab='scans')      # added out of order…
+            panel.add_tool_widget(QLabel('focus'), tab='calibration')
+            panel.add_tool_widget(QLabel('sim'))
             self.assertEqual([panel._tabs.tabText(i) for i in range(panel._tabs.count())],
-                             ['Motion && calibration', 'Scans'])
-            w = panel._btn_stop
-            while w is not None:                                   # STOP outside both tabs
-                self.assertIsNot(w, panel._tabs)
-                w = w.parentWidget()
-            panel.show_tab('scans')
-            self.assertEqual(panel._tabs.currentIndex(), 1)
+                             ['Motion', 'Calibration', 'Scans'])    # …shown in order
+            self.assertEqual(panel._tabs.currentIndex(), 0)         # movement first
+            for widget in (panel._btn_stop, panel._lbl_state, panel._lbl_pos['beam']):
+                w = widget
+                while w is not None:                                # header: outside all tabs
+                    self.assertIsNot(w, panel._tabs)
+                    w = w.parentWidget()
+            for i, name in enumerate(('motion', 'calibration', 'scans')):
+                panel.show_tab(name)
+                self.assertEqual(panel._tabs.currentIndex(), i)
+                self.assertTrue(panel._btn_stop.isVisibleTo(panel))
             with self.assertRaises(ValueError):
                 panel.add_tool_widget(QLabel('x'), tab='other')
         finally:

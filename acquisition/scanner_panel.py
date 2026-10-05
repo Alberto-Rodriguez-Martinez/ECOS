@@ -738,21 +738,29 @@ class ScannerPanel(QWidget):
         # the STOP stays visible whichever sub-tab is open (spec 5.1, 4).
         outer.addWidget(self._build_header())
 
-        # Two sub-tabs (spec 4): movement & calibration, and scans. The scans one
-        # is created when the first scan widget is added (add_tool_widget), so the
-        # standalone panel shows no empty tab.
+        # Three sub-tabs (spec 4), always in this order: movement (the first one,
+        # where a session starts), calibration (focus, flatness) and scans. The
+        # last two are created when their first widget is added (add_tool_widget),
+        # so the standalone panel shows no empty tab.
         self._tabs = QTabWidget()
         outer.addWidget(self._tabs, 1)
         self._tab_layouts = {}
-        layout = self._add_tab('motion', 'Motion && calibration')
+        self._tab_widgets = {}
+        layout = self._add_tab('motion')
         self._content_layout = layout
 
         layout.addWidget(self._build_status_group())
         layout.addWidget(self._build_session_group())
         layout.addWidget(self._build_movement_group())
 
-    def _add_tab(self, key, title):
-        """A scrollable sub-tab; returns its layout (tools are inserted before its stretch)."""
+    # key -> title, in display order
+    SUB_TABS = (('motion', 'Motion'), ('calibration', 'Calibration'), ('scans', 'Scans'))
+
+    def _add_tab(self, key):
+        """A scrollable sub-tab at its place in SUB_TABS; returns its layout (tools are
+        inserted before its stretch)."""
+        order = [k for k, _ in self.SUB_TABS]
+        title = dict(self.SUB_TABS)[key]
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.NoFrame)
@@ -761,8 +769,10 @@ class ScannerPanel(QWidget):
         layout = QVBoxLayout(content)
         layout.setSpacing(6)
         layout.addStretch()
-        self._tabs.addTab(scroll, title)
+        index = sum(1 for k in self._tab_layouts if order.index(k) < order.index(key))
+        self._tabs.insertTab(index, scroll, title)
         self._tab_layouts[key] = layout
+        self._tab_widgets[key] = scroll
         return layout
 
     def _build_header(self):
@@ -1554,21 +1564,21 @@ class ScannerPanel(QWidget):
 
     def add_tool_widget(self, widget, tab='motion'):
         """
-        Add a tool's controls at the bottom of a sub-tab: 'motion' (movement &
-        calibration: focus, flatness...) or 'scans' (created on first use).
+        Add a tool's controls at the bottom of a sub-tab: 'motion' (connection,
+        session, manual movement, simulator panels), 'calibration' (focus,
+        flatness) or 'scans'. The last two are created on first use.
         """
         if tab not in self._tab_layouts:
-            if tab != 'scans':
+            if tab not in dict(self.SUB_TABS):
                 raise ValueError(f'unknown sub-tab {tab!r}')
-            self._add_tab('scans', 'Scans')
+            self._add_tab(tab)
         layout = self._tab_layouts[tab]
         layout.insertWidget(layout.count() - 1, widget)
 
     def show_tab(self, tab):
-        """Bring a sub-tab to the front ('motion' or 'scans')."""
-        keys = list(self._tab_layouts)
-        if tab in keys:
-            self._tabs.setCurrentIndex(keys.index(tab))
+        """Bring a sub-tab to the front ('motion', 'calibration' or 'scans')."""
+        if tab in self._tab_widgets:
+            self._tabs.setCurrentWidget(self._tab_widgets[tab])
 
     def _axes_out_of_range(self):
         """Axes whose current GUI position falls outside [0, limit]."""

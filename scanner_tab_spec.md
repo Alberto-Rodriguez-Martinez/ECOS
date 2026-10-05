@@ -69,26 +69,29 @@ Escáner XYZR (controlador SE SC-03-00) para posicionar muestras de PVA dentro d
 Al lanzar una herramienta, la gráfica grande pasa automáticamente a la pestaña Escáner.
 
 ### Pestaña Escáner de la columna derecha (reorganizada el 2026-10-05)
-Quedaba demasiado densa en una sola columna, así que se divide en dos subpestañas bajo una cabecera fija:
+Tres subpestañas bajo una cabecera fija. Primero eran dos, «Movimiento y calibración» y «Barridos», pero la primera tenía demasiados campos a la vez:
 
 ```
 ┌──────────────────────────────────────────────┐
-│ Cabecera fija (siempre visible):             │
+│ Cabecera fija (siempre visible, encima de    │
+│ las tres subpestañas):                       │
 │   posición haz / lateral / Z / R             │
 │   [ STOP ]  estado (Libre, Moviendo,         │
 │             Secuencia i/n)                   │
 ├──────────────────────────────────────────────┤
-│ [Movimiento y calibración] [Barridos]        │
+│ [Movimiento] [Calibración] [Barridos]        │
 │                                              │
-│ Movimiento y calibración:                    │
+│ Movimiento (la inicial):                     │
 │   Conexión (puerto, conectar, resultado)     │
 │   Sesión (eje del haz, lado PE, límites,     │
 │     pasos, velocidades, ceros)               │
 │   Movimiento manual                          │
-│   Foco (5.4)                                 │
-│   Planitud (5.5)                             │
 │   [simulador: modelo del SeDaq sintético y   │
 │    secuencia de prueba]                      │
+│                                              │
+│ Calibración:                                 │
+│   Foco (5.4), con todos sus parámetros       │
+│   Planitud (5.5), con todos sus parámetros   │
 │                                              │
 │ Barridos (5.6):                              │
 │   Eje de la línea, rango, paso               │
@@ -99,19 +102,22 @@ Quedaba demasiado densa en una sola columna, así que se divide en dos subpesta�
 │   Referencias en agua (ganancias, promedios) │
 │   Operador, comentario, límites de deriva    │
 │   Tiempo estimado; Inicio / Pausa / Parar;   │
-│   pasos de referencia; guardar              │
+│   pasos de referencia; guardar               │
 └──────────────────────────────────────────────┘
 ```
 
-- **El STOP no está en ninguna subpestaña**: vive en la cabecera, junto a la posición y el estado, para que siga a la vista desde cualquiera de las dos (5.1).
+- En la interfaz (en inglés, como el resto de ECOS) las subpestañas se llaman *Motion*, *Calibration* y *Scans*.
+- **«Movimiento» es la inicial**: es con lo que se empieza una sesión.
+- **La cabecera fija queda por encima de las tres** y no pertenece a ninguna. El foco y la planitud mueven el escáner y vuelven al centro al terminar, así que la posición tiene que verse desde «Calibración» sin cambiar de pestaña, y el STOP tiene que estar alcanzable desde cualquiera de las tres.
+- Al lanzar el foco o la planitud, la gráfica grande pasa a la vista del escáner, como antes.
 - **Barridos: una sola sección para línea y superficie.** Una línea es el caso de una sola línea, igual que en el formato de datos (N_línea = 1). La casilla «Superficie» activa los campos del segundo eje (inicio, fin y paso; el modo relativo o absoluto es el del primero) y el recorrido: **zigzag**, que alterna el sentido del primer eje, o **un solo sentido**, en el que todas las líneas se recorren igual para que la holgura no desplace las líneas alternas.
 - Preparado para la fase 6: `ScanParams` lleva ya los campos (`surface`, `start2`, `end2`, `step2`, `path`). `ScanPlan` genera las líneas en los dos recorridos (`lines`, `all_positions`) y el tiempo estimado ya las cuenta. Solo falta la adquisición en superficie: hasta entonces, Inicio con «Superficie» marcada se rechaza con un mensaje.
-- `ScannerPanel.add_tool_widget(widget, tab='motion' | 'scans')` coloca cada herramienta en su subpestaña. La de barridos se crea al añadir el primer widget, así que el panel independiente (sin ECOS) no muestra una pestaña vacía.
+- `ScannerPanel.add_tool_widget(widget, tab='motion' | 'calibration' | 'scans')` coloca cada herramienta en su subpestaña. Las subpestañas se muestran siempre en ese orden, sea cual sea el orden en que se añadan. «Calibración» y «Barridos» se crean al añadir su primer widget, así que el panel independiente (sin ECOS) solo muestra «Movimiento».
 
 ## 5. Pestaña Escáner (columna derecha)
 
 ### 5.1 Estado: cabecera fija y conexión
-Posición, STOP y estado van en la cabecera fija (sección 4). Puerto, conexión y resultado van en el grupo Conexión de «Movimiento y calibración».
+Posición, STOP y estado van en la **cabecera fija**, encima de las tres subpestañas y fuera de todas (sección 4): se ven y se alcanzan desde «Movimiento», «Calibración» y «Barridos». Puerto, conexión y resultado van en el grupo Conexión de «Movimiento».
 - Selección de puerto: desplegable con los puertos serie detectados (`serial.tools.list_ports`, mostrando descripción) y botón de refresco. Se preselecciona el último usado (guardado en la sesión). El puerto asignado al Arduino PT100 en ECOS se marca y no se preselecciona. Nada de puertos fijos en el código.
 - Botones Conectar y Desconectar. **Verificación de identidad antes de instanciar `Scanner`**: abrir el puerto con pyserial, enviar `SCX` y exigir una respuesta con el formato `OKX` + 6 dígitos + `\r`. Si no coincide o no hay respuesta, se muestra «El dispositivo en COMx no es el escáner» y se cierra el puerto. Solo si la verificación es correcta se crea `Scanner(port=...)` (su constructor habilita motores y envía velocidades). Resultado siempre visible: «Conectado: escáner en COMx» o el error concreto.
 - Posición actual X / Y / Z / R, con la etiqueta de cada eje según su papel (haz, lateral, Z). Se actualiza al terminar cada movimiento.
