@@ -888,7 +888,7 @@ class TestScanGroup(ScanHarness):
         self.make()
         g = ScanGroup(self.tool, self.seq)
         p = g.params()
-        self.assertEqual((p.settle_ms, p.avg_n), (500, 20))          # not the focus ones
+        self.assertEqual((p.settle_ms, p.avg_n), (100, 20))          # not the focus ones
         self.assertEqual(p.operator, 'Sebas')
         self.assertIn('Estimated time', g._lbl_estimate.text())
         before = g._lbl_estimate.text()

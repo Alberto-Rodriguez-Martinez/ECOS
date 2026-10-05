@@ -257,7 +257,10 @@ En `acquisition/scan_tool.py` (`ScanTool`, `ScanGroup`). Reutiliza el secuenciad
 
 **Parámetros y estimación**
 - Eje lateral o Z (nunca el del haz ni R), con inicio, fin y paso, relativos a la posición al pulsar Inicio o absolutos. Los puntos fuera de [0, límite] se recortan, con aviso.
-- Asentamiento y promedios propios del barrido: 500 ms y 20 por defecto, **pendientes de caracterizar en función del paso**. Los del foco (5000 ms / 100) se midieron con pasos de 1 mm.
+- Asentamiento y promedios propios del barrido, independientes de los del foco (5000 ms / 100, medidos con pasos de 1 mm):
+  - **Asentamiento: 100 ms, medido** en el equipo real el 05/10. Se hicieron dos barridos iguales de 21 puntos con paso de 0,5 mm y 20 promedios, uno a 500 ms y otro a 100 ms. Coinciden punto por punto a 0,22 muestras RMS (2,2 ns, 1,5 µm) y los residuos del ajuste correlan a 0,988, así que a 500 ms no se gana nada. **Validado para pasos de 0,5 mm o menores**: no se ha comprobado para desplazamientos grandes.
+  - Promedios: 20 por defecto, **pendientes de caracterizar**.
+  - Los 100 promedios del foco no cambian: se midieron con pasos de 1 mm, que no es este caso.
 - Tiempo estimado siempre visible y actualizado con cada parámetro, en rojo por encima de media hora. Incluye los movimientos (6,7 mm/s), el asentamiento, los promedios (`GetAScan` cronometrado) y las dos referencias, pero no los pasos manuales. Con el simulador, la estimación quedó un 12 % por debajo del tiempo real.
 
 **Por punto**
@@ -319,6 +322,7 @@ En `acquisition/scan_tool.py` (`ScanTool`, `ScanGroup`). Reutiliza el secuenciad
 4. Planitud.
 5. Barrido en línea, referencias en agua y guardado (el guardado se adelantó desde la fase 6: el formato ya admite las dos dimensiones y la línea es el caso de una fila).
 6. Barrido en superficie (añade la segunda dimensión y la lectura de temperatura al acabar cada línea).
+   - **Nota para la fase 6 (05/10, no implementado):** los 100 ms de asentamiento valen entre puntos contiguos de una línea. El cambio de línea en un barrido **en un solo sentido** es un retorno de decenas de milímetros y excitará la mecánica mucho más. Hará falta un asentamiento propio para ese movimiento, o usar zigzag, que no tiene retorno.
 
 Cada fase termina con prueba en hardware y commit.
 

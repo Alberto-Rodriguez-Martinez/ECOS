@@ -47,8 +47,8 @@ Ch2 (pulse-echo) is saved in every reference but not compared, so a drift of
 the pulse-echo channel alone is not covered by this metric.
 
 Settle and averages are the scan's own, NOT the focus ones (5000 ms / 100 were
-measured with 1 mm steps): defaults DEFAULT_SCAN_SETTLE_MS / DEFAULT_SCAN_AVG_N,
-PENDIENTES DE CARACTERIZAR en función del paso.
+measured with 1 mm steps). DEFAULT_SCAN_SETTLE_MS = 100 ms, measured on the
+real equipment (see the constant); DEFAULT_SCAN_AVG_N still pending.
 """
 from __future__ import annotations
 
@@ -81,9 +81,16 @@ if _DB_DIR not in sys.path:
 from scan_counts import ADC_BITS_DEFAULT, counts_to_float  # noqa: E402
 
 PE_CHANNEL = 2
-# PENDIENTES DE CARACTERIZAR en función del paso (task_scanner_phase5.md 1):
-# scan steps are far smaller than the 1 mm focus steps that gave 5000 ms / 100.
-DEFAULT_SCAN_SETTLE_MS = 500
+# Settle between neighbouring points of a line. MEASURED on the real equipment
+# on 2026-10-05: two identical scans of 21 points with 0.5 mm steps and 20
+# averages, one at 500 ms and one at 100 ms, agree point by point within
+# 0.22 samples RMS (2.2 ns, 1.5 µm) and their fit residuals correlate at 0.988:
+# nothing is gained at 500 ms. VALIDATED FOR STEPS OF 0.5 mm OR LESS only; not
+# checked for large moves (e.g. the line change of a one-direction surface scan,
+# see scanner_tab_spec.md 5.6, phase 6).
+DEFAULT_SCAN_SETTLE_MS = 100
+# PENDIENTE DE CARACTERIZAR: the averages of a scan (20 was used in the settle
+# measurement above, not characterized itself).
 DEFAULT_SCAN_AVG_N = 20
 DEFAULT_SCAN_STEP_MM = 0.5
 DEFAULT_REF_AVG_N = 100
@@ -1061,7 +1068,8 @@ class ScanTool(QObject):
             'completed': n == len(plan.xs),
             'start_point': plan.start_coords,
             'settle_ms': p.settle_ms, 'avg_n': p.avg_n,
-            'settle_avg_note': 'scan defaults pending characterization vs step (phase 5)',
+            'settle_avg_note': 'default settle 100 ms measured 2026-10-05, valid for steps '
+                               '<= 0.5 mm; default averages (20) pending characterization',
             'c_w': self.c_w, 'c_w_source': self.cw_source,
             'references': p.references, 'ref_gains': [p.ref_gain1, p.ref_gain2],
             'ref_avg_n': p.ref_avg_n, 'reference_position': d.reference_position,
@@ -1166,12 +1174,14 @@ class ScanGroup(QGroupBox):
         self._spin_settle.setRange(0, 60000)
         self._spin_settle.setValue(DEFAULT_SCAN_SETTLE_MS)
         self._spin_settle.setSuffix(' ms')
-        self._spin_settle.setToolTip('Scan default, NOT the focus one: pending characterization '
-                                     'as a function of the step.')
+        self._spin_settle.setToolTip('Scan default, NOT the focus one. 100 ms measured on '
+                                     '05/10: same result as 500 ms (0.22 samples RMS) with '
+                                     '0.5 mm steps. Valid for steps of 0.5 mm or less; not '
+                                     'checked for large moves.')
         self._spin_avg = QSpinBox()
         self._spin_avg.setRange(1, 10000)
         self._spin_avg.setValue(DEFAULT_SCAN_AVG_N)
-        self._spin_avg.setToolTip(self._spin_settle.toolTip())
+        self._spin_avg.setToolTip('Scan default, NOT the focus one: pending characterization.')
         self._cmb_mag = QComboBox()
         for name, mag in MAGNITUDES.items():
             self._cmb_mag.addItem(mag.label, name)
