@@ -334,6 +334,7 @@ class EcosGUI(QMainWindow):
         self._syncing         = False
         self._unit            = 'samples'   # 'samples' | 'mus' | 'mm'
         self._axis_cw         = None        # (c_w, source) frozen for the mm axis
+        self._manual_temp     = None        # {T, time} of a temperature entered by hand
         self.session_notices  = []          # what was corrected when loading / saving
         self._Cl              = None
         self._L               = None
@@ -536,8 +537,9 @@ class EcosGUI(QMainWindow):
         self._btn_retake_cw = QPushButton("Retake c_w")
         self._btn_retake_cw.setToolTip(
             "The mm axis uses the c_w taken when the unit went to mm, frozen so the axis is "
-            "reproducible. Take it again from the latest PT100 reading (nominal 1480 m/s "
-            "without one) when the water temperature has really changed.")
+            "reproducible. Take it again from the latest PT100 reading, else the manual "
+            "temperature, else the nominal 1480 m/s, when the water temperature has really "
+            "changed.")
         self._btn_retake_cw.setEnabled(False)
         self._btn_retake_cw.clicked.connect(self._on_retake_axis_cw)
         top_row.addWidget(self._btn_retake_cw)
@@ -999,17 +1001,22 @@ class EcosGUI(QMainWindow):
     def _take_axis_cw(self):
         """
         Freeze the c_w of the mm axis: an axis that follows a measurement in progress is
-        not reproducible (two screenshots of one record would not compare). The PT100
-        value when the current c_w comes from a PT100 reading, else the nominal 1480
-        m/s (manual or assumed temperatures are not readings).
+        not reproducible (two screenshots of one record would not compare). The current
+        c_w when it comes from a PT100 reading ('PT100') or, without one, from a
+        temperature entered by hand ('manual'); the nominal 1480 m/s when there is
+        neither (the assumed 20 °C without hardware is neither). Screen only: in the
+        files a manual temperature is still not a reading (_latest_temperature).
         """
         reading = self._latest_temperature()
+        manual = getattr(self, '_manual_temp', None)
         cw, nominal = axis_cw(self._state.Cw_mean)
         if reading is not None and not nominal:
             when = time.strftime('%H:%M:%S', time.localtime(reading['time']))
             self._axis_cw = (cw, f"PT100, read {when}")
+        elif manual is not None and not nominal:
+            self._axis_cw = (cw, f"manual, T = {manual['T']:.1f} °C")
         else:
-            self._axis_cw = (C_W_AXIS_NOMINAL, "nominal, no PT100 reading")
+            self._axis_cw = (C_W_AXIS_NOMINAL, "nominal, no PT100 reading or manual value")
 
     def _unit_label(self):
         if self._unit == 'mm':
@@ -1343,6 +1350,7 @@ class EcosGUI(QMainWindow):
             self._state.T1 = self._state.T2 = T
             self._state.Cw1 = self._state.Cw2 = self._state.Cw_mean = cw
             self._temp_note = None        # assumed, not read: not reported as a reading
+            self._manual_temp = None      # nor a manual value
             self._update_temp_label()
             return True
 
@@ -1391,6 +1399,7 @@ class EcosGUI(QMainWindow):
         self._state.T1 = self._state.T2 = T
         self._state.Cw1 = self._state.Cw2 = self._state.Cw_mean = cw
         self._temp_note = None            # manual, not read: not reported as a reading
+        self._manual_temp = {"T": T, "time": time.time()}   # but the mm axis may use it
         self._lbl_temp.setText(f"Manual: T = {T:.1f} °C   Cw = {cw:.1f} m/s")
         return True
 
@@ -1720,6 +1729,7 @@ class EcosGUI(QMainWindow):
     def _note_temperature(self, source):
         """Remember when and where the state temperatures were last read (debug dumps)."""
         self._temp_note = {"time": time.time(), "source": source}
+        self._manual_temp = None          # a reading replaces a manual value
 
     def _latest_temperature(self):
         """The latest PT100 reading, with its time and source, or None. Only real readings

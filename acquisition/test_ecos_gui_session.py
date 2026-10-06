@@ -100,12 +100,15 @@ class TestGuiSimulatorSession(unittest.TestCase):
 
 class _LiveWindow(unittest.TestCase):
     """A fresh GUI window, shown, without a saved session (each window saves its own on
-    close, which the next one would restore: check boxes switched off by a test)."""
+    close, which the next one would restore: check boxes switched off by a test), and
+    with its live timer stopped: the tests drive the refresh (_update_plots) themselves,
+    so a timer tick can never land in the middle of one (e.g. setting the blanking)."""
 
     def setUp(self):
         if os.path.exists(_ENV['session']):
             os.remove(_ENV['session'])
         self.win = _ENV['gui'].EcosGUI()
+        self.win._timer.stop()
         self.win.resize(1400, 900)
         self.win.show()
         QApplication.processEvents()
@@ -244,6 +247,7 @@ class TestAxisUnits(_LiveWindow):
 
     def test_live_refresh_still_running_after_the_change(self):
         win = self.win
+        win._timer.start(_ENV['gui'].REALTIME_INTERVAL)      # the live timer, as at start
         for unit in ('mus', 'mm', 'samples'):
             with self.subTest(unit=unit):
                 self.radio(unit).setChecked(True)
@@ -338,6 +342,31 @@ class TestAxisCwFrozen(_LiveWindow):
         self.assertFalse(win._btn_retake_cw.isEnabled())
         win._radio_mm.setChecked(True)                   # back to mm: taken again
         self.assertEqual(win._axis_unit()[1], 1499.0)
+
+    def enter_manual(self):
+        """The real manual-entry path, its dialog accepted with the default 20.0 °C."""
+        from unittest import mock
+        gui = _ENV['gui']
+        with mock.patch.object(gui.QDialog, 'exec_', lambda _self: gui.QDialog.Accepted):
+            self.assertTrue(self.win._ask_manual_temperature())
+
+    def test_manual_temperature_on_screen_not_in_the_files(self):
+        win = self.win
+        self.enter_manual()
+        win._radio_mm.setChecked(True)
+        self.assertIn(f'c_w {win._approx_cw(20.0):.1f} m/s, manual, T = 20.0 °C', self.label())
+        self.assertEqual(win._axis_unit()[1], win._approx_cw(20.0))
+        self.assertIsNone(win._latest_temperature())     # files: still not a reading
+        self.pt100(1499.0)                               # a reading replaces it
+        win._btn_retake_cw.click()
+        self.assertIn('1499.0 m/s, PT100', self.label())
+
+    def test_assumed_temperature_is_not_manual(self):
+        win = self.win
+        self.enter_manual()
+        win._read_temperature()                          # no hardware: assumed 20 °C
+        win._radio_mm.setChecked(True)
+        self.assertIn('1480.0 m/s, nominal', self.label())
 
     def test_nominal_without_a_pt100_reading(self):
         win = self.win
