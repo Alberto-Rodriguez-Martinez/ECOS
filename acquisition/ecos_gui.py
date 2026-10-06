@@ -417,7 +417,18 @@ class EcosGUI(QMainWindow):
         self._radio_samples.toggled.connect(lambda c: c and self._on_unit_changed('samples'))
         self._radio_mus.toggled.connect(    lambda c: c and self._on_unit_changed('mus'))
         self._radio_mm.toggled.connect(     lambda c: c and self._on_unit_changed('mm'))
+        top_row.addSpacing(20)
+        # One control for the whole cross: both lines are shown and hidden together
+        self._chk_cursor = QCheckBox("Cursor")
+        self._chk_cursor.setChecked(True)
+        self._chk_cursor.setToolTip("Cross-hair cursor on the live A-scan (time and amplitude)")
+        self._chk_cursor.toggled.connect(lambda on: on or self._set_cursor_visible(False))
+        top_row.addWidget(self._chk_cursor)
         top_row.addStretch()
+        # Values under the cursor: discreet, at the right of the row, not over the trace
+        self._lbl_cursor = QLabel("")
+        self._lbl_cursor.setStyleSheet("color: gray;")
+        top_row.addWidget(self._lbl_cursor)
         layout.addLayout(top_row)
 
         # Zoom plot
@@ -444,13 +455,12 @@ class EcosGUI(QMainWindow):
                    self._curve_insp_pe, self._curve_insp_win):
             _c.hide()
 
-        # Hover cursor
+        # Hover cursor: a full cross (time and amplitude), both lines in the same style
         self._vline_cursor = pg.InfiniteLine(angle=90, movable=False, pen='w')
-        self._vline_cursor.setVisible(False)
-        self._plot_zoom.addItem(self._vline_cursor)
-        self._cursor_label = pg.TextItem(anchor=(0, 1), color=(255, 255, 255))
-        self._plot_zoom.addItem(self._cursor_label)
-        self._cursor_label.hide()
+        self._hline_cursor = pg.InfiniteLine(angle=0, movable=False, pen='w')
+        for line in (self._vline_cursor, self._hline_cursor):
+            line.setVisible(False)
+            self._plot_zoom.addItem(line)
         self._plot_zoom.scene().sigMouseMoved.connect(self._on_mouse_moved)
 
         # The big plot lives in a tab widget: "A-scan" is the live zoom plot,
@@ -932,31 +942,45 @@ class EcosGUI(QMainWindow):
     # ==========================================================================
     #  Hover cursor
     # ==========================================================================
+    def _set_cursor_visible(self, visible):
+        """The two lines of the cross always together, and their readout."""
+        self._vline_cursor.setVisible(visible)
+        self._hline_cursor.setVisible(visible)
+        if not visible:
+            self._lbl_cursor.setText("")
+
+    def _unit_to_us(self, x):
+        """x-axis value (current unit) to time [µs], without rounding to a sample."""
+        if self._unit == 'mus':
+            return float(x)
+        if self._unit == 'mm':
+            cw = self._state.Cw_mean or 1480.0
+            return float(x) * 2.0 / (cw * 1e-3)
+        return float(x) / DEFAULT_ACQ_FS * 1e6
+
     def _on_mouse_moved(self, pos):
         vb = self._plot_zoom.getViewBox()
-        if not self._plot_zoom.sceneBoundingRect().contains(pos):
-            self._vline_cursor.setVisible(False)
-            self._cursor_label.hide()
+        if (not self._chk_cursor.isChecked()
+                or not self._plot_zoom.sceneBoundingRect().contains(pos)):
+            self._set_cursor_visible(False)
             return
-        mp  = vb.mapSceneToView(pos)
-        x   = mp.x()
+        mp = vb.mapSceneToView(pos)
+        x, y = mp.x(), mp.y()
         self._vline_cursor.setPos(x)
-        self._vline_cursor.setVisible(True)
+        self._hline_cursor.setPos(y)
+        self._set_cursor_visible(True)
 
-        xs, ys = self._curve_zoom_ch2.getData()
-        if xs is None or len(xs) == 0:
-            xs, ys = self._curve_zoom_ch1.getData()
-        val = "---"
-        if xs is not None and len(xs) > 0:
-            i   = int(np.clip(np.searchsorted(xs, x), 0, len(ys) - 1))
-            val = f"{ys[i]:.4f}"
-
-        coord = {'samples': f"s = {int(x)}",
-                 'mus':     f"t = {x:.2f} µs",
-                 'mm':      f"d = {x:.2f} mm"}[self._unit]
-        self._cursor_label.setPos(x, mp.y())
-        self._cursor_label.setText(f"{coord}\nAmp: {val}")
-        self._cursor_label.show()
+        where = {'samples': f"sample {x:.0f}", 'mus': "", 'mm': f"d = {x:.2f} mm"}[self._unit]
+        text = (f"t = {self._unit_to_us(x):.3f} µs" + (f" ({where})" if where else "")
+                + f"   A = {y:.4f} a.u.")
+        # The signal at that instant (Ch2, else Ch1), as the former floating label showed
+        for name, curve in (("Ch2", self._curve_zoom_ch2), ("Ch1", self._curve_zoom_ch1)):
+            xs, ys = curve.getData()
+            if xs is not None and len(xs) > 0:
+                i = int(np.clip(np.searchsorted(xs, x), 0, len(ys) - 1))
+                text += f"   ·   {name} = {ys[i]:.4f} a.u."
+                break
+        self._lbl_cursor.setText(text)
 
     # ==========================================================================
     #  RecLen change
@@ -1990,6 +2014,7 @@ class EcosGUI(QMainWindow):
             "reclen":                self._txt_reclen.text(),
             "relay":                 self._btn_relay.isChecked(),
             "region":                [rmin, rmax],
+            "cursor":                self._chk_cursor.isChecked(),
             "excitation_index":      self._cmb_excitation.currentIndex(),
             "gen_fs":                self._txt_gen_fs.text(),
             "pulse_param_index":     self._cmb_pulse_param.currentIndex(),
@@ -2024,6 +2049,7 @@ class EcosGUI(QMainWindow):
         self._txt_voltage.setText(d.get("voltage",   str(DEFAULT_VOLTAGE)))
         self._txt_reclen.setText(d.get("reclen",      str(DEFAULT_RECLEN)))
         self._btn_relay.setChecked(d.get("relay", True))
+        self._chk_cursor.setChecked(d.get("cursor", True))
         region = d.get("region")
         if region:
             self._region.setRegion(region)
