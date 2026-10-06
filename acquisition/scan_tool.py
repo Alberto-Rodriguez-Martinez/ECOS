@@ -89,8 +89,8 @@ from flatness_tool import line_flags
 from ECOS_US_ToolBox import CalcToFAscanCosine_XCRFFT, Envelope
 from echo_tracking import CONFIDENT_CONTRAST
 from focus_tool import (
-    DEFAULT_EMISSION_SAMPLE, MOVE_MM_S, POSITION_DECIMALS, FocusDebugDump, acq_time,
-    format_duration, measurement_meta, resolve_cw,
+    DEFAULT_EMISSION_SAMPLE, MOVE_MM_S, POSITION_DECIMALS, SATURATION_FLAG, FocusDebugDump,
+    acq_time, format_duration, measurement_meta, resolve_cw,
 )
 
 _DB_DIR = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), '..',
@@ -1457,7 +1457,8 @@ class ScanTool(QObject):
                 self._line_start = self.data.n
                 self._dump_line_start = len(self._dump) if self._dump is not None else 0
         sig = ch2 if PE_CHANNEL == 2 else ch1
-        m = tracker.measure(sig, self.plan.beam_x)
+        m = tracker.measure(sig, self.plan.beam_x,            # saturation: raw, Smin–Smax
+                            self._seq.top_count(PE_CHANNEL, self.window))
         seg, env = tracker.point_signals(-1)
         self._last = (seg, env, np.array(ch1[smin:smax], dtype=float),
                       np.array(sig, dtype=float) if self._dump is not None else None,
@@ -1882,6 +1883,7 @@ class ScanTool(QObject):
                           f'witness visit {plan.other} moves first, then {plan.axis}; back to '
                           f'the start {plan.axis} first, then {plan.other}',
             'temperature_note': PT100_NOTE,
+            'saturation_criterion': SATURATION_FLAG,
             'start_point': plan.start_coords,
             'settle_ms': p.settle_ms, 'avg_n': p.avg_n,
             'settle_avg_note': 'default settle 100 ms measured 2026-10-05, valid for steps '

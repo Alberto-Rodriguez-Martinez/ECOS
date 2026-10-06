@@ -1,6 +1,6 @@
 # Especificación: pestaña Escáner en ECOS
 
-Estado: aprobada. Fase 1 implementada y probada en hardware (21–24/09). Fase 3 (foco) cerrada tras las pruebas en hardware (30/09). Fases 4 (planitud) y 5 (barrido en línea, referencias en agua y guardado) implementadas y probadas con el SeDaq sintético, pendientes de prueba en hardware. Fase 6 (barrido en superficie, espesor por punto, punto testigo) implementada y probada con el SeDaq sintético y en la GUI con el escáner simulado; el espesor, comprobado además sobre los barridos reales del 05/10; pendiente de prueba en hardware. Formato de barrido `scan-32-3.0` (se siguen leyendo los `scan-32-2.0`). Última revisión: 2026-10-05.
+Estado: aprobada. Fase 1 implementada y probada en hardware (21–24/09). Fase 3 (foco) cerrada tras las pruebas en hardware (30/09). Fases 4 (planitud) y 5 (barrido en línea, referencias en agua y guardado) implementadas y probadas con el SeDaq sintético, pendientes de prueba en hardware. Fase 6 (barrido en superficie, espesor por punto, punto testigo) implementada y probada con el SeDaq sintético y en la GUI con el escáner simulado; el espesor, comprobado además sobre los barridos reales del 05/10; pendiente de prueba en hardware. Formato de barrido `scan-32-3.1` (06/10: nuevo criterio de saturación, sección 5.7; se siguen leyendo 2.0 y 3.0). Última revisión: 2026-10-05.
 
 ## 1. Contexto
 
@@ -198,7 +198,7 @@ Implementada en `acquisition/flatness_tool.py` (fase 4, `task_scanner_phase4.md`
 - **Puntos poco fiables**, marcados en la gráfica y fuera del ajuste:
   - eco pegado a un borde de Smin–Smax → «ventana estrecha, amplíala»;
   - sin eco claro en la banda → «seguimiento perdido». Si hay un eco claro fuera de la banda, el desplazamiento por paso supera la banda y hay que reducir el paso o ampliar la banda;
-  - saturación.
+  - saturación (criterio en la sección 5.7, cambiado el 06/10).
 - **La cara puede acabarse**: si el eco desaparece en los extremos de una línea, el ajuste se limita al tramo con eco claro, se dice y se sugiere un rango. Con menos de 3 puntos válidos no hay resultado para ese eje.
 - Gráfica: las dos líneas como desplazamiento de la cara (µm, desde el ToF) frente a la posición relativa al centro, con sus rectas y los puntos poco fiables marcados.
 - Botones Ejecutar y **Repetir** (mismos parámetros: corriges a mano y vuelves a medir).
@@ -386,6 +386,19 @@ En `acquisition/scan_tool.py`, sobre el mismo `ScanTool`: una línea es el caso 
 - **Cambio incompatible**: el número de puntos medidos ya no es `shape[1]` (una línea parada va rellena hasta su longitud completa); es `point_valid.sum()` en los arrays, o `n_acquired` en `meta.json`. Revisado el repositorio el 06/10: nadie usaba `shape[1]` así. El `load_scan_raw_32` anterior solo aceptaba `scan-32-2.0` y **rechaza** un 3.0 con un error; solo leería el relleno como medidas un código que abriera `scan.npz` directamente. `analysis/ecos_loader.load_scan` lo advierte y añade al catálogo `scan_completed`, `scan_n_lines`, `scan_n_lines_acquired`, `scan_n_points_per_line`, `scan_line_status`, `scan_partial_line`, `scan_path` y `scan_doubtful_lines`; `scan_shape` es la forma guardada, relleno incluido.
 
 **Modo simulador de la GUI (06/10):** la ventana Smin–Smax por defecto la da el propio SeDaq sintético (`SimSeDaq.default_window`): contiene el eco frontal y el de la cara trasera de la muestra en el foco, y deja fuera el disparo y la primera reverberación. La sesión del simulador va en su propio archivo, `ecos_gui_session_sim.json` (fuera de git), y nunca toca la sesión del equipo real (`ecos_gui_session.json`, con la Smin–Smax y las ganancias del montaje: era la que el modo demo restauraba y sobrescribía). `--session FILE` o la variable `ECOS_GUI_SESSION` eligen otro archivo; los tests de la GUI usan uno temporal y comprueban que los dos reales no cambian.
+
+### 5.7 Saturación (06/10)
+**Una sola detección para todo ECOS**, en `database/scan_counts.py`: `top_mask(raw, bits)` marca las muestras de **una captura** en el tope del cuantizador (código 0 o fondo de escala − 1), sobre las **cuentas crudas**, antes de restar la media y de promediar; las adquisiciones la acumulan con OR sobre todas sus capturas. `count_at_top(mask, span)` cuenta las marcadas en el **rango que da quien la llama**:
+- **Indicador en vivo** (gráfica de tiempo real, junto al nombre de cada canal, en rojo y solo cuando ocurre, con el número de muestras al tope): el **registro entero**, porque cualquier recorte interesa verlo. Se calcula en el refresco en vivo y en cada adquisición de una secuencia.
+- **Bandera `saturated`** del foco, la planitud, el test de estabilidad y los barridos: **solo Smin–Smax** y el canal de pulso-eco (Ch2), para no marcar puntos por el disparo, que queda fuera de la ventana de análisis y no invalida la medida. El secuenciador guarda la máscara de la última adquisición (`top_fn` del anfitrión) y cada herramienta pide el recuento de su ventana (`ScanSequencer.top_count`); el seguimiento del eco lo recibe (`FrontEchoTracker.measure(..., n_top)`, `PeakMeasure.n_top`) y lo conserva al re-enganchar.
+
+**Cambio de criterio de la bandera `saturated`.** Hasta el 05/10 era un **umbral de 0,49 sobre la señal promediada y sin media, en la banda alrededor del eco seguido**. Desde el 06/10 es el **recuento de muestras al tope del cuantizador en cualquier captura individual, en Smin–Smax**. Son cosas distintas:
+- el umbral podía no ver una captura recortada entre varias (el promedio queda por debajo) y no miraba fuera de la banda del eco;
+- el recuento no depende de la desviación de continua del canal (Ch2: −7 a −8 cuentas en el equipo real) y ve, por ejemplo, un eco trasero que recorta donde la cara trasera está en foco (caso real del simulador con una muestra fina: 2,5 × A₀ = 0,5, justo el fondo de escala).
+
+**Los archivos anteriores no son comparables en ese campo.** Para que se distinga sin mirar fechas: los barridos pasan al esquema **`scan-32-3.1`** (mismos arrays que 3.0; se siguen leyendo 2.0 y 3.0) y llevan el criterio en `meta.json["scan"]["saturation_criterion"]`; los volcados de foco, planitud y barrido lo llevan en `meta_json["saturation_criterion"]` (`measurement_meta`). Un archivo sin esa clave usa el criterio antiguo.
+
+**Simulador:** el disparo del SeDaq sintético satura a propósito (para que importe medir solo en Smin–Smax), así que en modo demo el indicador de Ch2 está siempre encendido y las banderas no se activan. En el equipo real está por ver si el disparo llega al tope.
 
 ## 6. Seguridad
 

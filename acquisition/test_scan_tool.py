@@ -28,7 +28,7 @@ import test_focus_tool as tf  # noqa: E402  (module import: its tests are not co
 from BD_Experimentos_PVA import (  # noqa: E402
     experiment_name, load_scan_raw_32, save_scan_raw_32,
 )
-from scan_counts import counts_to_float, sum_dtype  # noqa: E402
+from scan_counts import counts_to_float, sum_dtype, top_mask  # noqa: E402
 from scan_tool import (  # noqa: E402
     LONG_SCAN_S, MAGNITUDES, PointContext, ScanParams, ScanPlan, compute_magnitudes,
     estimate_scan_s, line_positions, reference_drift, register_magnitude, scan_schedule,
@@ -45,11 +45,18 @@ LIMIT = tf.LIMIT
 MID = 512               # 10-bit quantizer midpoint (the assumed resolution)
 
 
+LAST_TOP = None     # raw samples at the quantizer top in the last acquire_counts()
+
+
 def acquire_counts(sim, avg_n):
     """What ecos_gui._acquire_counts does: Σ(raw − midpoint) over avg_n captures,
-    whole record, both channels (constant captures skipped)."""
+    whole record, both channels (constant captures skipped), and the raw samples at
+    the quantizer top in any capture (LAST_TOP)."""
+    global LAST_TOP
     s1 = np.zeros(sim.RecLen, dtype=np.int64)
     s2 = np.zeros(sim.RecLen, dtype=np.int64)
+    t1 = np.zeros(sim.RecLen, dtype=bool)
+    t2 = np.zeros(sim.RecLen, dtype=bool)
     k = 0
     while k < avg_n:
         sim.GetAScan()
@@ -59,7 +66,10 @@ def acquire_counts(sim, avg_n):
             continue
         s1 += r1 - MID
         s2 += r2 - MID
+        t1 |= top_mask(r1)
+        t2 |= top_mask(r2)
         k += 1
+    LAST_TOP = (t1, t2)
     return s1, s2
 OFFSET = 0.003          # the fake scanner lands this far from every target (real ≠ requested)
 
@@ -270,7 +280,7 @@ class TestScanSaveFormat(unittest.TestCase):
         kw = self.kwargs()
         path = save_scan_raw_32(**kw)
         meta, data = load_scan_raw_32(path)
-        self.assertEqual(meta['schema_version'], 'scan-32-3.0')
+        self.assertEqual(meta['schema_version'], 'scan-32-3.1')
         self.assertEqual(meta['experiment']['operator'], 'Ana')
         self.assertFalse(os.path.exists(os.path.join(path, 'results.json')))
         np.testing.assert_array_equal(data['signals_ch2_sum'], -kw['signals_ch1'])
@@ -438,6 +448,37 @@ THICK = dict(thickness=3.0, sigma=6.0, snr_db=45.0)
 
 def true_delay_samples(p):
     return 2.0 * p.thickness * 1e-3 / p.c_sample * FS
+
+
+class TestSaturationDetection(unittest.TestCase):
+    """scan_counts.top_mask / count_at_top: the one saturation detection of ECOS."""
+
+    def test_top_codes_only(self):
+        from scan_counts import count_at_top
+        raw = np.array([0, 1, 511, 512, 1022, 1023])
+        np.testing.assert_array_equal(top_mask(raw), [True, False, False, False, False, True])
+        self.assertEqual(count_at_top(top_mask(raw)), 2)
+        self.assertEqual(count_at_top(top_mask(raw), (1, 5)), 0)            # the range is the caller's
+        self.assertEqual(count_at_top(top_mask(raw), (4, 6)), 1)
+        self.assertEqual(count_at_top(top_mask(np.array([0, 4095]), bits=12)), 2)
+        self.assertEqual(count_at_top(None), 0)
+
+    def test_one_clipped_capture_is_not_hidden_by_the_average(self):
+        """The old flag (|x| ≥ 0.49 on the averaged float) misses it; the raw count does not."""
+        from scan_counts import count_at_top
+        n, rec = 10, 200
+        captures = [np.full(rec, MID + 100) for _ in range(n)]
+        for c in captures:
+            c[::2] = MID - 100                       # not constant, mean ≈ midpoint
+        captures[3][50] = 1023                       # one sample, one capture, at the top
+        top = np.zeros(rec, dtype=bool)
+        s = np.zeros(rec, dtype=np.int64)
+        for c in captures:
+            top |= top_mask(c)
+            s += c - MID
+        x, _ = counts_to_float(s, n)
+        self.assertLess(np.max(np.abs(x)), 0.49)     # the averaged float stays far below
+        self.assertEqual(count_at_top(top), 1)
 
 
 class TestEchoPair(unittest.TestCase):
@@ -616,7 +657,8 @@ class ScanHarness(unittest.TestCase):
             self.worker, self.sim, acquire,
             coords_fn=self.panel.current_coords,
             enter_exclusive=lambda: self.live.update(on=False),
-            leave_exclusive=lambda: self.live.update(on=True))
+            leave_exclusive=lambda: self.live.update(on=True),
+            top_fn=lambda: LAST_TOP)
         self.base = tempfile.mkdtemp(prefix='scan_db_test_')
         self.addCleanup(shutil.rmtree, self.base, ignore_errors=True)
         self.arduinos = []
@@ -826,6 +868,37 @@ class TestLineScan(ScanHarness):
         self.assertIn('scan session', focus.run(5.0, 1.0))
         self.tool.cancel_reference()
         self.assertIsNone(self.seq.reserved_reason())
+
+
+class TestScanSaturationFlag(ScanHarness):
+    """The 'saturated' flag from raw counts, Smin–Smax only (from 06/10)."""
+
+    def scan(self, gain2):
+        self.make()
+        self.scan_gains = (65.0, gain2)
+        self.sim.SetGain2(gain2)
+        self.assertIsNone(self.tool.start(ScanParams(start=-1, end=1, step=1, settle_ms=0,
+                                                     line_settle_ms=0, avg_n=2, witness=False)))
+        self.wait(lambda: self.dones)
+        return self.tool.data
+
+    def test_main_bang_outside_the_window_does_not_flag(self):
+        from scan_counts import count_at_top
+        d = self.scan(35.0)                                    # reference gain
+        self.assertGreater(count_at_top(LAST_TOP[1]), 0)        # the bang clips (sample ~30) …
+        self.assertEqual(count_at_top(LAST_TOP[1], tf.WIDE), 0)   # … outside Smin–Smax
+        self.assertFalse(any('saturated' in f for f in d.flags))
+        self.assertTrue(all(m.n_top == 0 for m in d.measures))   # checked, nothing there
+        meta, _ = self.load_saved()
+        self.assertIn('any single capture', meta['scan']['saturation_criterion'].lower())
+        self.assertIn('Smin-Smax', meta['scan']['saturation_criterion'])
+        self.assertEqual(meta['schema_version'], 'scan-32-3.1')
+
+    def test_clipped_echo_flags_the_points(self):
+        d = self.scan(35.0 + 12.0)                             # front echo 0.2 → 0.8: clips
+        self.assertTrue(all('saturated' in f for f in d.flags))
+        self.assertTrue(all(m.n_top > 0 for m in d.measures))
+        self.assertTrue(any('lower the gain' in w for w in self.warnings))
 
 
 class TestThickness(ScanHarness):

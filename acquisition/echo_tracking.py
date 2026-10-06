@@ -51,7 +51,6 @@ if _TOOLS_DIR not in sys.path:
 from ECOS_US_ToolBox import CalcToFAscanCosine_XCRFFT, Envelope  # noqa: E402
 
 DEFAULT_EDGE_MARGIN = 0.05     # fraction of the window width
-SATURATION_LEVEL = 0.49        # |amplitude| in ecos_gui units (full scale ±0.5)
 CONFIDENT_CONTRAST = 8.0       # envelope peak / median envelope: a clear echo
 EDGE_MIN_CONTRAST = 6.0        # below this the peak is noise and where it falls means nothing
 C_W_NOMINAL = 1480.0           # m/s, when no temperature has been read
@@ -66,7 +65,7 @@ class PeakMeasure:
     amp: float            # envelope peak of the echo used
     index: int            # absolute sample index of that peak
     at_edge: bool         # a clear peak within the edge margin of Smin or Smax
-    saturated: bool       # the raw signal reaches full scale around the echo used
+    saturated: bool       # n_top > 0: raw samples at the quantizer top in Smin–Smax
     contrast: float = float('inf')   # peak / median of the envelope in the window
     # Which echo was used:
     #   'max'      window maximum (window_peak, no tracking)
@@ -80,6 +79,9 @@ class PeakMeasure:
     outside: bool = False                     # the predicted band is out of Smin–Smax
     index_frac: float = float('nan')          # sub-sample envelope peak (parabolic), absolute
     echo_elsewhere: bool = False              # tracked: a clear echo in the window, off the band
+    # Raw samples at the top of the quantizer in Smin–Smax, any capture of the
+    # acquisition (scan_counts.top_mask / count_at_top); None: not checked (no raw counts).
+    n_top: Optional[int] = None
 
     @property
     def flagged(self):
@@ -110,16 +112,27 @@ def _window_env(sig, smin, smax):
     return seg, Envelope(seg)
 
 
-def _peak_measure(seg, env, smin, k, edge_margin, sat_span=None, **extra):
-    """PeakMeasure for relative index k; saturation checked on sat_span (relative, default all)."""
+def _peak_measure(seg, env, smin, k, edge_margin, **extra):
+    """PeakMeasure for relative index k (saturation: set_saturation, from raw counts)."""
     med = float(np.median(env))
     contrast = float(env[k]) / med if med > 0 else float('inf')
     margin = max(1, int(round(edge_margin * len(seg))))
     at_edge = (k < margin or k >= len(seg) - margin) and contrast >= EDGE_MIN_CONTRAST
-    lo, hi = sat_span if sat_span is not None else (0, len(seg))
-    saturated = bool(np.max(np.abs(seg[lo:hi])) >= SATURATION_LEVEL) if hi > lo else False
     extra.setdefault('index_frac', smin + subsample_peak(env, k))
-    return PeakMeasure(float(env[k]), smin + int(k), at_edge, saturated, contrast, **extra)
+    return PeakMeasure(float(env[k]), smin + int(k), at_edge, False, contrast, **extra)
+
+
+def set_saturation(m, n_top):
+    """
+    Saturation of a measure from the RAW counts of its acquisition: n_top samples
+    at the top of the quantizer in Smin–Smax, in any capture (scan_counts.top_mask
+    and count_at_top, the one detection of ECOS). The float the echo is measured on
+    has been averaged and has its mean removed, so it cannot tell for certain.
+    None: no raw counts available, not checked (saturated stays False).
+    """
+    m.n_top = None if n_top is None else int(n_top)
+    m.saturated = bool(n_top)
+    return m
 
 
 def subsample_peak(env, k):
@@ -134,10 +147,12 @@ def subsample_peak(env, k):
     return k + 0.5 * (y0 - y2) / den
 
 
-def window_peak(sig, smin, smax, edge_margin=DEFAULT_EDGE_MARGIN):
-    """Envelope maximum of sig[smin:smax] (never the whole record). No tracking."""
+def window_peak(sig, smin, smax, edge_margin=DEFAULT_EDGE_MARGIN, n_top=None):
+    """Envelope maximum of sig[smin:smax] (never the whole record). No tracking.
+    n_top: raw samples at the quantizer top in Smin–Smax (set_saturation)."""
     seg, env = _window_env(sig, smin, smax)
-    return _peak_measure(seg, env, smin, int(np.argmax(env)), edge_margin)
+    return set_saturation(_peak_measure(seg, env, smin, int(np.argmax(env)), edge_margin),
+                          n_top)
 
 
 def echo_threshold(env, fraction=DEFAULT_THRESHOLD):
@@ -237,7 +252,7 @@ class FrontEchoTracker:
     def new_sweep(self):
         self.measures: List[PeakMeasure] = []
         self.relocks: List[int] = []        # indices in this sweep where it re-locked
-        self._points = []                   # (x, seg, env) kept for a re-lock
+        self._points = []                   # (x, seg, env, n_top) kept for a re-lock
 
     def predict(self, x, anchor=None):
         anchor = anchor if anchor is not None else self.anchor
@@ -245,24 +260,26 @@ class FrontEchoTracker:
             return None
         return anchor[1] + self.samples_per_mm * (float(x) - anchor[0])
 
-    def measure(self, sig, x):
+    def measure(self, sig, x, n_top=None):
+        """n_top: raw samples at the quantizer top in Smin–Smax for this acquisition
+        (set_saturation); None when the caller has no raw counts."""
         smin, smax = self.window
         seg, env = _window_env(sig, smin, smax)
         x = float(x)
-        m = self._locate(seg, env, x, self.anchor, allow_relock=True)
+        m = set_saturation(self._locate(seg, env, x, self.anchor, allow_relock=True), n_top)
         if m.mode in ('first', 'relock') or (m.mode == 'tracked' and m.confident):
             self.anchor = (x, m.index)
         if m.mode == 'relock':
             self.relocks.append(len(self.measures))
             self._retrack_backwards()
-        self._points.append((x, seg, env))
+        self._points.append((x, seg, env, n_top))
         self.measures.append(m)
         return m
 
     def point_signals(self, j=-1):
         """(seg, env) of point j of this sweep: the exact window array the measure
         was computed on (float copy of sig[smin:smax]) and its Hilbert envelope."""
-        _, seg, env = self._points[j]
+        _, seg, env, _ = self._points[j]
         return seg, env
 
     # -- internals ---------------------------------------------------------------
@@ -292,7 +309,7 @@ class FrontEchoTracker:
         if hi_c - lo_c < 3:
             # The predicted echo is out of Smin–Smax: nothing to measure there.
             k = min(max(int(round(p)), 0), n - 1)
-            m = _peak_measure(seg, env, smin, k, self.edge_margin, (lo_c, hi_c),
+            m = _peak_measure(seg, env, smin, k, self.edge_margin,
                               mode='tracked', band=(smin + lo, smin + hi),
                               predicted=smin + p, outside=True, index_frac=float(smin + k),
                               echo_elsewhere=bool(lobes))
@@ -301,7 +318,7 @@ class FrontEchoTracker:
             m.at_edge = False
             return m
         k = lo_c + int(np.argmax(env[lo_c:hi_c]))
-        return _peak_measure(seg, env, smin, k, self.edge_margin, (lo_c, hi_c),
+        return _peak_measure(seg, env, smin, k, self.edge_margin,
                              mode='tracked', band=(smin + lo_c, smin + hi_c),
                              predicted=smin + p, echo_elsewhere=elsewhere)
 
@@ -309,15 +326,15 @@ class FrontEchoTracker:
         """Measure on the echo at relative index k; band = ±band around it."""
         smin = self.window[0]
         lo, hi = max(k - self.band, 0), min(k + self.band + 1, len(env))
-        return _peak_measure(seg, env, smin, k, self.edge_margin, (lo, hi),
+        return _peak_measure(seg, env, smin, k, self.edge_margin,
                              mode=mode, band=(smin + lo, smin + hi))
 
     def _retrack_backwards(self):
         """After a re-lock: the earlier points of this sweep, predicted from the new anchor."""
         anchor = self.anchor
         for j in range(len(self._points) - 1, -1, -1):
-            x, seg, env = self._points[j]
-            m = self._locate(seg, env, x, anchor, allow_relock=False)
+            x, seg, env, n_top = self._points[j]
+            m = set_saturation(self._locate(seg, env, x, anchor, allow_relock=False), n_top)
             self.measures[j] = m
             if m.confident:
                 anchor = (x, m.index)

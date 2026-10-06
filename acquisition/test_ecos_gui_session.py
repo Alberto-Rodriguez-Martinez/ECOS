@@ -210,5 +210,81 @@ class TestFullScaleLines(_LiveWindow):
                 self.assertIn(f'A = {y:.4f} a.u. ({pct})', self.win._lbl_cursor.text())
 
 
+class TestSaturationIndicator(_LiveWindow):
+    """Red indicator per channel, from the raw counts of the last acquisition."""
+
+    def setUp(self):
+        super().setUp()
+        sys.path.insert(0, os.path.join(_HERE, '..', 'database'))
+        from scan_counts import count_at_top, top_mask
+        self.count_at_top, self.top_mask = count_at_top, top_mask
+        self.lbl = self.win._lbl_sat
+        self.sim = self.win._sedaq
+
+    def test_only_when_it_happens_with_the_count(self):
+        import numpy as np
+        n = self.win._reclen
+        clean = np.zeros(n, dtype=bool)
+        self.win._show_saturation((clean, clean))
+        self.assertFalse(self.lbl[1].isVisible() or self.lbl[2].isVisible())
+        ch2 = clean.copy()
+        ch2[[10, 500, 501]] = True
+        self.win._show_saturation((clean, ch2))
+        self.assertFalse(self.lbl[1].isVisible())
+        self.assertTrue(self.lbl[2].isVisible())
+        self.assertIn('3 samples', self.lbl[2].text())
+        self.assertIn('230, 30, 30', self.lbl[2].styleSheet())            # red
+        one = clean.copy()
+        one[7] = True
+        self.win._show_saturation((one, clean))
+        self.assertEqual(self.lbl[1].text(), 'SATURATED: 1 sample at full scale')
+        self.assertFalse(self.lbl[2].isVisible())
+
+    @staticmethod
+    def layout_of(layout, widget):
+        """The (nested) layout that holds widget directly."""
+        if layout.indexOf(widget) >= 0:
+            return layout
+        for i in range(layout.count()):
+            child = layout.itemAt(i).layout()
+            found = child is not None and TestSaturationIndicator.layout_of(child, widget)
+            if found:
+                return found
+        return None
+
+    def test_next_to_the_channel_name(self):
+        row = self.layout_of(self.win._chk_ch1.parentWidget().layout(), self.win._chk_ch1)
+        for ch, chk in ((1, self.win._chk_ch1), (2, self.win._chk_ch2)):
+            items = [row.itemAt(i).widget() for i in range(row.count())]
+            self.assertEqual(items.index(self.lbl[ch]), items.index(chk) + 1)
+
+    def raw_count(self, buf):
+        return self.count_at_top(self.top_mask(buf[:self.win._reclen]))
+
+    def test_live_refresh_whole_record(self):
+        self.sim.SetGain1(self.sim.params.gain_ref_ch1 + 30.0)     # Ch1 clips (0.43 → 1.4)
+        self.win._running, self.win._inspection_mode = True, False
+        self.win._update_plots()
+        n1 = self.raw_count(self.sim.DataADC1)
+        self.assertGreater(n1, 0)
+        self.assertTrue(self.lbl[1].isVisible())
+        self.assertIn(f'{n1} samples', self.lbl[1].text())
+        # Ch2: the simulator's main bang clips on purpose; the whole record is checked
+        self.assertEqual(self.lbl[2].isVisible(), self.raw_count(self.sim.DataADC2) > 0)
+
+    def test_sequence_acquisition_any_capture(self):
+        import numpy as np
+        self.sim.SetGain1(self.sim.params.gain_ref_ch1 + 30.0)
+        self.win._seq_acquire(4)
+        top1 = self.win._last_top[0]
+        self.assertTrue(self.lbl[1].isVisible())
+        self.assertIn(f'{self.count_at_top(top1)} samples', self.lbl[1].text())
+        self.assertIs(self.win._last_counts['top'], self.win._last_top)
+        self.sim.SetGain1(self.sim.params.gain_ref_ch1)             # back to normal
+        self.win._seq_acquire(4)
+        self.assertFalse(self.lbl[1].isVisible())
+        self.assertEqual(int(np.count_nonzero(self.win._last_top[0])), 0)
+
+
 if __name__ == '__main__':
     unittest.main()

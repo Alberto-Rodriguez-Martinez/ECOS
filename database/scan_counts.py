@@ -43,6 +43,44 @@ def quantizer(bits=ADC_BITS_DEFAULT):
     return full, full // 2
 
 
+# ---------------------------------------------------------------------------
+#  Saturation: the ONE detection of ECOS (live indicator, and the 'saturated'
+#  flag of focus, flatness, stability and scans), from 2026-10-06.
+# ---------------------------------------------------------------------------
+SATURATION_CRITERION = ('raw counts: at least one sample at the top of the quantizer '
+                        '(code 0 or full_scale - 1) in ANY single capture, before any mean '
+                        'is removed or captures averaged')
+
+
+def top_mask(raw, bits=ADC_BITS_DEFAULT):
+    """
+    Samples of ONE capture at the top of the quantizer, code 0 or full_scale − 1:
+    raw counts, before removing the mean or averaging, so it is certain (a sample
+    there has clipped) and a clipped capture is never hidden by the average.
+    Accumulate over the captures of an acquisition with |=.
+    """
+    full, _ = quantizer(bits)
+    r = np.asarray(raw)
+    return (r <= 0) | (r >= full - 1)
+
+
+def count_at_top(mask, span=None):
+    """
+    Samples marked in `mask` (top_mask, accumulated over captures) within the sample
+    range span = (lo, hi), end exclusive; the whole record when None. The range is
+    the caller's: the live view checks the whole record (any clipping is worth
+    seeing), the measurement flags only Smin–Smax (the main bang outside the
+    analysis window does not invalidate a measure).
+    """
+    if mask is None:
+        return 0
+    m = np.asarray(mask, dtype=bool)
+    if span is not None:
+        lo, hi = max(0, int(span[0])), min(m.size, int(span[1]))
+        m = m[lo:hi]
+    return int(np.count_nonzero(m))
+
+
 def sum_dtype(n_avg, bits=ADC_BITS_DEFAULT):
     """Smallest integer type holding Σ(raw − midpoint) over n_avg captures."""
     _, mid = quantizer(bits)

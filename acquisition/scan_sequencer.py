@@ -21,10 +21,18 @@ While a sequence runs the live-refresh timer must be off: the host passes
 enter_exclusive / leave_exclusive (stop / start of that timer). The leave hook
 runs on every way out (done, stop, error, pause) from a finally.
 """
+import os
+import sys
 import time
 from contextlib import ExitStack, contextmanager
 
 from PyQt5.QtCore import QObject, QTimer, pyqtSignal
+
+_DB_DIR = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), '..',
+                                        'database'))
+if _DB_DIR not in sys.path:
+    sys.path.insert(0, _DB_DIR)
+from scan_counts import count_at_top  # noqa: E402
 
 SEQUENCE_AXES = ('X', 'Y', 'Z')   # R needs its own stepwise handling: not sequenced here
 NAN = float('nan')
@@ -73,7 +81,7 @@ class ScanSequencer(QObject):
 
     def __init__(self, worker, sedaq, acquire_fn, *, coords_fn=None,
                  blocker_fn=None, temp_factory=None,
-                 enter_exclusive=None, leave_exclusive=None, parent=None):
+                 enter_exclusive=None, leave_exclusive=None, top_fn=None, parent=None):
         """
         worker          ScannerWorker (only its enqueue() and signals are used)
         sedaq           SeDaq object, used to guard RecLen
@@ -83,6 +91,9 @@ class ScanSequencer(QObject):
                         whether a sequence may start (connection, free-movement...)
         temp_factory    () -> object with getTemperatures() -> (T1, T2) and close(),
                         opened once per sequence. None: temperature stored as NaN.
+        top_fn          () -> (mask_ch1, mask_ch2) of the LAST acquisition: samples at the
+                        quantizer top in any capture, whole record (scan_counts.top_mask,
+                        accumulated). None: no raw counts, saturation not checked.
         """
         super().__init__(parent)
         self._worker = worker
@@ -93,6 +104,8 @@ class ScanSequencer(QObject):
         self._temp_factory = temp_factory
         self._enter_hook = enter_exclusive
         self._leave_hook = leave_exclusive
+        self._top_fn = top_fn
+        self.last_top = None       # (mask_ch1, mask_ch2) of the last point's acquisition
 
         self._active = False
         self._state = 'idle'
@@ -117,6 +130,14 @@ class ScanSequencer(QObject):
     @property
     def state(self):
         return self._state
+
+    def top_count(self, channel, span=None):
+        """Raw samples at the quantizer top in the last point's acquisition, channel 1
+        or 2, within span = (lo, hi) (the whole record when None); None when the host
+        gives no raw counts. The tools pass Smin–Smax (scan_counts.count_at_top)."""
+        if self.last_top is None:
+            return None
+        return count_at_top(self.last_top[int(channel) - 1], span)
 
     # -- reservation (phase 5) -------------------------------------------------
     def reserve(self, owner, reason):
@@ -296,6 +317,7 @@ class ScanSequencer(QObject):
             return
         i = self._index
         ch1, ch2 = self._acquire(self._avg_n)
+        self.last_top = self._top_fn() if self._top_fn is not None else None
         value = self._measure(ch1, ch2)
         coords = self._coords_fn() if self._coords_fn else dict(self._positions[i])
         self.results.append((i, coords, value))

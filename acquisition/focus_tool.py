@@ -89,6 +89,12 @@ from echo_tracking import (  # window_peak, PeakMeasure: re-exported for ecos_gu
     PeakMeasure, band_samples, echo_samples_per_mm, window_peak,
 )
 from scan_sequencer import DEFAULT_AVG_N, DEFAULT_SETTLE_MS
+from scan_counts import SATURATION_CRITERION  # noqa: E402  (database/, put on the path above)
+
+# The 'saturated' flag of every scanner tool, from 2026-10-06 (written in every dump
+# and scan file). Before: |x| >= 0.49 on the averaged, mean-removed float, in the
+# band around the tracked echo. Flags before and after are NOT comparable.
+SATURATION_FLAG = SATURATION_CRITERION + '; PE channel (Ch2), Smin-Smax only'
 
 PE_CHANNEL = 2                 # ecos_gui.py: s_PE is Ch2
 DEFAULT_HALF_RANGE_MM = 5.0
@@ -225,13 +231,15 @@ def measurement_meta(settle_ms, avg_n, gains=None, temperature=None):
     """
     The measurement parameters every debug dump writes into meta_json, with the
     same keys in the three tools (focus, flatness, scan), so dumps can be compared
-    with each other: settle_ms, avg_n, gain_ch1_db, gain_ch2_db and temperature
-    ({'T1', 'T2', 'time', 'source'} of the reading available at that moment, or None).
+    with each other: settle_ms, avg_n, gain_ch1_db, gain_ch2_db, temperature
+    ({'T1', 'T2', 'time', 'source'} of the reading available at that moment, or None)
+    and saturation_criterion (what the 'saturated' flag means: it changed on 06/10).
     gains: (g1, g2) or None (unknown).
     """
     g1, g2 = (None, None) if gains is None else (float(gains[0]), float(gains[1]))
     return {'settle_ms': int(settle_ms), 'avg_n': int(avg_n),
-            'gain_ch1_db': g1, 'gain_ch2_db': g2, 'temperature': temperature}
+            'gain_ch1_db': g1, 'gain_ch2_db': g2, 'temperature': temperature,
+            'saturation_criterion': SATURATION_FLAG}
 
 
 def host_value(fn):
@@ -953,7 +961,8 @@ class FocusTool(QObject):
         x = self._panel.current_coords()[self._axis]
         if self._dump is not None:
             self._last_record = np.array(sig, dtype=float)
-        return self._plan.tracker.measure(sig, x)
+        tracker = self._plan.tracker      # saturation: raw counts in Smin–Smax
+        return tracker.measure(sig, x, self._seq.top_count(PE_CHANNEL, tracker.window))
 
     def _start_phase(self, phase, xs):
         self._phase = phase

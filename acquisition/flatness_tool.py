@@ -592,7 +592,8 @@ class FlatnessTool(QObject):
         sig = ch2 if PE_CHANNEL == 2 else ch1
         if self._dump is not None:
             self._last_record = np.array(sig, dtype=float)
-        return self._tracker.measure(sig, self._plan.beam_x)
+        return self._tracker.measure(sig, self._plan.beam_x,     # saturation: raw, Smin–Smax
+                                     self._seq.top_count(PE_CHANNEL, self._tracker.window))
 
     def _start_phase(self, phase):
         self._phase = phase

@@ -21,8 +21,11 @@ import unittest
 
 os.environ.setdefault('QT_QPA_PLATFORM', 'offscreen')
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'database'))
 
 import numpy as np  # noqa: E402
+
+from scan_counts import count_at_top, top_mask  # noqa: E402
 
 from sim_sedaq import QUANT, SimParams, SimSeDaq  # noqa: E402
 from echo_tracking import FrontEchoTracker  # noqa: E402
@@ -44,15 +47,35 @@ def raw_to_float(buf, reclen):
     return arr
 
 
+LAST_TOP = None     # raw samples at the quantizer top in the last acquire(), (ch1, ch2)
+
+
 def acquire(sim, avg_n):
-    """Averaged (ch1, ch2), like ecos_gui._acquire_avg."""
+    """Averaged (ch1, ch2), like ecos_gui._acquire_avg; as ecos_gui._acquire_counts it
+    also keeps the raw samples at the quantizer top of every capture (LAST_TOP)."""
+    global LAST_TOP
     acc1 = np.zeros(sim.RecLen)
     acc2 = np.zeros(sim.RecLen)
+    top1 = np.zeros(sim.RecLen, dtype=bool)
+    top2 = np.zeros(sim.RecLen, dtype=bool)
     for _ in range(avg_n):
         sim.GetAScan()
         acc1 += raw_to_float(sim.DataADC1, sim.RecLen)
         acc2 += raw_to_float(sim.DataADC2, sim.RecLen)
+        top1 |= top_mask(sim.DataADC1[:sim.RecLen])
+        top2 |= top_mask(sim.DataADC2[:sim.RecLen])
+    LAST_TOP = (top1, top2)
     return acc1 / avg_n, acc2 / avg_n
+
+
+def last_top():
+    """The host's top_fn for a ScanSequencer fed by acquire()."""
+    return LAST_TOP
+
+
+def pe_top(window):
+    """Raw PE samples at the quantizer top in the window, last acquire()."""
+    return count_at_top(LAST_TOP[1], window)
 
 
 def make_sim(seed=0, beam='Y', pe_side='origin', thin=False, inverted=False, **params):
@@ -75,7 +98,7 @@ def measure_at(sim, xs, window, avg_n, margin=0.05):
     for x in xs:
         move(sim, x)
         _, pe = acquire(sim, avg_n)
-        out.append(window_peak(pe, window[0], window[1], margin))
+        out.append(window_peak(pe, window[0], window[1], margin, pe_top(window)))
     return out
 
 
@@ -85,7 +108,7 @@ def measure_tracked(sim, xs, tracker, avg_n):
     for x in xs:
         move(sim, x)
         _, pe = acquire(sim, avg_n)
-        tracker.measure(pe, x)
+        tracker.measure(pe, x, pe_top(tracker.window))
     return list(tracker.measures)
 
 
@@ -179,7 +202,7 @@ class TestSimSeDaq(unittest.TestCase):
         self.assertEqual(raw.max(), QUANT - 1)
         self.assertEqual(raw.min(), 0)
         _, pe = acquire(sim, 1)
-        self.assertTrue(window_peak(pe, *WIDE).saturated)
+        self.assertTrue(window_peak(pe, *WIDE, n_top=pe_top(WIDE)).saturated)
 
     def test_zero_gain_is_noise_not_a_dead_record(self):
         sim = make_sim()
@@ -629,7 +652,12 @@ class TestEchoPolarity(unittest.TestCase):
         for seed, (thin, x_focus) in enumerate([(False, 50.0), (False, 52.3),
                                                 (True, 50.0), (True, 48.7)]):
             with self.subTest(thin=thin, x_focus=x_focus):
-                sim = make_sim(seed=30 + seed, thin=thin, inverted=True, x_focus=x_focus)
+                # thin: back echo still larger than the front one, but below full scale
+                # (2.5 × A0 = 0.5 IS full scale: it clips where the back face is in focus,
+                # which the raw-count saturation flag, on all of Smin–Smax, rightly sees)
+                extra = dict(back_ratio=2.2) if thin else {}
+                sim = make_sim(seed=30 + seed, thin=thin, inverted=True, x_focus=x_focus,
+                               **extra)
                 outcome, _ = run_focus(sim, 50.0, WIDE, fine=fine)
                 self.assertTrue(outcome.move, outcome.text)
                 self.assertLess(abs(outcome.fit.x_opt - x_focus), fine, outcome.text)
@@ -715,7 +743,7 @@ class TestFocusToolQt(unittest.TestCase):
             self.worker, self.sim, lambda n: acquire(self.sim, n),
             coords_fn=self.panel.current_coords,
             enter_exclusive=lambda: self.live.update(on=False),
-            leave_exclusive=leave)
+            leave_exclusive=leave, top_fn=last_top)
         self.window = WIDE
         self.window_reads = 0
 

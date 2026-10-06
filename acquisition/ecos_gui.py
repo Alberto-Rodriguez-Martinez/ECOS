@@ -156,7 +156,7 @@ AVG_MAX_ATTEMPTS_FACTOR = 4  # captures tried per requested average before givin
 # ECOS until now (density_gui / pulser_gui let the user pick it, default 10 bit).
 # It is a parameter: the quantizer midpoint and full scale come from it, and
 # every scan writes it into its metadata (database/scan_counts.py).
-from scan_counts import ADC_BITS_DEFAULT, counts_to_float  # noqa: E402
+from scan_counts import ADC_BITS_DEFAULT, count_at_top, counts_to_float, top_mask  # noqa: E402
 ADC_BITS = ADC_BITS_DEFAULT
 ADC_FULL_SCALE = 2 ** ADC_BITS          # counts; midpoint = ADC_FULL_SCALE / 2
 
@@ -407,8 +407,18 @@ class EcosGUI(QMainWindow):
         self._chk_ch2.setChecked(True)
         self._chk_ch1.toggled.connect(self._toggle_ch1_vis)
         self._chk_ch2.toggled.connect(self._toggle_ch2_vis)
-        top_row.addWidget(self._chk_ch1)
-        top_row.addWidget(self._chk_ch2)
+        # Saturation of each channel, next to its name, only while it happens
+        self._lbl_sat = {}
+        for ch, chk in ((1, self._chk_ch1), (2, self._chk_ch2)):
+            lbl = QLabel("")
+            lbl.setStyleSheet("color: rgb(230, 30, 30); font-weight: bold;")
+            lbl.setToolTip("Raw samples of the last acquisition at the top of the quantizer "
+                           "(code 0 or full scale - 1) in any capture, whole record: this "
+                           "channel has clipped.")
+            lbl.hide()
+            self._lbl_sat[ch] = lbl
+            top_row.addWidget(chk)
+            top_row.addWidget(lbl)
 
         top_row.addSpacing(20)
         top_row.addWidget(QLabel("X-axis:"))
@@ -879,8 +889,23 @@ class EcosGUI(QMainWindow):
             ch1 = self._raw_to_float(self._sedaq.DataADC1, self._reclen, quant)
             ch2 = self._raw_to_float(self._sedaq.DataADC2, self._reclen, quant)
             self._plot_ascans(ch1, ch2)
+            self._show_saturation(tuple(
+                top_mask(np.asarray(buf[:self._reclen]), ADC_BITS)
+                for buf in (self._sedaq.DataADC1, self._sedaq.DataADC2)))
         except Exception as e:
             print(f"[_update_plots] {e}")
+
+    def _show_saturation(self, tops):
+        """Red indicator next to each channel name, only when its last acquisition has
+        raw samples at the quantizer top (scan_counts.top_mask, the one detection of
+        ECOS). The whole record: any clipping is worth seeing here, also the main bang,
+        which the measurement flags ignore (they look at Smin–Smax only)."""
+        for ch, mask in zip((1, 2), tops):
+            n = count_at_top(mask)
+            lbl = self._lbl_sat[ch]
+            lbl.setText(f"SATURATED: {n} sample{'s' if n != 1 else ''} at full scale"
+                        if n else "")
+            lbl.setVisible(n > 0)
 
     def _plot_ascans(self, ch1, ch2):
         """Draw one pair of full-record A-scans on the zoom and overview plots."""
@@ -1314,6 +1339,7 @@ class EcosGUI(QMainWindow):
             temp_factory=self._open_seq_arduino,
             enter_exclusive=self._timer.stop,
             leave_exclusive=lambda: self._timer.start(REALTIME_INTERVAL),
+            top_fn=lambda: getattr(self, '_last_top', None),
             parent=self,
         )
         seq = self._sequencer
@@ -1598,9 +1624,11 @@ class EcosGUI(QMainWindow):
         s1, s2 = self._acquire_counts(avg_n, reclen)
         ch1, o1 = counts_to_float(s1, avg_n, ADC_BITS)
         ch2, o2 = counts_to_float(s2, avg_n, ADC_BITS)
-        self._last_counts = {'sum': (s1, s2), 'offset': (o1, o2), 'n': int(avg_n)}
+        self._last_counts = {'sum': (s1, s2), 'offset': (o1, o2), 'n': int(avg_n),
+                             'top': self._last_top}
         if reclen == self._reclen:
             self._plot_ascans(ch1, ch2)
+            self._show_saturation(self._last_top)
         return ch1, ch2
 
     def _last_counts_fn(self):
@@ -1611,11 +1639,14 @@ class EcosGUI(QMainWindow):
         Integer sums over avg_n captures of (raw − midpoint), both channels, whole
         record (int64). Same retry rule as _acquire_avg: a constant capture on any
         channel (all zeros after the mean removal there) is discarded and retried,
-        up to AVG_MAX_ATTEMPTS_FACTOR * avg_n captures.
+        up to AVG_MAX_ATTEMPTS_FACTOR * avg_n captures. Also the samples at the
+        quantizer top in ANY of the captures (scan_counts.top_mask, OR-ed), kept in
+        self._last_top for the saturation indicator and the sequencer.
         """
         reclen = self._reclen if reclen is None else reclen
         mid = ADC_FULL_SCALE // 2
         sums = [np.zeros(reclen, dtype=np.int64), np.zeros(reclen, dtype=np.int64)]
+        tops = [np.zeros(reclen, dtype=bool), np.zeros(reclen, dtype=bool)]
         n = tries = 0
         max_tries = AVG_MAX_ATTEMPTS_FACTOR * avg_n
         while n < avg_n:
@@ -1630,9 +1661,11 @@ class EcosGUI(QMainWindow):
                     for buf in (self._sedaq.DataADC1, self._sedaq.DataADC2)]
             if any(np.all(r == r[0]) for r in raws):
                 continue
-            for acc, r in zip(sums, raws):
+            for acc, top, r in zip(sums, tops, raws):
                 acc += r - mid
+                top |= top_mask(r, ADC_BITS)
             n += 1
+        self._last_top = (tops[0], tops[1])
         return sums[0], sums[1]
 
     def _open_seq_arduino(self):

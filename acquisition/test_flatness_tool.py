@@ -250,7 +250,7 @@ class TestFlatnessToolQt(unittest.TestCase):
             self.worker, self.sim, lambda n: tf.acquire(self.sim, n),
             coords_fn=self.panel.current_coords,
             enter_exclusive=lambda: self.live.update(on=False),
-            leave_exclusive=lambda: self.live.update(on=True))
+            leave_exclusive=lambda: self.live.update(on=True), top_fn=tf.last_top)
         self.dump_dir = tempfile.mkdtemp(prefix='flatness_debug_test_')
         self.addCleanup(shutil.rmtree, self.dump_dir, ignore_errors=True)
         self.tool = FlatnessTool(self.seq, self.panel, lambda: tf.WIDE, pg.PlotWidget(),

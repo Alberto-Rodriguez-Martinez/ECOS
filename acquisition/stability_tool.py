@@ -329,7 +329,8 @@ class StabilityTool(QObject):
     # -- per point -------------------------------------------------------------
     def _measure(self, ch1, ch2):
         sig = ch2 if PE_CHANNEL == 2 else ch1
-        m = self._tracker.measure(sig, self._beam_x)
+        m = self._tracker.measure(sig, self._beam_x,             # saturation: raw, Smin–Smax
+                                  self._seq.top_count(PE_CHANNEL, self._tracker.window))
         self._last = (np.array(ch1, dtype=float), np.array(sig, dtype=float))
         return m
 
