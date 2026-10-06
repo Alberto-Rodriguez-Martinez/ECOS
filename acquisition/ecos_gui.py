@@ -1789,8 +1789,9 @@ class EcosGUI(QMainWindow):
         Integer sums over avg_n captures of (raw − midpoint), both channels, whole
         record (int64). Exact: the midpoint is a fixed integer, the DC offset of a
         capture is NOT subtracted here (it is computed later from the sum and kept
-        apart, scan_counts) and nothing is rounded. Same retry rule as _acquire_avg: a constant capture on any
-        channel (all zeros after the mean removal there) is discarded and retried,
+        apart, scan_counts) and nothing is rounded. Same retry rule as _acquire_avg:
+        a constant capture on any channel (all zeros after the mean removal there)
+        is discarded and retried,
         up to AVG_MAX_ATTEMPTS_FACTOR * avg_n captures. Also the samples at the
         quantizer top in ANY of the captures (scan_counts.top_mask, OR-ed), kept in
         self._last_top for the saturation indicator and the sequencer.
