@@ -252,8 +252,7 @@ class StabilityTool(QObject):
             band_us=params.band_us, threshold=params.threshold,
             emission_sample=params.emission_sample, fs=ACQ_FS, pe_channel=PE_CHANNEL,
             **measurement_meta(params.interval_s * 1000.0, params.avg_n, g,
-                               start if start is not None and start['ok'] else None,
-                               getattr(self._seq, 'emission_blank', None)),
+                               start if start is not None and start['ok'] else None),
         ), prefix='stability_debug')
         self._plot.reset()
         reason = self._seq.start([{}] * params.n, int(round(params.interval_s * 1000.0)),

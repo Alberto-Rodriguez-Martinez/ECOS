@@ -569,7 +569,7 @@ class FlatnessTool(QObject):
             threshold=threshold, c_w=c_w, cw_source=cw_source, emission_sample=emission_sample,
             fs=ACQ_FS, pe_channel=PE_CHANNEL, notices=plan.notices,
             **measurement_meta(settle_ms, avg_n, host_value(self._gains_fn),
-                               host_value(self._temp_fn), getattr(self._seq, 'emission_blank', None)),
+                               host_value(self._temp_fn)),
         ), prefix='flatness_debug') if debug_dump else None
         self._plot.reset(lat)
         for text in plan.notices:

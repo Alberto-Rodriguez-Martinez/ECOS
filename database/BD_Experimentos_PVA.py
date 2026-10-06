@@ -163,6 +163,11 @@ def save_scan_raw_32(
         <exp_name>/scan.npz    (compressed) integer signals per channel
                                (N_line × N_point × N_samples) and their offsets, real
                                coordinates, times, temperatures and water references
+    Samples stored: ONLY the analysis window, Smin..Smax-1, for the signals, the
+    witness and the references: what is measured is saved. The per-point offsets are
+    the one value taken from the whole record (the mean ECOS removes from each
+    capture), stored because it cannot be recomputed from the window. The debug dumps
+    of the scanner tools, by contrast, keep full records (scanner_tab_spec.md 5.6).
     The signals are the integer sums of counts of the averaged captures, int16 when
     they fit and int32 otherwise (scan_counts.py): exact, about half the size of
     float32, and nothing converted when writing. The conversion parameters (bits,

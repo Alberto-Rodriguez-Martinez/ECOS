@@ -463,23 +463,6 @@ class TestSaturationDetection(unittest.TestCase):
         self.assertEqual(count_at_top(top_mask(np.array([0, 4095]), bits=12)), 2)
         self.assertEqual(count_at_top(None), 0)
 
-    def test_emission_blanking_default(self):
-        from scan_counts import default_emission_blank, emission_end
-        rng = np.random.default_rng(0)
-        quiet = (MID + rng.normal(0, 2, 5000)).round()
-        self.assertEqual(emission_end(quiet), 0)                    # no bang: nothing to blank
-        self.assertEqual(default_emission_blank((quiet, quiet)), 0)
-        bang = quiet.copy()
-        bang[20:80] = np.where(np.arange(60) % 2, 1023, 0)          # clipping bang
-        bang[80:120] = MID + 40 * np.cos(np.arange(40))             # ringing down
-        end = emission_end(bang)
-        self.assertGreaterEqual(end, 115)
-        self.assertLess(end, 125)
-        self.assertEqual(default_emission_blank((quiet, bang)), end + 50)   # + 0.5 µs
-        echo = quiet.copy()
-        echo[3000:3050] = 1023                                      # an echo is not a bang
-        self.assertEqual(emission_end(echo), 0)
-
     def test_one_clipped_capture_is_not_hidden_by_the_average(self):
         """The old flag (|x| ≥ 0.49 on the averaged float) misses it; the raw count does not."""
         from scan_counts import count_at_top
@@ -916,7 +899,6 @@ class TestScanSaturationFlag(ScanHarness):
         self.make()
         self.sim.SetGain1(self.sim.params.gain_ref_ch1 + 30.0)       # Ch1 clips, Ch2 does not
         self.scan_gains = (self.sim.params.gain_ref_ch1 + 30.0, 35.0)
-        self.seq.emission_blank = 108
         self.assertIsNone(self.tool.start(ScanParams(start=-1, end=1, step=1, settle_ms=0,
                                                      line_settle_ms=0, avg_n=2, witness=True)))
         self.wait(lambda: self.dones)
@@ -931,8 +913,7 @@ class TestScanSaturationFlag(ScanHarness):
         self.assertTrue((s['n_top_ch2'] == 0).all())                  # checked, none
         self.assertTrue((s['witness_n_top_ch1'] > 0).all())
         self.assertIn('each channel apart', meta['scan']['saturation_criterion'])
-        self.assertEqual(meta['scan']['emission_blank_samples'], 108)  # next to the criterion
-        self.assertIn('LIVE', meta['scan']['emission_blank_note'])
+        self.assertNotIn('emission_blank_samples', meta['scan'])       # removed 06/10
 
     def test_clipped_ch1_water_reference_is_not_silent(self):
         self.make()
@@ -1468,11 +1449,10 @@ class TestScanDebugDump(ScanHarness):
                 else:
                     self.assertIsNone(meta['temperature'])
                 self.assertIn('each channel apart', meta['saturation_criterion'])
-                self.assertIsNone(meta['emission_blank_samples'])       # host did not set it
+                self.assertNotIn('emission_blank_samples', meta)         # removed 06/10
 
-    def test_saturation_columns_and_blanking_in_the_dump(self):
+    def test_saturation_columns_in_the_dump(self):
         self.make()
-        self.seq.emission_blank = 108
         self.sim.SetGain1(self.sim.params.gain_ref_ch1 + 30.0)
         self.assertIsNone(self.tool.start(ScanParams(start=-1, end=1, step=1, settle_ms=0,
                                                      line_settle_ms=0, avg_n=2, witness=False,
@@ -1481,7 +1461,6 @@ class TestScanDebugDump(ScanHarness):
         dump = np.load(self.tool.last_dump_path)
         self.assertTrue((dump['n_top_ch1'] > 0).all())
         self.assertTrue((dump['n_top_ch2'] == 0).all())
-        self.assertEqual(json.loads(str(dump['meta_json']))['emission_blank_samples'], 108)
 
 
 class TestDriftOnScreen(ScanHarness):

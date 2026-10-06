@@ -232,21 +232,19 @@ def format_duration(seconds):
     return f'{h} h {m:02d} min'
 
 
-def measurement_meta(settle_ms, avg_n, gains=None, temperature=None, emission_blank=None):
+def measurement_meta(settle_ms, avg_n, gains=None, temperature=None):
     """
     The measurement parameters every debug dump writes into meta_json, with the
     same keys in the three tools (focus, flatness, scan), so dumps can be compared
     with each other: settle_ms, avg_n, gain_ch1_db, gain_ch2_db, temperature
     ({'T1', 'T2', 'time', 'source'} of the reading available at that moment, or None)
-    and saturation_criterion (what the saturation marks mean: they changed on 06/10),
-    with emission_blank_samples, the blanking of the live saturation indicator (samples
-    from the record start; None: not set). gains: (g1, g2) or None (unknown).
+    and saturation_criterion (what the saturation marks mean: they changed on 06/10).
+    gains: (g1, g2) or None (unknown).
     """
     g1, g2 = (None, None) if gains is None else (float(gains[0]), float(gains[1]))
     return {'settle_ms': int(settle_ms), 'avg_n': int(avg_n),
             'gain_ch1_db': g1, 'gain_ch2_db': g2, 'temperature': temperature,
-            'saturation_criterion': SATURATION_FLAG,
-            'emission_blank_samples': None if emission_blank is None else int(emission_blank)}
+            'saturation_criterion': SATURATION_FLAG}
 
 
 def host_value(fn):
@@ -615,7 +613,9 @@ class FocusDebugDump:
     """
     Every point measured during one focus run (coarse, fine, and the one-point
     'move' / 'return' phases), saved to one .npz. Arrays, index n = point in
-    measurement order, all loadable with np.load (no pickle):
+    measurement order, all loadable with np.load (no pickle). Also used by the
+    flatness, scan and stability tools. A dump keeps the FULL record (it is for
+    diagnosis), unlike the database, which keeps only Smin..Smax-1 (what is measured):
 
         phase             (n,) str    'coarse', 'fine', 'move', 'return'
         x_beam            (n,)        beam-axis position [mm] where it was measured
@@ -954,7 +954,7 @@ class FocusTool(QObject):
             samples_per_mm=plan.samples_per_mm, fs=ACQ_FS, pe_channel=PE_CHANNEL,
             coarse_positions=plan.coarse_positions, notices=plan.notices,
             **measurement_meta(settle_ms, avg_n, host_value(self._gains_fn),
-                               host_value(self._temp_fn), getattr(self._seq, 'emission_blank', None)),
+                               host_value(self._temp_fn)),
         )) if debug_dump else None
         self._plot.reset(axis)
         for text in plan.notices:

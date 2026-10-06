@@ -1157,8 +1157,7 @@ class ScanTool(QObject):
             has_t = start_t['T1'] == start_t['T1'] or start_t['T2'] == start_t['T2']
             self._dump.meta.update(measurement_meta(
                 params.settle_ms, params.avg_n, self._scan_gains,
-                dict(start_t, source='PT100, scan start') if has_t else None,
-                getattr(self._seq, 'emission_blank', None)))
+                dict(start_t, source='PT100, scan start') if has_t else None))
         self._resolve_cw()
         for text in plan.notices:
             self.warning.emit(text)
@@ -1925,11 +1924,6 @@ class ScanTool(QObject):
                           f'the start {plan.axis} first, then {plan.other}',
             'temperature_note': PT100_NOTE,
             'saturation_criterion': SATURATION_FLAG,
-            'emission_blank_samples': getattr(self._seq, 'emission_blank', None),
-            'emission_blank_note': 'samples from the record start left out of the LIVE '
-                                   'saturation indicator (it covers blanking .. end of record; '
-                                   'the main bang clips by design); the saturated_ch1/ch2 '
-                                   'marks of this file look at Smin-Smax only',
             'start_point': plan.start_coords,
             'settle_ms': p.settle_ms, 'avg_n': p.avg_n,
             'settle_avg_note': 'default settle 100 ms measured 2026-10-05, valid for steps '

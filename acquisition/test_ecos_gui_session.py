@@ -102,7 +102,7 @@ class _LiveWindow(unittest.TestCase):
     """A fresh GUI window, shown, without a saved session (each window saves its own on
     close, which the next one would restore: check boxes switched off by a test), and
     with its live timer stopped: the tests drive the refresh (_update_plots) themselves,
-    so a timer tick can never land in the middle of one (e.g. setting the blanking)."""
+    so a timer tick can never land between two checks of one test."""
 
     def setUp(self):
         if os.path.exists(_ENV['session']):
@@ -481,8 +481,8 @@ class TestFullScaleLines(_LiveWindow):
 
 
 class TestSaturationIndicator(_LiveWindow):
-    """Red indicator per channel, from the raw counts of the last acquisition, from the
-    end of the emission blanking to the end of the record."""
+    """Red indicator per channel, from the raw counts of the last acquisition, within
+    Smin–Smax: the samples that are measured and saved, as the marks of the tools."""
 
     def setUp(self):
         super().setUp()
@@ -491,23 +491,28 @@ class TestSaturationIndicator(_LiveWindow):
         self.count_at_top, self.top_mask = count_at_top, top_mask
         self.lbl = self.win._lbl_sat
         self.sim = self.win._sedaq
+        self.smin, self.smax = self.win._get_smin_smax()
+
+    def mask(self, *samples):
+        m = np.zeros(self.win._reclen, dtype=bool)
+        m[list(samples)] = True
+        return m
+
+    def live(self):
+        self.win._running, self.win._inspection_mode = True, False
+        self.win._update_plots()
 
     def test_only_when_it_happens_with_the_count(self):
-        import numpy as np
-        n = self.win._reclen
-        clean = np.zeros(n, dtype=bool)
+        clean = self.mask()
         self.win._show_saturation((clean, clean))
         self.assertFalse(self.lbl[1].isVisible() or self.lbl[2].isVisible())
-        ch2 = clean.copy()
-        ch2[[10, 500, 501]] = True
-        self.win._show_saturation((clean, ch2))
+        s = self.smin
+        self.win._show_saturation((clean, self.mask(s + 10, s + 500, s + 501)))
         self.assertFalse(self.lbl[1].isVisible())
         self.assertTrue(self.lbl[2].isVisible())
         self.assertIn('3 samples', self.lbl[2].text())
         self.assertIn('230, 30, 30', self.lbl[2].styleSheet())            # red
-        one = clean.copy()
-        one[7] = True
-        self.win._show_saturation((one, clean))
+        self.win._show_saturation((self.mask(s + 7), clean))
         self.assertEqual(self.lbl[1].text(), 'SATURATED: 1 sample at full scale')
         self.assertFalse(self.lbl[2].isVisible())
 
@@ -529,77 +534,64 @@ class TestSaturationIndicator(_LiveWindow):
             items = [row.itemAt(i).widget() for i in range(row.count())]
             self.assertEqual(items.index(self.lbl[ch]), items.index(chk) + 1)
 
-    def span(self):
-        return (self.win._spin_blank.value(), self.win._reclen)
+    def test_outside_smin_smax_off_inside_on(self):
+        """Only the window counts: the edges included (Smin), excluded (Smax)."""
+        clean, s0, s1 = self.mask(), self.smin, self.smax
+        for outside in ((0, 30, s0 - 1), (s1, s1 + 1, 14000, self.win._reclen - 1)):
+            with self.subTest(outside=outside):
+                self.win._show_saturation((self.mask(*outside), self.mask(*outside)))
+                self.assertFalse(self.lbl[1].isVisible() or self.lbl[2].isVisible())
+        for inside in ((s0,), (s1 - 1,), ((s0 + s1) // 2,)):
+            with self.subTest(inside=inside):
+                self.win._show_saturation((self.mask(*inside), clean))
+                self.assertTrue(self.lbl[1].isVisible())
+                self.assertIn('1 sample', self.lbl[1].text())
 
-    def raw_count(self, buf, span=None):
-        return self.count_at_top(self.top_mask(buf[:self.win._reclen]), span)
-
-    def live(self):
-        self.win._running, self.win._inspection_mode = True, False
-        self.win._update_plots()
-
-    def test_live_refresh_blanking_to_end_of_record(self):
-        self.sim.SetGain1(self.sim.params.gain_ref_ch1 + 30.0)     # Ch1 clips (0.43 → 1.4)
+    def test_live_outside_off_inside_on(self):
+        """With the simulator: its main bang clips by design before Smin (off); the Ch1
+        transmission pulse (~sample 3990) clipped at +30 dB, after Smax (off) and then
+        inside the window (on)."""
         self.live()
-        n1 = self.raw_count(self.sim.DataADC1, self.span())
+        self.assertGreater(self.count_at_top(self.top_mask(self.sim.DataADC2[:self.win._reclen])),
+                           0)                                    # the bang does clip …
+        self.assertFalse(self.lbl[2].isVisible())                # … outside the window
+        self.sim.params.snr_db = 60.0          # quiet: at +30 dB only the pulse clips, not noise
+        self.sim.SetGain1(self.sim.params.gain_ref_ch1 + 30.0)   # Ch1 pulse clips
+        tt = int(np.argmax(np.abs(self.sim.clean_signals()[0])))   # the Ch1 pulse
+        self.assertTrue(self.smin + 400 < tt < self.smax)
+        self.win._region.setRegion([self.smin, tt - 300])        # pulse after Smax
+        self.live()
+        top = self.top_mask(self.sim.DataADC1[:self.win._reclen])
+        self.assertGreater(self.count_at_top(top), 0)
+        self.assertEqual(self.count_at_top(top, self.win._get_smin_smax()), 0)
+        self.assertFalse(self.lbl[1].isVisible())
+        self.win._region.setRegion([self.smin, self.smax])      # pulse inside
+        self.live()
+        n1 = self.count_at_top(self.top_mask(self.sim.DataADC1[:self.win._reclen]),
+                               self.win._get_smin_smax())
         self.assertGreater(n1, 0)
         self.assertTrue(self.lbl[1].isVisible())
         self.assertIn(f'{n1} samples', self.lbl[1].text())
 
-    def test_main_bang_blanked_by_default(self):
-        """The simulator's main bang clips by design: blanked, the indicator stays off."""
-        from scan_counts import default_emission_blank
-        self.live()                                           # first record, no session
-        raw1, raw2 = self.win._last_raw
-        blank = self.win._spin_blank.value()
-        self.assertEqual(blank, default_emission_blank((raw1, raw2), 100e6))
-        top = np.flatnonzero(self.top_mask(raw2))
-        self.assertGreater(top.size, 0)                       # the bang does reach the top …
-        self.assertLess(top.max(), blank)                     # … all of it inside the blanking
-        self.assertLess(blank, self.win._get_smin_smax()[0])  # and it stops before Smin
-        self.assertFalse(self.lbl[2].isVisible())
-        self.live()
-        self.assertFalse(self.lbl[2].isVisible())             # stays off
-
-    def test_clipping_outside_smin_smax_still_seen(self):
-        self.live()
-        blank, (smin, _) = self.win._spin_blank.value(), self.win._get_smin_smax()
-        mask = np.zeros(self.win._reclen, dtype=bool)
-        mask[(blank + smin) // 2] = True                       # after the blanking, before Smin
-        self.win._show_saturation((mask, np.zeros_like(mask)))
-        self.assertTrue(self.lbl[1].isVisible())
-        mask[:] = False
-        mask[blank - 1] = True                                # inside the blanking
-        self.win._show_saturation((mask, np.zeros_like(mask)))
-        self.assertFalse(self.lbl[1].isVisible())
-
-    def test_blanking_saved_in_the_session_and_in_the_sequencer(self):
-        self.live()
-        self.win._spin_blank.setValue(321)
-        self.assertEqual(self.win._sequencer.emission_blank, 321)
-        self.win.close()
-        with open(_ENV['session']) as f:
-            self.assertEqual(json.load(f)['emission_blank'], 321)
-        win2 = _ENV['gui'].EcosGUI()                          # restored, not re-estimated
-        self.addCleanup(win2.close)
-        win2._running, win2._inspection_mode = True, False
-        win2._update_plots()
-        self.assertEqual(win2._spin_blank.value(), 321)
-        self.assertEqual(win2._sequencer.emission_blank, 321)
-
     def test_sequence_acquisition_any_capture(self):
-        import numpy as np
         self.sim.SetGain1(self.sim.params.gain_ref_ch1 + 30.0)
         self.win._seq_acquire(4)
         top1 = self.win._last_top[0]
         self.assertTrue(self.lbl[1].isVisible())
-        self.assertIn(f'{self.count_at_top(top1, self.span())} samples', self.lbl[1].text())
+        self.assertIn(f'{self.count_at_top(top1, self.win._get_smin_smax())} samples',
+                      self.lbl[1].text())
         self.assertIs(self.win._last_counts['top'], self.win._last_top)
         self.sim.SetGain1(self.sim.params.gain_ref_ch1)             # back to normal
         self.win._seq_acquire(4)
         self.assertFalse(self.lbl[1].isVisible())
         self.assertEqual(int(np.count_nonzero(self.win._last_top[0])), 0)
+
+    def test_no_blanking_control_left(self):
+        """Emission blanking was removed on 06/10 (spec 5.7): no control, no session key."""
+        self.assertFalse(hasattr(self.win, '_spin_blank'))
+        self.win.close()
+        with open(_ENV['session']) as f:
+            self.assertNotIn('emission_blank', json.load(f))
 
 
 if __name__ == '__main__':

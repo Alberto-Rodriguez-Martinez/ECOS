@@ -67,10 +67,9 @@ def top_mask(raw, bits=ADC_BITS_DEFAULT):
 def count_at_top(mask, span=None):
     """
     Samples marked in `mask` (top_mask, accumulated over captures) within the sample
-    range span = (lo, hi), end exclusive; the whole record when None. The range is
-    the caller's: the live view checks the whole record (any clipping is worth
-    seeing), the measurement flags only Smin–Smax (the main bang outside the
-    analysis window does not invalidate a measure).
+    range span = (lo, hi), end exclusive; the whole record when None. ECOS passes
+    Smin–Smax everywhere (live indicator and measurement marks): what lies outside
+    the window is neither measured nor saved, e.g. the main bang before Smin.
     """
     if mask is None:
         return 0
@@ -79,35 +78,6 @@ def count_at_top(mask, span=None):
         lo, hi = max(0, int(span[0])), min(m.size, int(span[1]))
         m = m[lo:hi]
     return int(np.count_nonzero(m))
-
-
-def emission_end(raw, fs=100e6, start_us=2.0, quiet_us=1.0, k=8.0):
-    """
-    Sample where the excitation (main bang) at the start of a raw record is over: the
-    end of the activity that begins within the first start_us, i.e. the first sample
-    after which the signal stays within k noise σ of its median for quiet_us. The
-    noise σ is 1.4826·MAD of the record (the echoes are sparse), at least half a
-    count. 0 when the record does not start with activity (nothing to blank).
-    """
-    x = np.asarray(raw, dtype=float)
-    dev = np.abs(x - np.median(x))
-    sigma = max(1.4826 * float(np.median(dev)), 0.5)
-    idx = np.flatnonzero(dev > k * sigma)
-    if idx.size == 0 or idx[0] > int(start_us * 1e-6 * fs):
-        return 0
-    gaps = np.flatnonzero(np.diff(idx) > int(quiet_us * 1e-6 * fs))
-    return int(idx[gaps[0]] + 1) if gaps.size else int(idx[-1] + 1)
-
-
-EMISSION_BLANK_MARGIN_US = 0.5   # added after the detected end of the main bang
-
-
-def default_emission_blank(raws, fs=100e6, margin_us=EMISSION_BLANK_MARGIN_US):
-    """Default blanking of the emission zone for the live saturation indicator, from the
-    record itself: the latest end of the main bang over the channels (emission_end)
-    plus margin_us; 0 when no channel starts with a main bang."""
-    end = max(emission_end(r, fs) for r in raws)
-    return 0 if end == 0 else int(end + round(margin_us * 1e-6 * fs))
 
 
 def sum_dtype(n_avg, bits=ADC_BITS_DEFAULT):
