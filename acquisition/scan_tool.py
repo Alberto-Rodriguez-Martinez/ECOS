@@ -128,10 +128,13 @@ DEFAULT_LINE_SETTLE_MS = 1000
 # analysis can remove the drift of the sample from the position of the face
 # (PVA, 05/10: −4.34 µm/min in jerks, 97.5 µm in 21 min; steel: +0.32 µm/min).
 DEFAULT_WITNESS_EVERY = 1
-# A jump: the witness off the trend by more than this between two visits. ~3σ of
-# the difference of two visits with the jitter measured on 05/10 (≈1 µm per point
-# with 20 averages, √2 for a difference), below the jumps seen on PVA (5–7 µm).
-DEFAULT_WITNESS_JUMP_UM = 4.0
+# A jump: the witness off the trend, between two visits, by more than a threshold
+# taken from the scatter of the witness series itself (witness_threshold): the
+# jitter depends on the echo amplitude and varies with the sample (05/10: 0.41 µm on
+# steel, 1.0-1.4 µm on PVA). This is its FLOOR: ~3σ of the difference of two visits
+# with ≈1 µm per point, below the jumps seen on PVA (5–7 µm).
+DEFAULT_WITNESS_JUMP_FLOOR_UM = 4.0
+WITNESS_JUMP_SIGMAS = 3.0
 WITNESS_MODES = ('first', 'start', 'custom')
 LONG_SCAN_S = 30 * 60          # warn above half an hour
 # Per-move overhead besides the travel at MOVE_MM_S: command, read-back of the axes
@@ -169,14 +172,15 @@ class Magnitude:
     unit: str
     fn: Callable[[PointContext], float]
     uses_echo: bool = False      # depends on the tracked front echo (lost echo → NaN)
+    tip: str = ''                # tooltip of the map selector
 
 
 MAGNITUDES = OrderedDict()
 
 
-def register_magnitude(name, label, unit, fn, uses_echo=False):
+def register_magnitude(name, label, unit, fn, uses_echo=False, tip=''):
     """Add a map magnitude: fn(PointContext) -> float. The scan computes all of them."""
-    MAGNITUDES[name] = Magnitude(label, unit, fn, uses_echo)
+    MAGNITUDES[name] = Magnitude(label, unit, fn, uses_echo, tip)
 
 
 def pair_thickness_mm(pair, c_sample, fs=ACQ_FS):
@@ -198,9 +202,13 @@ register_magnitude('amplitude', 'Max. envelope in the window (PE)', '',
                    lambda c: float(np.max(c.env)))
 register_magnitude('energy', 'Energy in the window (PE)', 'a.u.·µs',
                    lambda c: float(np.sum(c.seg * c.seg)) / c.fs * 1e6)
-register_magnitude('thickness_corr', 'Thickness: echo 1 / echo 2 correlation', '',
+register_magnitude('thickness_corr', 'Thickness quality (r)', '',
                    lambda c: c.pair.corr if c.pair is not None and c.pair.found
-                   else float('nan'), uses_echo=True)
+                   else float('nan'), uses_echo=True,
+                   tip='Correlation coefficient between echoes 1 and 2 at each point: no '
+                       'units, from 0 to 1. Not another way of measuring the thickness: it '
+                       'tells in which zones of the thickness map to trust it (low where the '
+                       'echo is deformed, e.g. an inclined face).')
 THICKNESS_MAGNITUDES = ('thickness', 'thickness_corr')
 
 
@@ -277,7 +285,7 @@ class ScanParams:
     witness_lat: float = 0.0
     witness_z: float = 0.0
     witness_every: int = DEFAULT_WITNESS_EVERY
-    witness_jump_um: float = DEFAULT_WITNESS_JUMP_UM
+    witness_jump_floor_um: float = DEFAULT_WITNESS_JUMP_FLOOR_UM
     # Surface (phase 6): a line is the case of a single line, as in the data format.
     # The second axis is the other of lateral / Z; same range mode as the first.
     surface: bool = False
@@ -489,6 +497,24 @@ def witness_jumps(times, face_um):
     return dev, rate
 
 
+def witness_threshold(dev, floor_um=DEFAULT_WITNESS_JUMP_FLOOR_UM, k=WITNESS_JUMP_SIGMAS):
+    """
+    Jump threshold from the witness series itself: k × the scatter of the
+    deviations between consecutive visits (witness_jumps: the differences with the
+    trend removed), never below floor_um. The scatter is 1.4826 × MAD, the standard
+    deviation for Gaussian noise but not inflated by the jump it has to find (a
+    plain standard deviation of five intervals with one 40 µm jump is ~16 µm, and
+    3σ would hide that jump). Fewer than three valid intervals: the floor.
+    Returns (threshold_um, sigma_um or NaN).
+    """
+    d = np.asarray(dev, dtype=float)
+    d = d[np.isfinite(d)]
+    if d.size < 3:
+        return float(floor_um), float('nan')
+    sigma = 1.4826 * float(np.median(np.abs(d - np.median(d))))
+    return max(float(floor_um), k * sigma), sigma
+
+
 def witness_doubt(visits, dev, threshold_um):
     """
     {line: reason} of the lines in doubt: the lines measured between two visits
@@ -696,7 +722,8 @@ def _pts(xs):
 #  Qt part
 # ===========================================================================
 import pyqtgraph as pg  # noqa: E402
-from PyQt5.QtCore import QObject, QRectF, QTimer, pyqtSignal  # noqa: E402
+from PyQt5.QtCore import QObject, QRectF, Qt, QTimer, pyqtSignal  # noqa: E402
+from PyQt5.QtGui import QImage  # noqa: E402
 from PyQt5.QtWidgets import (  # noqa: E402
     QCheckBox, QComboBox, QDoubleSpinBox, QFileDialog, QFormLayout, QGroupBox, QHBoxLayout,
     QLabel, QLineEdit, QPushButton, QSpinBox, QWidget,
@@ -801,6 +828,27 @@ def map_rgba(grid, measured, lo, hi):
     return out
 
 
+class RGBAImageItem(pg.ImageItem):
+    """
+    ImageItem for an RGBA uint8 image already coloured by the caller (map_rgba). Its
+    render() builds the QImage directly. pyqtgraph 0.11 renders every ImageItem
+    through functions.makeARGB, which calls np.float, removed in numpy 1.24 (the
+    .venv32 of the laptop): the AttributeError is raised inside paint(), Qt swallows
+    it and the item stays blank, with its axes, rect and colour bar ranges all
+    correct. Building the QImage here does not depend on the numpy version.
+    """
+
+    def render(self):
+        image = self.image
+        if image is None:
+            self.qimage = None
+            return
+        # col-major (pyqtgraph 0.11 default): image[x, y] → QImage rows are y
+        rows = np.ascontiguousarray(np.asarray(image, dtype=np.uint8).transpose(1, 0, 2))
+        h, w = rows.shape[:2]
+        self.qimage = QImage(rows.tobytes(), w, h, 4 * w, QImage.Format_RGBA8888).copy()
+
+
 class SurfaceMap:
     """
     Live 2-D maps of a surface scan in a GraphicsLayoutWidget (pyqtgraph 0.11:
@@ -820,13 +868,14 @@ class SurfaceMap:
         """names: magnitudes shown (main first); lat_vals / z_vals: ascending grid centres."""
         w = self.widget
         w.clear()
-        self.panels, self.last = {}, {}
+        self.panels, self.last, self.notes = {}, {}, {}
         self._lat = np.asarray(lat_vals, dtype=float)
         self._z = np.asarray(z_vals, dtype=float)
         dl = float(np.median(np.diff(self._lat))) if self._lat.size > 1 else 1.0
         dz = float(np.median(np.diff(self._z))) if self._z.size > 1 else 1.0
-        rect = QRectF(self._lat[0] - dl / 2, self._z[0] - dz / 2,
-                      dl * self._lat.size, dz * self._z.size)
+        # pixels centred on the measured points: half a step beyond the first and last
+        self.rect = rect = QRectF(self._lat[0] - dl / 2, self._z[0] - dz / 2,
+                                  dl * self._lat.size, dz * self._z.size)
         for col, name in enumerate(names):
             plot = w.addPlot(row=0, col=2 * col, title=titles[name])
             plot.setLabel('bottom', 'Lateral', units='mm')
@@ -835,38 +884,55 @@ class SurfaceMap:
                 plot.getAxis(ax).enableAutoSIPrefix(False)
             plot.getViewBox().invertY(True)
             plot.getViewBox().setAspectLocked(True)
-            img = pg.ImageItem()
+            img = RGBAImageItem()
             # 0.11: setRect scales by the image size, so the (empty) image goes first
             img.setImage(np.zeros((self._lat.size, self._z.size, 4), dtype=np.uint8),
                          autoLevels=False)
             img.setRect(rect)
             plot.addItem(img)
+            plot.setXRange(rect.left(), rect.right(), padding=0.02)
+            plot.setYRange(rect.top(), rect.bottom(), padding=0.02)
             marks = pg.ScatterPlotItem(symbol='x', size=9, pen=pg.mkPen(_COL_FLAG, width=2),
                                        brush=pg.mkBrush(_COL_FLAG))
             plot.addItem(marks)
+            note = pg.TextItem('', color=(230, 120, 0), anchor=(0.5, 0.5))
+            note.setPos(rect.center())
+            plot.addItem(note)
             bar = w.addPlot(row=0, col=2 * col + 1)
             bar.setMaximumWidth(80)
             bar.hideAxis('bottom')
             bar.setLabel('left', '', units=units[name] or None)
             bar.getAxis('left').enableAutoSIPrefix(False)
             bar.setMouseEnabled(x=False, y=False)
-            bar_img = pg.ImageItem()
+            bar_img = RGBAImageItem()
             bar_img.setImage(map_rgba(np.linspace(0.0, 1.0, 256)[None, :],
                                       np.ones((1, 256), bool), 0.0, 1.0), autoLevels=False)
             bar.addItem(bar_img)
             self.panels[name] = (plot, img, bar, bar_img, marks)
+            self.notes[name] = note
 
     def set_title(self, name, title):
         if name in self.panels:
             self.panels[name][0].setTitle(title)
 
-    def set_data(self, name, grid, measured, marks_xy=(), scale=None):
-        """grid, measured: (n_lat, n_z); marks_xy: [(lat, z)] of marked points."""
+    def set_data(self, name, grid, measured, marks_xy=(), scale=None, empty_reason=''):
+        """grid, measured: (n_lat, n_z); marks_xy: [(lat, z)] of marked points. With no
+        finite value to draw, the map says so (empty_reason: why) instead of staying
+        blank."""
         if name not in self.panels:
             return
         plot, img, bar, bar_img, marks = self.panels[name]
-        lo, hi = map_levels(np.asarray(grid)[measured], scale)
+        grid = np.asarray(grid, dtype=float)
+        lo, hi = map_levels(grid[measured], scale)
         img.setImage(map_rgba(grid, measured, lo, hi), autoLevels=False)
+        img.setRect(self.rect)                       # always the scan, half a step each side
+        if np.isfinite(grid[measured]).any():
+            self.notes[name].setText('')
+        elif not measured.any():
+            self.notes[name].setText('No point measured yet')
+        else:
+            self.notes[name].setText('No valid value to draw'
+                                     + (f':\n{empty_reason}' if empty_reason else ''))
         bar_img.setRect(QRectF(0.0, lo, 1.0, hi - lo))
         bar.setYRange(lo, hi, padding=0)
         bar.setXRange(0.0, 1.0, padding=0)
@@ -1047,6 +1113,7 @@ class ScanTool(QObject):
         self._schedule, self._witness_pos = schedule, witness_pos
         self._doubt_lines = {}
         self._witness_ref = None
+        self._witness_thr, self._witness_sigma = params.witness_jump_floor_um, float('nan')
         self._line_start = self._dump_line_start = 0
         self.window = (int(smin), int(smax))
         self._check_thickness(params)
@@ -1513,12 +1580,13 @@ class ScanTool(QObject):
         dev, rate = witness_jumps([v['time'] for v in d.witness],
                                   [v['face_um'] for v in d.witness])
         d.witness_dev, d.witness_rate = dev, rate
-        doubt = witness_doubt(d.witness, dev, p.witness_jump_um)
+        self._witness_thr, self._witness_sigma = witness_threshold(dev, p.witness_jump_floor_um)
+        doubt = witness_doubt(d.witness, dev, self._witness_thr)
         new = sorted(set(doubt) - set(self._doubt_lines))
         self._doubt_lines = doubt
         if new and any('jump' in doubt[k] for k in new):
             self.warning.emit(
-                f'Witness point jumped by more than {p.witness_jump_um:g} µm off the trend '
+                f'Witness point jumped by more than {self._witness_thr:.1f} µm off the trend '
                 f'during line(s) {", ".join(str(k) for k in new)}: the drift there cannot be '
                 'reconstructed, those lines are marked as doubtful.')
 
@@ -1650,9 +1718,16 @@ class ScanTool(QObject):
                 grid[cell], measured[cell] = v, True
                 if point_marked(name, f):
                     marks.append((lat[cell[0]], z[cell[1]]))
+            if name in THICKNESS_MAGNITUDES and not self.thickness_on:
+                why = f'thickness not available in this scan ({self.thickness_reason})'
+            elif MAGNITUDES[name].uses_echo:
+                why = 'no clear echo at any measured point'
+            else:
+                why = 'NaN at every measured point'
             self._map.set_title(name, self._map_title(name))
             self._map.set_data(name, grid, measured, marks,
-                               self.map_scale if name == self._map_names[0] else None)
+                               self.map_scale if name == self._map_names[0] else None,
+                               empty_reason=why)
 
     def _on_finished(self, status, text):
         if self._phase is None or self.state == 'idle':
@@ -1898,7 +1973,13 @@ class ScanTool(QObject):
         n_lines = (max(d.line) + 1) if d.line else 0
         return {
             'enabled': True, 'mode': p.witness_mode, 'position': self._witness_pos,
-            'every_lines': p.witness_every, 'jump_threshold_um': p.witness_jump_um,
+            'every_lines': p.witness_every,
+            'jump_threshold_um': self._witness_thr, 'jump_floor_um': p.witness_jump_floor_um,
+            'jitter_sigma_um': (self._witness_sigma if np.isfinite(self._witness_sigma)
+                                else None),
+            'threshold_rule': f'max(floor, {WITNESS_JUMP_SIGMAS:g} × 1.4826·MAD of the '
+                              'deviations between consecutive visits); the floor alone with '
+                              'fewer than three intervals',
             'n_visits': len(d.witness),
             'median_rate_um_per_min': (d.witness_rate * 60.0 if np.isfinite(d.witness_rate)
                                        else None),
@@ -2021,6 +2102,8 @@ class ScanGroup(QGroupBox):
         self._cmb_mag = QComboBox()
         for name, mag in MAGNITUDES.items():
             self._cmb_mag.addItem(mag.label, name)
+            if mag.tip:
+                self._cmb_mag.setItemData(self._cmb_mag.count() - 1, mag.tip, Qt.ToolTipRole)
         form.addRow('Line axis:', self._cmb_axis)
         form.addRow('Range:', self._cmb_mode)
         form.addRow('Start:', self._spin_start)
@@ -2094,15 +2177,18 @@ class ScanGroup(QGroupBox):
         self._spin_wevery.setRange(1, 1000)
         self._spin_wevery.setValue(DEFAULT_WITNESS_EVERY)
         self._spin_wevery.setSuffix(' line(s)')
-        self._spin_wjump = dspin(0.1, 1000.0, DEFAULT_WITNESS_JUMP_UM, 1, 0.5, ' µm')
-        self._spin_wjump.setToolTip('A witness displacement between two visits off the trend by '
-                                    'more than this marks the lines in between as doubtful.')
+        self._spin_wjump = dspin(0.1, 1000.0, DEFAULT_WITNESS_JUMP_FLOOR_UM, 1, 0.5, ' µm')
+        self._spin_wjump.setToolTip('Minimum jump threshold. The threshold is 3 × the scatter of '
+                                    'the witness series itself (its jitter depends on the echo: '
+                                    '0.41 µm on steel, 1.0–1.4 µm on PVA), never below this. '
+                                    'A jump off the trend marks the lines in between as '
+                                    'doubtful.')
         form.addRow(self._chk_witness)
         form.addRow('Witness position:', self._cmb_witness)
         form.addRow('Witness lateral:', self._spin_wlat)
         form.addRow('Witness Z:', self._spin_wz)
         form.addRow('Witness every:', self._spin_wevery)
-        form.addRow('Witness jump limit:', self._spin_wjump)
+        form.addRow('Witness jump floor:', self._spin_wjump)
 
         self._chk_thick = QCheckBox('Thickness per point (echo 1 → echo 2)')
         self._chk_thick.setChecked(True)
@@ -2307,7 +2393,7 @@ class ScanGroup(QGroupBox):
             line_settle_ms=self._spin_line_settle.value(), witness=self._chk_witness.isChecked(),
             witness_mode=self._cmb_witness.currentData(), witness_lat=self._spin_wlat.value(),
             witness_z=self._spin_wz.value(), witness_every=self._spin_wevery.value(),
-            witness_jump_um=self._spin_wjump.value())
+            witness_jump_floor_um=self._spin_wjump.value())
 
     def _refresh_estimate(self, *_):
         _, text, long_ = self._tool.estimate(self.params())

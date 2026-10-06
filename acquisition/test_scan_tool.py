@@ -32,7 +32,7 @@ from scan_counts import counts_to_float, sum_dtype  # noqa: E402
 from scan_tool import (  # noqa: E402
     LONG_SCAN_S, MAGNITUDES, PointContext, ScanParams, ScanPlan, compute_magnitudes,
     estimate_scan_s, line_positions, reference_drift, register_magnitude, scan_schedule,
-    witness_correction, witness_doubt, witness_jumps, witness_position,
+    witness_correction, witness_doubt, witness_jumps, witness_position, witness_threshold,
 )
 from sim_sedaq import SimParams, SimSeDaq  # noqa: E402
 from echo_tracking import (  # noqa: E402
@@ -204,6 +204,32 @@ class TestWitnessPure(unittest.TestCase):
         every2 = scan_schedule(self.plan(surface=True, start2=-2, end2=2, step2=1,
                                          witness_every=2))
         self.assertEqual([e.line for e in every2 if e.kind == 'witness'], [0, 2, 4, 5])
+
+    def test_jump_threshold_from_the_series(self):
+        """3 × the robust scatter of the deviations, never below the 4 µm floor."""
+        rng = np.random.default_rng(7)
+        t = np.arange(41) * 30.0
+        for jitter, expect_floor in ((0.41, True), (2.5, False)):     # steel-like, noisy PVA
+            with self.subTest(jitter=jitter):
+                face = -0.07 * t + rng.normal(0.0, jitter, t.size)
+                dev, _ = witness_jumps(t, face)
+                thr, sigma = witness_threshold(dev)
+                self.assertAlmostEqual(sigma, jitter * np.sqrt(2), delta=0.35 * jitter * np.sqrt(2))
+                if expect_floor:
+                    self.assertEqual(thr, 4.0)
+                else:
+                    self.assertAlmostEqual(thr, 3 * sigma)
+                    self.assertGreater(thr, 4.0)
+        # a 40 µm jump among five intervals is still found (a plain std would hide it)
+        face = -0.07 * t[:6] + np.array([0, 0.5, -0.4, 0.3, -40.0, -40.2])
+        dev, _ = witness_jumps(t[:6], face)
+        thr, _ = witness_threshold(dev)
+        self.assertGreater(3 * np.std(dev), 40.0)                   # the naive rule
+        self.assertLess(thr, 10.0)
+        self.assertEqual(sorted(witness_doubt([{'after_line': k} for k in range(6)], dev, thr)),
+                         [3])
+        self.assertEqual(witness_threshold(dev[:2])[0], 4.0)      # too few: the floor
+        self.assertEqual(witness_threshold(dev, floor_um=50.0)[0], 50.0)
 
     def test_live_correction(self):
         t, v = [0.0, 10.0, 20.0], [5.0, 6.0, 8.0]
@@ -910,6 +936,69 @@ class TestWitness(ScanHarness):
         self.assertNotIn('witness_sum1', s)
 
 
+class TestSurfaceMapDrawing(unittest.TestCase):
+    """The 2-D map is really painted, where the scan is (pyqtgraph 0.11 + numpy 1.24:
+    the stock ImageItem raised inside paint() and stayed blank)."""
+
+    LAT = np.array([49.0, 49.5, 50.0, 50.5, 51.0])
+    Z = np.array([24.0, 25.0, 26.0])
+
+    def setUp(self):
+        from scan_tool import SurfaceMap, _LUT
+        self.lut = _LUT
+        self.w = pg.GraphicsLayoutWidget()
+        self.w.resize(700, 400)
+        self.w.show()
+        self.addCleanup(self.w.close)
+        self.map = SurfaceMap(self.w)
+        self.map.reset(['thickness'], {'thickness': 'Thickness'}, {'thickness': 'mm'},
+                       self.LAT, self.Z)
+
+    def pixel(self, lat, z):
+        from PyQt5.QtCore import QPointF
+        QApplication.processEvents()
+        img = self.w.grab().toImage()
+        vb = self.map.panels['thickness'][0].getViewBox()
+        p = self.w.mapFromScene(vb.mapViewToScene(QPointF(lat, z)))
+        c = img.pixelColor(p.x(), p.y())
+        return np.array([c.red(), c.green(), c.blue()])
+
+    def test_rect_is_the_scan_with_half_a_step_each_side(self):
+        img = self.map.panels['thickness'][1]
+        self.map.set_data('thickness', np.zeros((5, 3)), np.ones((5, 3), bool))
+        r = img.mapRectToParent(img.boundingRect())
+        self.assertAlmostEqual(r.left(), 49.0 - 0.25)
+        self.assertAlmostEqual(r.right(), 51.0 + 0.25)
+        self.assertAlmostEqual(r.top(), 24.0 - 0.5)
+        self.assertAlmostEqual(r.bottom(), 26.0 + 0.5)
+        self.assertIn(img, self.map.panels['thickness'][0].items)
+
+    def test_painted_in_place_and_oriented(self):
+        grid = np.zeros((5, 3))
+        grid[4, 0] = 1.0                                    # lateral 51, Z 24: the maximum
+        self.map.set_data('thickness', grid, np.ones((5, 3), bool))
+        np.testing.assert_allclose(self.pixel(51.0, 24.0), self.lut[-1], atol=12)
+        np.testing.assert_allclose(self.pixel(49.0, 26.0), self.lut[0], atol=12)
+        np.testing.assert_allclose(self.pixel(50.0, 25.0), self.lut[0], atol=12)
+
+    def test_says_when_there_is_nothing_to_draw(self):
+        note = self.map.notes['thickness']
+        self.map.set_data('thickness', np.full((5, 3), np.nan), np.zeros((5, 3), bool))
+        self.assertIn('No point measured yet', note.textItem.toPlainText())
+        measured = np.zeros((5, 3), bool)
+        measured[:2] = True
+        self.map.set_data('thickness', np.full((5, 3), np.nan), measured,
+                          empty_reason='thickness not available in this scan')
+        self.assertIn('No valid value', note.textItem.toPlainText())
+        self.assertIn('not available', note.textItem.toPlainText())
+        grid = np.full((5, 3), np.nan)
+        grid[0, 0] = 3.0
+        self.map.set_data('thickness', grid, measured)
+        self.assertEqual(note.textItem.toPlainText(), '')
+        # NaN cells are drawn grey, not left blank
+        np.testing.assert_allclose(self.pixel(49.5, 24.0), (120, 120, 120), atol=12)
+
+
 class TestSurface(ScanHarness):
     """Phase 6 verification 1, 2, 4–8 on the simulator."""
 
@@ -938,6 +1027,11 @@ class TestSurface(ScanHarness):
                 self.assertEqual(shown, [0, 1, 2, 3, 3, 4, 5, 6, 6, 7, 8, 9, 9])
                 grid, levels = self.tool._map.last['thickness']
                 self.assertEqual(grid.shape, (3, 3))                    # lateral × Z
+                for name in ('thickness', 'amplitude'):                 # the scan, ± half a step
+                    img = self.tool._map.panels[name][1]
+                    r = img.mapRectToParent(img.boundingRect())
+                    self.assertEqual((r.left(), r.right(), r.top(), r.bottom()),
+                                     (48.5, 51.5, 23.5, 26.5))
                 np.testing.assert_allclose(grid, 3.0, atol=0.003)
                 meta, d = self.load_saved()
                 self.assertEqual(meta['scan']['type'], 'surface')
@@ -1366,6 +1460,18 @@ class TestScanGroup(ScanHarness):
         self.assertEqual(g._spin_rg2.value(), 12.0)
         g2 = ScanGroup(self.tool, self.seq)
         self.assertEqual(g2._spin_rg2.value(), 40.0)
+
+    def test_thickness_quality_name_and_tooltip(self):
+        from PyQt5.QtCore import Qt
+        self.make()
+        g = ScanGroup(self.tool, self.seq)
+        i = g._cmb_mag.findData('thickness_corr')
+        self.assertEqual(g._cmb_mag.itemText(i), 'Thickness quality (r)')
+        tip = g._cmb_mag.itemData(i, Qt.ToolTipRole)
+        for words in ('correlation coefficient between echoes 1 and 2', 'no units',
+                      'from 0 to 1', 'trust'):
+            self.assertIn(words, tip.lower() if words.islower() else tip)
+        self.assertEqual(g.params().witness_jump_floor_um, 4.0)
 
     def test_defaults_estimate_and_buttons(self):
         self.make()

@@ -206,8 +206,14 @@ def load_density(folder_path: str | Path) -> dict:
 # [2b] Load SCAN experiment (metadata only; the signals are in scan.npz)
 # ---------------------------------------------------------------------------
 
+# n_acquired is the number of points actually measured. From scan-32-3.0 the arrays are
+# (N_line, N_point_per_line, ...) with a stopped line PADDED to its full length: never
+# take shape[1] (or scan_shape) as the number of measured points; in the arrays, use
+# point_valid (load_scan_raw_32 adds it, all True, for a 2.0 file).
 _SCAN_FIELDS = ["type", "axis_role", "axis", "n_points", "n_acquired", "step_mm",
-                "settle_ms", "avg_n", "status", "c_w", "references_taken"]
+                "settle_ms", "avg_n", "status", "completed", "c_w", "references_taken",
+                "n_lines", "n_lines_acquired", "n_points_per_line", "line_status",
+                "partial_line", "path"]
 
 
 def load_scan(folder_path: str | Path) -> dict:
@@ -232,7 +238,9 @@ def load_scan(folder_path: str | Path) -> dict:
         record[unified] = specimen.get(src, "")
     for key in _SCAN_FIELDS:
         record[f"scan_{key}"] = scan.get(key)
-    record["scan_shape"] = scan.get("shape")
+    record["scan_shape"] = scan.get("shape")      # stored array shape, padding included
+    witness = scan.get("witness") or {}
+    record["scan_doubtful_lines"] = sorted(int(k) for k in witness.get("doubtful_lines", {}))
     record["schema_version"]  = meta.get("schema_version", "")
     record["experiment_id"]   = exp_info.get("id", "")
     record["operator"]        = exp_info.get("operator", "")
