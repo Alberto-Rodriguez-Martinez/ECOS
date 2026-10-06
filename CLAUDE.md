@@ -59,6 +59,21 @@ Son distintos en cada máquina.
 **Restricción común:** el código de adquisición y de la pestaña del escáner debe funcionar
 en Python 3.9 y con pyqtgraph 0.11. Nada de sintaxis posterior a 3.9 ni de API posterior a 0.11.
 
+**numpy < 1.24 en adquisición (en todas las máquinas).** pyqtgraph 0.11 usa `np.float` y
+`np.int`, que numpy 1.24 eliminó, y falla **en silencio**: la excepción salta dentro de un
+evento de Qt, que se la traga. Medido el 06/10 con numpy 1.24.4: ningún `ImageItem` se pinta
+(`functions.makeARGB`; el mapa 2D del barrido quedaba en blanco) y arrastrar con el ratón para
+desplazar o ampliar no hace nada en ninguna gráfica (`ViewBox.mouseDragEvent`). `scan_tool`
+tiene su propio `RGBAImageItem`, pero el arreglo es no salir de numpy < 1.24.
+- Portátil: `numpy==1.23.5`, fijado en `requirements-acq32.txt` (compatible con scipy 1.9.1
+  y contourpy 1.3.0).
+- Despacho: comprobar con `conda run -p ~\anaconda3_32 python -c "import numpy; print(numpy.__version__)"`
+  y anotarla aquí. Lo exigido es < 1.24; el objetivo es la misma versión exacta que el
+  portátil (1.23.5), comprobando antes con `conda install --dry-run` que es compatible con su
+  scipy 1.6.2.
+
+**pandas en análisis:** `analysis/ecos_loader.py` lo importa; está en `requirements-analysis.txt`.
+
 ## Tests
 `python -m unittest` desde la raíz no descubre ninguno: `acquisition/` no es un
 paquete (no tiene `__init__.py`). Hay que lanzar cada carpeta por separado, desde la raíz:
