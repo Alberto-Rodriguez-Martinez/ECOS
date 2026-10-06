@@ -170,6 +170,12 @@ SESSION_FILE = (_ARGS.session or os.environ.get('ECOS_GUI_SESSION') or os.path.j
 
 SIGNAL_YMIN = -0.5
 SIGNAL_YMAX =  0.5
+# Quantizer full scale in the ECOS float, ±midpoint/full_scale (±0.5 at any number of
+# bits). Nominal: the float has the record mean removed, so a channel with a DC offset
+# clips that much off these lines (05/10, real scans: Ch2 −7 to −8 counts, ≈1.5 % of FS;
+# Ch1 ≈ +1 count).
+QUANT_FULL_SCALE = (ADC_FULL_SCALE // 2) / ADC_FULL_SCALE
+ZOOM_Y_MARGIN = 1.1            # live plot range: the full-scale lines inside, not on the border
 
 # ==============================================================================
 # [3] ACQUISITION ERRORS (the simulated digitizer is sim_sedaq.SimSeDaq)
@@ -424,6 +430,15 @@ class EcosGUI(QMainWindow):
         self._chk_cursor.setToolTip("Cross-hair cursor on the live A-scan (time and amplitude)")
         self._chk_cursor.toggled.connect(lambda on: on or self._set_cursor_visible(False))
         top_row.addWidget(self._chk_cursor)
+        self._chk_fullscale = QCheckBox("Full scale")
+        self._chk_fullscale.setChecked(True)
+        self._chk_fullscale.setToolTip(
+            "Faint lines at the quantizer full scale, ± (nominal): the margin left before "
+            "saturating. The signal has its mean removed, so a channel with a DC offset "
+            "clips slightly off them (Ch2 ≈ 1.5 % of full scale on the real set-up).")
+        self._chk_fullscale.toggled.connect(
+            lambda on: [line.setVisible(on) for line in self._fullscale_lines])
+        top_row.addWidget(self._chk_fullscale)
         top_row.addStretch()
         # Values under the cursor: discreet, at the right of the row, not over the trace
         self._lbl_cursor = QLabel("")
@@ -438,7 +453,8 @@ class EcosGUI(QMainWindow):
         self._plot_zoom.setLabel('bottom', 'Sample')
         self._plot_zoom.showGrid(x=True, y=True, alpha=0.3)
         self._plot_zoom.enableAutoRange(axis='y', enable=False)
-        self._plot_zoom.setYRange(SIGNAL_YMIN, SIGNAL_YMAX, padding=0)
+        self._plot_zoom.setYRange(SIGNAL_YMIN * ZOOM_Y_MARGIN, SIGNAL_YMAX * ZOOM_Y_MARGIN,
+                                  padding=0)
         self._plot_zoom.enableAutoRange(axis='x', enable=False)
         self._plot_zoom.getViewBox().setMouseEnabled(x=False, y=False)
 
@@ -458,6 +474,14 @@ class EcosGUI(QMainWindow):
         # Hover cursor: a full cross (time and amplitude), both lines in the same style
         self._vline_cursor = pg.InfiniteLine(angle=90, movable=False, pen='w')
         self._hline_cursor = pg.InfiniteLine(angle=0, movable=False, pen='w')
+        # Quantizer full scale, + and −: faint, dashed, behind the traces
+        fs_pen = pg.mkPen((200, 200, 200, 90), width=1, style=Qt.DashLine)
+        self._fullscale_lines = []
+        for level in (QUANT_FULL_SCALE, -QUANT_FULL_SCALE):
+            line = pg.InfiniteLine(pos=level, angle=0, movable=False, pen=fs_pen)
+            line.setZValue(-10)
+            self._plot_zoom.addItem(line)
+            self._fullscale_lines.append(line)
         for line in (self._vline_cursor, self._hline_cursor):
             line.setVisible(False)
             self._plot_zoom.addItem(line)
@@ -972,7 +996,7 @@ class EcosGUI(QMainWindow):
 
         where = {'samples': f"sample {x:.0f}", 'mus': "", 'mm': f"d = {x:.2f} mm"}[self._unit]
         text = (f"t = {self._unit_to_us(x):.3f} µs" + (f" ({where})" if where else "")
-                + f"   A = {y:.4f} a.u.")
+                + f"   A = {y:.4f} a.u. ({y / QUANT_FULL_SCALE * 100:+.1f} % FS)")
         # The signal at that instant (Ch2, else Ch1), as the former floating label showed
         for name, curve in (("Ch2", self._curve_zoom_ch2), ("Ch1", self._curve_zoom_ch1)):
             xs, ys = curve.getData()
@@ -2015,6 +2039,7 @@ class EcosGUI(QMainWindow):
             "relay":                 self._btn_relay.isChecked(),
             "region":                [rmin, rmax],
             "cursor":                self._chk_cursor.isChecked(),
+            "full_scale_lines":      self._chk_fullscale.isChecked(),
             "excitation_index":      self._cmb_excitation.currentIndex(),
             "gen_fs":                self._txt_gen_fs.text(),
             "pulse_param_index":     self._cmb_pulse_param.currentIndex(),
@@ -2050,6 +2075,7 @@ class EcosGUI(QMainWindow):
         self._txt_reclen.setText(d.get("reclen",      str(DEFAULT_RECLEN)))
         self._btn_relay.setChecked(d.get("relay", True))
         self._chk_cursor.setChecked(d.get("cursor", True))
+        self._chk_fullscale.setChecked(d.get("full_scale_lines", True))
         region = d.get("region")
         if region:
             self._region.setRegion(region)

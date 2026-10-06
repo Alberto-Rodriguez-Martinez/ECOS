@@ -97,10 +97,13 @@ class TestGuiSimulatorSession(unittest.TestCase):
             self.assertEqual(_digest(path), digest, path)
 
 
-class TestLiveCursor(unittest.TestCase):
-    """The live A-scan cursor is a full cross: both lines, one control, values with units."""
+class _LiveWindow(unittest.TestCase):
+    """A fresh GUI window, shown, without a saved session (each window saves its own on
+    close, which the next one would restore: check boxes switched off by a test)."""
 
     def setUp(self):
+        if os.path.exists(_ENV['session']):
+            os.remove(_ENV['session'])
         self.win = _ENV['gui'].EcosGUI()
         self.win.resize(1400, 900)
         self.win.show()
@@ -112,6 +115,11 @@ class TestLiveCursor(unittest.TestCase):
     def move_to(self, x, y):
         from PyQt5.QtCore import QPointF
         self.win._on_mouse_moved(self.vb.mapViewToScene(QPointF(x, y)))
+
+
+
+class TestLiveCursor(_LiveWindow):
+    """The live A-scan cursor is a full cross: both lines, one control, values with units."""
 
     def lines(self):
         return self.win._vline_cursor, self.win._hline_cursor
@@ -163,6 +171,43 @@ class TestLiveCursor(unittest.TestCase):
                     self.assertIn('sample', text)
                 if unit == 'mm':
                     self.assertIn('mm', text)
+
+
+class TestFullScaleLines(_LiveWindow):
+    """Faint lines at the quantizer full scale, ±, and the amplitude in % of it."""
+
+    def test_lines_at_full_scale_inside_the_view_behind_the_traces(self):
+        gui = _ENV['gui']
+        lines = self.win._fullscale_lines
+        self.assertEqual(sorted(line.value() for line in lines),
+                         [-gui.QUANT_FULL_SCALE, gui.QUANT_FULL_SCALE])
+        self.assertEqual(gui.QUANT_FULL_SCALE, 0.5)                 # ±midpoint/full scale
+        _, (y0, y1) = self.vb.viewRange()
+        for line in lines:
+            self.assertEqual(line.angle, 0)
+            self.assertTrue(line.isVisible())
+            self.assertTrue(y0 < line.value() < y1)                  # not on the border
+            self.assertLess(line.zValue(), self.win._curve_zoom_ch2.zValue())
+            self.assertLess(line.pen.color().alpha(), 255)          # faint
+            self.assertNotEqual(line.pen.color().getRgb(),
+                                self.win._vline_cursor.pen.color().getRgb())
+
+    def test_own_check_box_independent_of_the_cursor(self):
+        lines = self.win._fullscale_lines
+        self.win._chk_fullscale.setChecked(False)
+        self.assertFalse(any(line.isVisible() for line in lines))
+        self.win._chk_cursor.setChecked(True)                       # the cursor does not bring them
+        self.assertFalse(any(line.isVisible() for line in lines))
+        self.win._chk_fullscale.setChecked(True)
+        self.win._chk_cursor.setChecked(False)
+        self.assertTrue(all(line.isVisible() for line in lines))
+
+    def test_amplitude_in_percent_of_full_scale(self):
+        (x0, x1), _ = self.vb.viewRange()
+        for y, pct in ((0.25, '+50.0 % FS'), (-0.4, '-80.0 % FS'), (0.5, '+100.0 % FS')):
+            with self.subTest(y=y):
+                self.move_to(0.5 * (x0 + x1), y)
+                self.assertIn(f'A = {y:.4f} a.u. ({pct})', self.win._lbl_cursor.text())
 
 
 if __name__ == '__main__':
