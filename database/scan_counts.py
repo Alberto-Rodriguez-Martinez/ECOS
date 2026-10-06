@@ -19,6 +19,13 @@ This is mathematically the same as averaging the mean-removed captures. The
 offset is kept per point and channel because the record is stored only in the
 Smin–Smax window, so it cannot be recomputed from the stored samples.
 
+Order, and no rounding anywhere (scanner_tab_spec.md 5.6): each capture is raw −
+midpoint (an exact integer subtraction; its DC offset is NOT removed), summed in
+int64; the offset is computed afterwards from the whole-record sum, in float64, and
+stored APART, never applied to the sum; the sum is cast to int16/int32 only after
+checking |sum| ≤ midpoint·N (so the cast cannot truncate); the reader subtracts the
+offset when it computes x.
+
 Exactness: counts_to_float is the one function that computes x, both when
 measuring (ecos_gui._seq_acquire) and when reading a file (load_scan_raw_32):
 same inputs, same float64 operations, elementwise, so the float read back is

@@ -443,6 +443,72 @@ class TestCorruptSessionRegion(unittest.TestCase):
         self.assertEqual(win._get_smin_smax(), (3000, 3500))
 
 
+class TestExactCounts(_LiveWindow):
+    """
+    What a scan file holds is exactly the counts measured: the production
+    acquisition (EcosGUI._seq_acquire → _acquire_counts) summed over the raw captures
+    with no rounding and no offset subtracted, saved (save_scan_raw_32) and read back
+    (load_scan_raw_32). Expected values computed independently, in Python integers,
+    from every raw capture the digitizer delivered.
+    """
+
+    def test_read_back_equals_the_measured_counts(self):
+        sys.path.insert(0, os.path.join(_HERE, '..', 'database'))
+        from BD_Experimentos_PVA import load_scan_raw_32, save_scan_raw_32
+        from scan_counts import counts_to_float
+        win, sim = self.win, self.win._sedaq
+        # the DC offsets of the real set-up, fractional: with them, a mean subtracted (and
+        # rounded) per capture would differ from the midpoint and change the sums
+        sim.params.dc_offset_lsb_ch1, sim.params.dc_offset_lsb_ch2 = 1.2, -7.4
+        captures = []                                   # every raw capture, both channels
+        get = sim.GetAScan
+
+        def recording():
+            get()
+            captures.append(([int(v) for v in sim.DataADC1[:sim.RecLen]],
+                             [int(v) for v in sim.DataADC2[:sim.RecLen]]))
+        sim.GetAScan = recording
+        n, (smin, smax) = 20, win._get_smin_smax()
+        points = []
+        for _ in range(3):                              # three points, as a scan line
+            del captures[:]
+            ch1, ch2 = win._seq_acquire(n)              # the production path
+            lc = win._last_counts
+            points.append((list(captures), lc, ch1, ch2))
+        sim.GetAScan = get
+        mid = 512                                       # 10 bits
+        ch2_mean = np.mean([np.mean(cap[1]) for caps, _, _, _ in points for cap in caps])
+        self.assertLess(ch2_mean - mid, -5)              # the offset is really there
+        tmp = tempfile.mkdtemp(prefix='exact_counts_')
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        sums = [np.array([np.asarray(lc['sum'][c])[smin:smax] for _, lc, _, _ in points])
+                [None] for c in (0, 1)]
+        offs = [np.array([[lc['offset'][c] for _, lc, _, _ in points]]) for c in (0, 1)]
+        path = save_scan_raw_32(
+            specimen={}, protocol={}, equipment1={'params': {'Smin': smin, 'Smax': smax}},
+            equipment2={}, scanner_session={}, scan={'type': 'line'},
+            signals_ch1=sums[0], signals_ch2=sums[1], offsets_ch1=offs[0], offsets_ch2=offs[1],
+            n_avg=n, gains=(65.0, 35.0), coords=np.zeros((1, 3, 4)),
+            point_time=np.zeros((1, 3)), temperatures=[], base_dir=tmp, exp_name='exact')
+        meta, d = load_scan_raw_32(path)
+        for k, (caps, lc, ch1, ch2) in enumerate(points):
+            self.assertEqual(len(caps), n)              # n captures, none discarded
+            for c, name in ((0, 'ch1'), (1, 'ch2')):
+                # Σ raw counts of the n captures, in Python integers (no numpy, no float)
+                measured = [sum(cap[c][i] for cap in caps) for i in range(smin, smax)]
+                stored = d[f'signals_{name}_sum'][0, k]
+                self.assertTrue(np.issubdtype(stored.dtype, np.integer))
+                # exact, not approximate: the stored sum is Σ(raw − midpoint), nothing else
+                self.assertEqual([int(v) + mid * n for v in stored], measured)
+                # the offset is stored apart, and the reader's float is the one measured
+                self.assertEqual(float(d[f'offsets_{name}'][0, k]), lc['offset'][c])
+                x = (ch1, ch2)[c][smin:smax]
+                np.testing.assert_array_equal(d[f'signals_{name}'][0, k], x)
+                np.testing.assert_array_equal(
+                    x, counts_to_float(stored, n, 10, lc['offset'][c])[0])
+        self.assertEqual(meta['conversion']['dtype'], 'int16')    # 20 × 512 fits int16
+
+
 class TestFullScaleLines(_LiveWindow):
     """Faint lines at the quantizer full scale, ±, and the amplitude in % of it."""
 

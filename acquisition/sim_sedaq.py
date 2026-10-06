@@ -112,6 +112,10 @@ class SimParams:
     tt_amp: float = 0.15         # through-transmission pulse
     snr_db: float = 30.0         # A0 over the noise standard deviation
     adc_noise_lsb: float = 0.7   # ADC noise floor (std, LSB), independent of the gain
+    # DC offset of each channel at the ADC input, in LSB (counts), fractional: the real
+    # set-up shows Ch2 -7 to -8 counts and Ch1 about +1 (saved scans, 05/10). 0: none.
+    dc_offset_lsb_ch1: float = 0.0
+    dc_offset_lsb_ch2: float = 0.0
     gain_ref_ch1: float = 65.0   # gains at which the amplitudes above hold
     gain_ref_ch2: float = 35.0
     # -- through-transmission map structure --------------------------------------
@@ -187,8 +191,8 @@ class SimSeDaq:
         adc_sd = p.adc_noise_lsb / QUANT
         ch1 = ch1 + self._rng.normal(0.0, noise_sd, n) * self._gain_scale(1)
         ch2 = ch2 + self._rng.normal(0.0, noise_sd, n) * self._gain_scale(2)
-        ch1 = ch1 + self._rng.normal(0.0, adc_sd, n)
-        ch2 = ch2 + self._rng.normal(0.0, adc_sd, n)
+        ch1 = ch1 + self._rng.normal(0.0, adc_sd, n) + p.dc_offset_lsb_ch1 / QUANT
+        ch2 = ch2 + self._rng.normal(0.0, adc_sd, n) + p.dc_offset_lsb_ch2 / QUANT
         self.DataADC1 = self._quantize(ch1)
         self.DataADC2 = self._quantize(ch2)
 
