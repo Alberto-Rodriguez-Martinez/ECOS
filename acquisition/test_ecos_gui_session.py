@@ -164,14 +164,128 @@ class TestLiveCursor(_LiveWindow):
                 x, y = 0.5 * (x0 + x1), y0 + 0.25 * (y1 - y0)
                 self.move_to(x, y)
                 text = win._lbl_cursor.text()
-                t_us = win._unit_to_us(x)
+                t_us = x / 100.0                  # x is in samples in every unit (100 MHz)
                 self.assertIn(f't = {t_us:.3f} µs', text)
                 self.assertIn(f'A = {y:.4f} a.u.', text)
                 if unit == 'samples':
-                    self.assertAlmostEqual(t_us, x / 100.0, places=6)      # 100 MHz
-                    self.assertIn('sample', text)
+                    self.assertIn(f'sample {x:.0f}', text)
                 if unit == 'mm':
-                    self.assertIn('mm', text)
+                    d = x / 1e8 * 1480.0 / 2.0 * 1e3          # no PT100: nominal c_w
+                    self.assertIn(f'd = {d:.2f} mm', text)
+
+
+class TestAxisUnits(_LiveWindow):
+    """
+    Regression (06/10): switching the x unit to µs or mm squashed the overview (its
+    curves converted, its range, limits and Smin–Smax region still in samples) and
+    froze the zoom (the mm inverse was off by 10^6: the region collapsed to
+    [16384, 16384] through the zoom⇄region feedback, and the zoom stopped updating).
+    No exception was raised: the state was wrong. Every item stays in samples; only
+    the axis shows the unit (UnitAxisItem).
+    """
+
+    UNITS = ('samples', 'mus', 'mm')
+
+    def radio(self, unit):
+        return {'samples': self.win._radio_samples, 'mus': self.win._radio_mus,
+                'mm': self.win._radio_mm}[unit]
+
+    def refresh(self, n=3):
+        self.win._running, self.win._inspection_mode = True, False
+        for _ in range(n):
+            self.win._update_plots()
+        QApplication.processEvents()
+
+    def finite_ranges(self):
+        for plot in (self.win._plot_zoom, self.win._plot_ov):
+            (x0, x1), (y0, y1) = plot.getViewBox().viewRange()
+            self.assertTrue(np.all(np.isfinite([x0, x1, y0, y1])), plot)
+            self.assertLess(x0, x1)
+            axis = plot.getAxis('bottom')
+            levels = axis.tickValues(x0, x1, 800)
+            values = [v for _, vals in levels for v in vals]
+            self.assertTrue(values and np.all(np.isfinite(values)))
+            for _, vals in levels:
+                strings = axis.tickStrings(vals, 1.0, levels[0][0])
+                self.assertTrue(all(np.isfinite(float(t)) for t in strings), strings)
+
+    def test_every_unit_keeps_the_physical_positions(self):
+        from echo_tracking import PeakMeasure
+        win = self.win
+        self.refresh()
+        region = tuple(win._region.getRegion())
+        smin, smax = win._get_smin_smax()
+        x_cursor = smin + 0.37 * (smax - smin)          # a sample in the window
+        self.move_to(x_cursor, 0.1)
+        win._mark_echo(PeakMeasure(0.1, smin + 300, False, False, 50.0, 'tracked',
+                                   band=(smin + 250, smin + 350)))
+        band, peak, _ = win._echo_mark
+        for unit in self.UNITS + ('mus', 'samples', 'mm'):
+            with self.subTest(unit=unit):
+                self.radio(unit).setChecked(True)
+                self.refresh()
+                self.assertEqual(win._unit, unit)
+                self.assertEqual(tuple(win._region.getRegion()), region)     # Smin–Smax
+                self.assertEqual(win._get_smin_smax(), (smin, smax))
+                self.assertEqual(win._vline_cursor.value(), x_cursor)        # the cursor
+                self.assertEqual(peak.value(), smin + 300)                   # the echo mark
+                self.assertEqual(tuple(band.getRegion()), (smin + 250, smin + 350))
+                x_zoom, _ = win._curve_zoom_ch2.getData()
+                self.assertEqual((x_zoom[0], x_zoom[-1] + 1), (smin, smax))  # the curve
+                x_ov, _ = win._curve_ov_ch2.getData()
+                self.assertEqual((x_ov[0], x_ov[-1] + 1), (0, win._reclen))
+                (zx0, zx1), _ = self.vb.viewRange()
+                self.assertAlmostEqual(zx0, smin, delta=1e-6)               # zoom = region
+                self.assertAlmostEqual(zx1, smax, delta=1e-6)
+                (ox0, ox1), _ = win._plot_ov.getViewBox().viewRange()
+                self.assertTrue(ox0 <= region[0] and region[1] <= ox1 + 1)  # region visible
+                self.finite_ranges()
+
+    def test_live_refresh_still_running_after_the_change(self):
+        win = self.win
+        for unit in ('mus', 'mm', 'samples'):
+            with self.subTest(unit=unit):
+                self.radio(unit).setChecked(True)
+                self.refresh(1)
+                _, y_before = win._curve_zoom_ch2.getData()
+                y_before = np.array(y_before)
+                self.refresh(1)
+                _, y_after = win._curve_zoom_ch2.getData()
+                self.assertTrue(win._timer.isActive())
+                self.assertFalse(np.array_equal(y_before, y_after))         # new data drawn
+                self.assertLess(*win._get_smin_smax())
+
+    def test_distance_without_pt100(self):
+        """c_w None or NaN (no PT100): the nominal c_w, said in the label, never a NaN range."""
+        win = self.win
+        for cw in (None, float('nan'), 0.0):
+            with self.subTest(cw=cw):
+                win._state.Cw_mean = cw
+                self.radio('mm').setChecked(True)
+                win._on_unit_changed('mm')
+                self.refresh()
+                self.assertIn('nominal', win._plot_zoom.getAxis('bottom').labelText)
+                self.finite_ranges()
+                self.move_to(sum(win._get_smin_smax()) / 2.0, 0.0)
+                self.assertNotIn('nan', win._lbl_cursor.text().lower())
+        win._state.Cw_mean = 1500.0                          # a real reading: used, ticks move
+        self.refresh()
+        self.assertIn('1500.0 m/s', win._plot_zoom.getAxis('bottom').labelText)
+        self.assertNotIn('nominal', win._plot_zoom.getAxis('bottom').labelText)
+        win._state.Cw_mean = None
+
+    def test_one_conversion_and_its_inverse(self):
+        gui = _ENV['gui']
+        n = np.array([0.0, 1.0, 2672.0, 16383.0])
+        for unit in self.UNITS:
+            for cw in (None, float('nan'), 1480.0, 1497.3):
+                with self.subTest(unit=unit, cw=cw):
+                    x = gui.samples_to_axis(n, unit, cw)
+                    self.assertTrue(np.all(np.isfinite(x)))
+                    np.testing.assert_allclose(gui.axis_to_samples(x, unit, cw), n, atol=1e-9)
+        self.assertAlmostEqual(float(gui.samples_to_axis(2672, 'mus', None)), 26.72)
+        self.assertAlmostEqual(float(gui.samples_to_axis(2702.7027, 'mm', 1480.0)), 20.0,
+                               places=4)
 
 
 class TestFullScaleLines(_LiveWindow):

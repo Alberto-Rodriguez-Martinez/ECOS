@@ -180,6 +180,82 @@ QUANT_FULL_SCALE = (ADC_FULL_SCALE // 2) / ADC_FULL_SCALE
 ZOOM_Y_MARGIN = 1.1            # live plot range: the full-scale lines inside, not on the border
 
 # ==============================================================================
+# X-AXIS UNIT OF THE LIVE PLOTS
+# ==============================================================================
+# Every item of the live plots (curves, Smin–Smax region, cursor, echo mark, limits)
+# lives in SAMPLES, whatever the unit chosen. Only the bottom axis shows the unit
+# (UnitAxisItem), through this one conversion and its inverse; the cursor readout
+# uses them too. Nothing on the plots is ever converted, so nothing can be left in
+# the other unit (06/10: the region and the limits stayed in samples while the
+# curves went to µs or mm, and the mm inverse was off by 10^6).
+X_UNITS = ('samples', 'mus', 'mm')
+C_W_AXIS_NOMINAL = 1480.0      # m/s, the mm axis without a valid PT100 reading
+
+
+def axis_cw(cw):
+    """(c_w, nominal?) for the mm axis: the PT100 value when it is a finite positive
+    number, else C_W_AXIS_NOMINAL (a NaN must never reach an axis range)."""
+    try:
+        cw = float(cw)
+    except (TypeError, ValueError):
+        return C_W_AXIS_NOMINAL, True
+    if np.isfinite(cw) and cw > 0:
+        return cw, False
+    return C_W_AXIS_NOMINAL, True
+
+
+def samples_to_axis(n, unit, cw, fs=None):
+    """Record sample(s) → the axis unit: 'samples', 'mus' (µs) or 'mm' (c_w·t/2)."""
+    fs = DEFAULT_ACQ_FS if fs is None else fs
+    n = np.asarray(n, dtype=float)
+    if unit == 'mus':
+        return n / fs * 1e6
+    if unit == 'mm':
+        return n / fs * axis_cw(cw)[0] / 2.0 * 1e3
+    return n
+
+
+def axis_to_samples(x, unit, cw, fs=None):
+    """Inverse of samples_to_axis (float samples, not rounded)."""
+    fs = DEFAULT_ACQ_FS if fs is None else fs
+    x = np.asarray(x, dtype=float)
+    if unit == 'mus':
+        return x * 1e-6 * fs
+    if unit == 'mm':
+        return x * 1e-3 * 2.0 / axis_cw(cw)[0] * fs
+    return x
+
+
+class UnitAxisItem(pg.AxisItem):
+    """
+    Bottom axis of a live plot whose data is in samples: ticks at round values of
+    the chosen unit, placed with axis_to_samples and labelled with samples_to_axis.
+    unit_fn() -> (unit, c_w). pyqtgraph 0.11: generateDrawSpecs calls tickValues
+    for the positions and tickStrings with the same spacing.
+    """
+
+    def __init__(self, unit_fn, orientation='bottom', **kw):
+        super().__init__(orientation, **kw)
+        self._unit_fn = unit_fn
+
+    def tickValues(self, minVal, maxVal, size):
+        unit, cw = self._unit_fn()
+        lo, hi = sorted(float(v) for v in samples_to_axis([minVal, maxVal], unit, cw))
+        return [(spacing, [float(v) for v in axis_to_samples(vals, unit, cw)])
+                for spacing, vals in super().tickValues(lo, hi, size)]
+
+    def tickStrings(self, values, scale, spacing):
+        unit, cw = self._unit_fn()
+        return super().tickStrings([float(v) for v in samples_to_axis(values, unit, cw)],
+                                   scale, spacing)
+
+    def refresh(self):
+        """Redraw the ticks (unit or c_w changed; the data range did not)."""
+        self.picture = None
+        self.update()
+
+
+# ==============================================================================
 # [3] ACQUISITION ERRORS (the simulated digitizer is sim_sedaq.SimSeDaq)
 # ==============================================================================
 class AcquisitionError(RuntimeError):
@@ -459,7 +535,9 @@ class EcosGUI(QMainWindow):
         layout.addLayout(top_row)
 
         # Zoom plot
-        self._plot_zoom = pg.PlotWidget(title="Live A-scan — zoom region")
+        self._plot_zoom = pg.PlotWidget(
+            title="Live A-scan — zoom region",
+            axisItems={'bottom': UnitAxisItem(self._axis_unit)})
         self._plot_zoom.setLabel('left', 'Amplitude', units='a.u.')
         self._plot_zoom.getAxis('left').enableAutoSIPrefix(False)
         self._plot_zoom.setLabel('bottom', 'Sample')
@@ -511,7 +589,9 @@ class EcosGUI(QMainWindow):
         layout.addWidget(self._left_tabs, stretch=3)
 
         # Overview plot
-        self._plot_ov = pg.PlotWidget(title="Overview — full record")
+        self._plot_ov = pg.PlotWidget(
+            title="Overview — full record",
+            axisItems={'bottom': UnitAxisItem(self._axis_unit)})
         self._plot_ov.setLabel('bottom', 'Sample')
         self._plot_ov.setMaximumHeight(160)
         self._plot_ov.setYRange(SIGNAL_YMIN, SIGNAL_YMAX, padding=0)
@@ -874,29 +954,30 @@ class EcosGUI(QMainWindow):
     # ==========================================================================
     #  [6] Unit conversion helpers
     # ==========================================================================
-    def _samples_to_unit(self, n):
-        cw = self._state.Cw_mean or 1480.0
-        if self._unit == 'mus':
-            return np.asarray(n, dtype=float) / DEFAULT_ACQ_FS * 1e6
-        elif self._unit == 'mm':
-            return np.asarray(n, dtype=float) / DEFAULT_ACQ_FS * cw / 2.0 * 1e3
-        return np.asarray(n, dtype=float)
+    def _axis_unit(self):
+        """(unit, c_w) of the x axis of the live plots (UnitAxisItem)."""
+        return self._unit, self._state.Cw_mean
 
-    def _unit_to_samples(self, val):
-        cw = self._state.Cw_mean or 1480.0
-        if self._unit == 'mus':
-            return int(round(float(val) * 1e-6 * DEFAULT_ACQ_FS))
-        elif self._unit == 'mm':
-            return int(round(float(val) * 2.0 / (cw * 1e-3) * DEFAULT_ACQ_FS))
-        return int(round(float(val)))
+    def _to_axis(self, n):
+        """Samples → the chosen unit (samples_to_axis, the one conversion)."""
+        return samples_to_axis(n, self._unit, self._state.Cw_mean)
 
     def _unit_label(self):
-        return {'samples': 'Sample', 'mus': 'Time [µs]', 'mm': 'Distance [mm]'}[self._unit]
+        if self._unit == 'mm':
+            cw, nominal = axis_cw(self._state.Cw_mean)
+            return f"Distance [mm] (c_w {cw:.1f} m/s{', nominal' if nominal else ''})"
+        return {'samples': 'Sample', 'mus': 'Time [µs]'}[self._unit]
 
     def _on_unit_changed(self, unit):
+        """Only the axes change: every item stays in samples (see UnitAxisItem)."""
         self._unit = unit
-        self._plot_zoom.setLabel('bottom', self._unit_label())
-        self._plot_ov.setLabel('bottom', self._unit_label())
+        self._refresh_unit_axes()
+
+    def _refresh_unit_axes(self):
+        self._axis_cw_drawn = axis_cw(self._state.Cw_mean)
+        for plot in (self._plot_zoom, self._plot_ov):
+            plot.setLabel('bottom', self._unit_label())
+            plot.getAxis('bottom').refresh()
 
     # ==========================================================================
     #  Real-time plot update
@@ -954,8 +1035,11 @@ class EcosGUI(QMainWindow):
         smin = max(0, int(rmin))
         smax = min(self._reclen, int(rmax))
 
-        x_full = self._samples_to_unit(np.arange(self._reclen))
-        x_zoom = self._samples_to_unit(np.arange(smin, smax))
+        x_full = np.arange(self._reclen)          # samples: the axis shows the unit
+        x_zoom = np.arange(smin, smax)
+        if self._unit == 'mm' and axis_cw(self._state.Cw_mean) != getattr(
+                self, '_axis_cw_drawn', None):
+            self._refresh_unit_axes()             # c_w changed: the mm ticks move
 
         if self._chk_ch1.isChecked():
             self._curve_ov_ch1.setData(x_full, ch1)
@@ -973,11 +1057,10 @@ class EcosGUI(QMainWindow):
             self._curve_ov_ch2.setData([], [])
             self._curve_zoom_ch2.setData([], [])
 
-        if smax > smin:
-            self._plot_zoom.setXRange(
-                self._samples_to_unit(smin),
-                self._samples_to_unit(smax), padding=0
-            )
+        if smax > smin and not self._syncing:
+            self._syncing = True                  # the zoom follows the region, not back
+            self._plot_zoom.setXRange(smin, smax, padding=0)
+            self._syncing = False
 
     @staticmethod
     def _raw_to_float(buf, reclen, quant):
@@ -997,17 +1080,15 @@ class EcosGUI(QMainWindow):
         self._txt_smax.setText(str(smax))
         if not self._syncing:
             self._syncing = True
-            self._plot_zoom.setXRange(
-                self._samples_to_unit(smin), self._samples_to_unit(smax), padding=0
-            )
+            self._plot_zoom.setXRange(smin, smax, padding=0)
             self._syncing = False
 
     def _on_zoom_xrange_changed(self, _vb, x_range):
         if self._syncing or self._inspection_mode:
             return
         self._syncing = True
-        smin = max(0, self._unit_to_samples(x_range[0]))
-        smax = min(self._reclen, self._unit_to_samples(x_range[1]))
+        smin = max(0, int(round(x_range[0])))          # samples, as everything here
+        smax = min(self._reclen, int(round(x_range[1])))
         self._region.setRegion([smin, smax])
         self._syncing = False
 
@@ -1039,14 +1120,6 @@ class EcosGUI(QMainWindow):
         if not visible:
             self._lbl_cursor.setText("")
 
-    def _unit_to_us(self, x):
-        """x-axis value (current unit) to time [µs], without rounding to a sample."""
-        if self._unit == 'mus':
-            return float(x)
-        if self._unit == 'mm':
-            cw = self._state.Cw_mean or 1480.0
-            return float(x) * 2.0 / (cw * 1e-3)
-        return float(x) / DEFAULT_ACQ_FS * 1e6
 
     def _on_mouse_moved(self, pos):
         vb = self._plot_zoom.getViewBox()
@@ -1060,8 +1133,11 @@ class EcosGUI(QMainWindow):
         self._hline_cursor.setPos(y)
         self._set_cursor_visible(True)
 
-        where = {'samples': f"sample {x:.0f}", 'mus': "", 'mm': f"d = {x:.2f} mm"}[self._unit]
-        text = (f"t = {self._unit_to_us(x):.3f} µs" + (f" ({where})" if where else "")
+        # x is in samples (every item of the plot is): the unit only for the text
+        t_us = float(samples_to_axis(x, 'mus', None))
+        where = {'samples': f"sample {x:.0f}", 'mus': "",
+                 'mm': f"d = {float(self._to_axis(x)):.2f} mm"}[self._unit]
+        text = (f"t = {t_us:.3f} µs" + (f" ({where})" if where else "")
                 + f"   A = {y:.4f} a.u. ({y / QUANT_FULL_SCALE * 100:+.1f} % FS)")
         # The signal at that instant (Ch2, else Ch1), as the former floating label showed
         for name, curve in (("Ch2", self._curve_zoom_ch2), ("Ch1", self._curve_zoom_ch1)):
@@ -1495,11 +1571,10 @@ class EcosGUI(QMainWindow):
                 self._plot_zoom.addItem(item)
             self._echo_mark = (band, peak, label)
         band, peak, label = self._echo_mark
-        x = float(self._samples_to_unit(m.index))
+        x = float(m.index)                        # samples, as every item of the plot
         peak.setPos(x)
         if m.band is not None:
-            band.setRegion((float(self._samples_to_unit(m.band[0])),
-                            float(self._samples_to_unit(m.band[1]))))
+            band.setRegion((float(m.band[0]), float(m.band[1])))
             band.show()
         else:
             band.hide()
