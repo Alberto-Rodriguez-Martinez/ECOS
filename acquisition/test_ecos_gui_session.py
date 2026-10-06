@@ -227,7 +227,8 @@ class TestAxisUnits(_LiveWindow):
                 self.assertEqual(win._unit, unit)
                 self.assertEqual(tuple(win._region.getRegion()), region)     # Smin–Smax
                 self.assertEqual(win._get_smin_smax(), (smin, smax))
-                self.assertEqual(win._vline_cursor.value(), x_cursor)        # the cursor
+                self.assertAlmostEqual(win._vline_cursor.value(), x_cursor,  # the cursor
+                                       delta=1e-6)
                 self.assertEqual(peak.value(), smin + 300)                   # the echo mark
                 self.assertEqual(tuple(band.getRegion()), (smin + 250, smin + 350))
                 x_zoom, _ = win._curve_zoom_ch2.getData()
@@ -268,10 +269,9 @@ class TestAxisUnits(_LiveWindow):
                 self.finite_ranges()
                 self.move_to(sum(win._get_smin_smax()) / 2.0, 0.0)
                 self.assertNotIn('nan', win._lbl_cursor.text().lower())
-        win._state.Cw_mean = 1500.0                          # a real reading: used, ticks move
-        self.refresh()
-        self.assertIn('1500.0 m/s', win._plot_zoom.getAxis('bottom').labelText)
-        self.assertNotIn('nominal', win._plot_zoom.getAxis('bottom').labelText)
+        win._state.Cw_mean = 1500.0          # a value that is not a PT100 reading (manual,
+        win._on_unit_changed('mm')            # assumed): the axis still says nominal
+        self.assertIn('1480.0 m/s, nominal', win._plot_zoom.getAxis('bottom').labelText)
         win._state.Cw_mean = None
 
     def test_one_conversion_and_its_inverse(self):
@@ -286,6 +286,132 @@ class TestAxisUnits(_LiveWindow):
         self.assertAlmostEqual(float(gui.samples_to_axis(2672, 'mus', None)), 26.72)
         self.assertAlmostEqual(float(gui.samples_to_axis(2702.7027, 'mm', 1480.0)), 20.0,
                                places=4)
+
+
+class TestAxisCwFrozen(_LiveWindow):
+    """The c_w of the mm axis is taken once, when the unit goes to mm, and held."""
+
+    def pt100(self, cw):
+        """As a PT100 reading leaves the state (Acquisition tab or a scanner tool)."""
+        self.win._state.T1 = self.win._state.T2 = 24.0       # a reading sets T and c_w
+        self.win._state.Cw_mean = cw
+        self.win._note_temperature('PT100 (test)')
+
+    def label(self):
+        return self.win._plot_zoom.getAxis('bottom').labelText
+
+    def mm_of(self, sample):
+        unit, cw = self.win._axis_unit()
+        return float(_ENV['gui'].samples_to_axis(sample, unit, cw))
+
+    def test_held_while_the_reading_changes(self):
+        win = self.win
+        self.pt100(1497.0)
+        win._radio_mm.setChecked(True)
+        self.assertIn('c_w 1497.0 m/s, PT100, read', self.label())
+        d0 = self.mm_of(2700)
+        self.pt100(1502.0)                               # the next reading, during the session
+        win._running, win._inspection_mode = True, False
+        for _ in range(3):
+            win._update_plots()
+        self.assertEqual(win._axis_unit()[1], 1497.0)    # the axis did not move
+        self.assertEqual(self.mm_of(2700), d0)
+        self.assertIn('1497.0 m/s', self.label())
+        smin, smax = win._get_smin_smax()
+        from PyQt5.QtCore import QPointF
+        win._on_mouse_moved(win._plot_zoom.getViewBox().mapViewToScene(QPointF(2700, 0.0)))
+        self.assertIn(f'd = {d0:.2f} mm', win._lbl_cursor.text())       # the cursor too
+
+    def test_retake_without_changing_the_unit(self):
+        win = self.win
+        self.assertFalse(win._btn_retake_cw.isEnabled())                 # only in mm
+        self.pt100(1497.0)
+        win._radio_mm.setChecked(True)
+        self.assertTrue(win._btn_retake_cw.isEnabled())
+        self.pt100(1502.0)
+        win._btn_retake_cw.click()
+        self.assertEqual(win._unit, 'mm')
+        self.assertEqual(win._axis_unit()[1], 1502.0)
+        self.assertIn('1502.0 m/s, PT100', self.label())
+        self.pt100(1499.0)
+        win._radio_mus.setChecked(True)
+        self.assertFalse(win._btn_retake_cw.isEnabled())
+        win._radio_mm.setChecked(True)                   # back to mm: taken again
+        self.assertEqual(win._axis_unit()[1], 1499.0)
+
+    def test_nominal_without_a_pt100_reading(self):
+        win = self.win
+        win._state.Cw_mean = None
+        win._radio_mm.setChecked(True)
+        self.assertIn('c_w 1480.0 m/s, nominal, no PT100 reading', self.label())
+        self.assertEqual(win._axis_unit()[1], 1480.0)
+
+
+class TestCorruptSessionRegion(unittest.TestCase):
+    """06/10: the unit bug saved an empty Smin–Smax ([16384, 16384]) in the session."""
+
+    def window_with(self, session):
+        with open(_ENV['session'], 'w') as f:
+            json.dump(session, f)
+        win = _ENV['gui'].EcosGUI()
+        win.resize(1400, 900)
+        win.show()
+        QApplication.processEvents()
+        self.addCleanup(win.close)
+        return win
+
+    def draws(self, win):
+        win._running, win._inspection_mode = True, False
+        win._update_plots()
+        smin, smax = win._get_smin_smax()
+        x, y = win._curve_zoom_ch2.getData()
+        self.assertEqual(len(x), smax - smin)                         # the big plot draws
+        self.assertGreater(len(x), 0)
+        (z0, z1), _ = win._plot_zoom.getViewBox().viewRange()
+        self.assertEqual((round(z0), round(z1)), (smin, smax))        # zoom = region
+        self.assertTrue(np.all(np.isfinite([z0, z1])))
+
+    def test_empty_region_discarded_at_start(self):
+        win = self.window_with({'region': [16384, 16384], 'reclen': '16384'})
+        smin, smax = win._get_smin_smax()
+        self.assertGreaterEqual(smax - smin, 16)                      # not the empty region
+        self.assertEqual((smin, smax), tuple(win._sedaq.default_window()))
+        self.assertEqual((smin, smax), win._default_region(16384))
+        self.assertTrue(any('[16384, 16384]' in n and 'not valid' in n
+                            for n in win.session_notices))
+        self.draws(win)
+
+    def test_other_invalid_regions(self):
+        for region in ([5000, 3000], [10000, 20000], [-50, 3000], [100, 105],
+                       [float('nan'), 4000], ['a', 'b'], [3000]):
+            with self.subTest(region=region):
+                win = self.window_with({'region': region, 'reclen': '16384'})
+                self.assertEqual(win._get_smin_smax(), win._default_region(16384))
+                self.assertTrue(win.session_notices)
+                self.draws(win)
+                win.close()
+
+    def test_valid_region_kept_silently(self):
+        win = self.window_with({'region': [2500, 4000], 'reclen': '16384'})
+        self.assertEqual(win._get_smin_smax(), (2500, 4000))
+        self.assertEqual(win.session_notices, [])
+        self.draws(win)
+
+    def test_never_saves_an_empty_region(self):
+        win = self.window_with({'region': [2500, 4000], 'reclen': '16384'})
+        win._region.setRegion([5000, 5000])                          # however it got there
+        win.close()
+        with open(_ENV['session']) as f:
+            saved = json.load(f)['region']
+        self.assertEqual(saved, [2500, 4000])                        # the last valid one
+        self.assertTrue(any('saves [2500, 4000]' in n for n in win.session_notices))
+
+    def test_zoom_range_never_writes_an_empty_region(self):
+        win = self.window_with({'region': [2500, 4000], 'reclen': '16384'})
+        win._on_zoom_xrange_changed(None, (16384.0, 16384.0))       # the old feedback path
+        self.assertEqual(win._get_smin_smax(), (2500, 4000))
+        win._on_zoom_xrange_changed(None, (3000.0, 3500.0))          # a valid one goes through
+        self.assertEqual(win._get_smin_smax(), (3000, 3500))
 
 
 class TestFullScaleLines(_LiveWindow):

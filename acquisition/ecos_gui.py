@@ -226,6 +226,29 @@ def axis_to_samples(x, unit, cw, fs=None):
     return x
 
 
+MIN_REGION_SAMPLES = 16       # narrowest Smin–Smax accepted (the tools' minimum window)
+
+
+def valid_region(region, reclen, min_width=MIN_REGION_SAMPLES):
+    """
+    (smin, smax) in samples when `region` is two finite numbers with
+    0 <= smin and smin + min_width <= smax <= reclen; None otherwise (empty,
+    inverted, outside the record, not numbers). Used when loading and saving a
+    session and before writing the region from the zoom range: on 06/10 an empty
+    [16384, 16384] got into the session file and kept the live plots blank.
+    """
+    try:
+        lo, hi = (float(v) for v in region)
+    except (TypeError, ValueError):
+        return None
+    if not (np.isfinite(lo) and np.isfinite(hi)):
+        return None
+    lo, hi = int(round(lo)), int(round(hi))
+    if lo < 0 or hi > int(reclen) or hi - lo < min_width:
+        return None
+    return lo, hi
+
+
 class UnitAxisItem(pg.AxisItem):
     """
     Bottom axis of a live plot whose data is in samples: ticks at round values of
@@ -310,6 +333,8 @@ class EcosGUI(QMainWindow):
         self._inspection_mode = False
         self._syncing         = False
         self._unit            = 'samples'   # 'samples' | 'mus' | 'mm'
+        self._axis_cw         = None        # (c_w, source) frozen for the mm axis
+        self.session_notices  = []          # what was corrected when loading / saving
         self._Cl              = None
         self._L               = None
 
@@ -508,6 +533,14 @@ class EcosGUI(QMainWindow):
         for r in (self._radio_samples, self._radio_mus, self._radio_mm):
             self._unit_grp.addButton(r)
             top_row.addWidget(r)
+        self._btn_retake_cw = QPushButton("Retake c_w")
+        self._btn_retake_cw.setToolTip(
+            "The mm axis uses the c_w taken when the unit went to mm, frozen so the axis is "
+            "reproducible. Take it again from the latest PT100 reading (nominal 1480 m/s "
+            "without one) when the water temperature has really changed.")
+        self._btn_retake_cw.setEnabled(False)
+        self._btn_retake_cw.clicked.connect(self._on_retake_axis_cw)
+        top_row.addWidget(self._btn_retake_cw)
         self._radio_samples.toggled.connect(lambda c: c and self._on_unit_changed('samples'))
         self._radio_mus.toggled.connect(    lambda c: c and self._on_unit_changed('mus'))
         self._radio_mm.toggled.connect(     lambda c: c and self._on_unit_changed('mm'))
@@ -955,26 +988,51 @@ class EcosGUI(QMainWindow):
     #  [6] Unit conversion helpers
     # ==========================================================================
     def _axis_unit(self):
-        """(unit, c_w) of the x axis of the live plots (UnitAxisItem)."""
-        return self._unit, self._state.Cw_mean
+        """(unit, c_w) of the x axis of the live plots (UnitAxisItem): the c_w frozen
+        when the unit went to mm, not the one of each refresh."""
+        return self._unit, (self._axis_cw[0] if self._axis_cw else None)
 
     def _to_axis(self, n):
         """Samples → the chosen unit (samples_to_axis, the one conversion)."""
-        return samples_to_axis(n, self._unit, self._state.Cw_mean)
+        return samples_to_axis(n, *self._axis_unit())
+
+    def _take_axis_cw(self):
+        """
+        Freeze the c_w of the mm axis: an axis that follows a measurement in progress is
+        not reproducible (two screenshots of one record would not compare). The PT100
+        value when the current c_w comes from a PT100 reading, else the nominal 1480
+        m/s (manual or assumed temperatures are not readings).
+        """
+        reading = self._latest_temperature()
+        cw, nominal = axis_cw(self._state.Cw_mean)
+        if reading is not None and not nominal:
+            when = time.strftime('%H:%M:%S', time.localtime(reading['time']))
+            self._axis_cw = (cw, f"PT100, read {when}")
+        else:
+            self._axis_cw = (C_W_AXIS_NOMINAL, "nominal, no PT100 reading")
 
     def _unit_label(self):
         if self._unit == 'mm':
-            cw, nominal = axis_cw(self._state.Cw_mean)
-            return f"Distance [mm] (c_w {cw:.1f} m/s{', nominal' if nominal else ''})"
+            cw, source = self._axis_cw
+            return f"Distance [mm] (c_w {cw:.1f} m/s, {source})"
         return {'samples': 'Sample', 'mus': 'Time [µs]'}[self._unit]
 
     def _on_unit_changed(self, unit):
-        """Only the axes change: every item stays in samples (see UnitAxisItem)."""
+        """Only the axes change: every item stays in samples (see UnitAxisItem). Going
+        to mm takes the c_w once; it holds until the unit changes again or Retake."""
         self._unit = unit
+        if unit == 'mm':
+            self._take_axis_cw()
+        self._btn_retake_cw.setEnabled(unit == 'mm')
         self._refresh_unit_axes()
 
+    def _on_retake_axis_cw(self):
+        """Take the c_w of the mm axis again (the water temperature really changed)."""
+        if self._unit == 'mm':
+            self._take_axis_cw()
+            self._refresh_unit_axes()
+
     def _refresh_unit_axes(self):
-        self._axis_cw_drawn = axis_cw(self._state.Cw_mean)
         for plot in (self._plot_zoom, self._plot_ov):
             plot.setLabel('bottom', self._unit_label())
             plot.getAxis('bottom').refresh()
@@ -1037,9 +1095,6 @@ class EcosGUI(QMainWindow):
 
         x_full = np.arange(self._reclen)          # samples: the axis shows the unit
         x_zoom = np.arange(smin, smax)
-        if self._unit == 'mm' and axis_cw(self._state.Cw_mean) != getattr(
-                self, '_axis_cw_drawn', None):
-            self._refresh_unit_axes()             # c_w changed: the mm ticks move
 
         if self._chk_ch1.isChecked():
             self._curve_ov_ch1.setData(x_full, ch1)
@@ -1076,6 +1131,9 @@ class EcosGUI(QMainWindow):
         rmin, rmax = self._region.getRegion()
         smin = max(0, int(rmin))
         smax = min(self._reclen, int(rmax))
+        good = valid_region((smin, smax), self._reclen)
+        if good is not None:
+            self._last_good_region = good
         self._txt_smin.setText(str(smin))
         self._txt_smax.setText(str(smax))
         if not self._syncing:
@@ -1089,7 +1147,8 @@ class EcosGUI(QMainWindow):
         self._syncing = True
         smin = max(0, int(round(x_range[0])))          # samples, as everything here
         smax = min(self._reclen, int(round(x_range[1])))
-        self._region.setRegion([smin, smax])
+        if valid_region((smin, smax), self._reclen) is not None:   # never an empty region
+            self._region.setRegion([smin, smax])
         self._syncing = False
 
     def _on_smin_smax_edited(self):
@@ -2181,8 +2240,49 @@ class EcosGUI(QMainWindow):
     # ==========================================================================
     #  Session collect / restore
     # ==========================================================================
+    # -- Smin–Smax region in the session: never empty or outside the record ----
+    def _session_notice(self, text):
+        """A note in the log (the console, as every ECOS message) about the session."""
+        self.session_notices.append(text)
+        print(f"[session] {text}")
+
+    def _default_region(self, reclen):
+        """Smin–Smax when there is no valid one: the synthetic SeDaq's window, else the
+        first quarter of the record (the default of a fresh installation)."""
+        if isinstance(self._sedaq, SimSeDaq):
+            good = valid_region(self._sedaq.default_window(), reclen)
+            if good is not None:
+                return good
+        return 0, max(MIN_REGION_SAMPLES, int(reclen) // 4)
+
+    def _restore_region(self, d):
+        """The session's region if valid for the session's record length; otherwise
+        discarded for the default, and said so."""
+        if "region" not in d:
+            return
+        try:
+            reclen = int(d.get("reclen", self._reclen))
+        except (TypeError, ValueError):
+            reclen = self._reclen
+        good = valid_region(d["region"], reclen)
+        if good is None:
+            good = self._default_region(reclen)
+            self._session_notice(
+                f"Smin–Smax region {d['region']!r} in the session is not valid for a record of "
+                f"{reclen} samples (empty, inverted or outside the record): discarded, using "
+                f"{list(good)}.")
+        self._region.setRegion(list(good))
+        self._last_good_region = good
+
     def _collect_session(self):
-        rmin, rmax = self._region.getRegion()
+        good = valid_region(self._region.getRegion(), self._reclen)
+        if good is None:                # never write an empty or out-of-range region
+            good = (getattr(self, '_last_good_region', None)
+                    or self._default_region(self._reclen))
+            self._session_notice(
+                f"Smin–Smax region {list(self._region.getRegion())} is not valid: the session "
+                f"saves {list(good)} instead.")
+        rmin, rmax = good
         return {
             "gain_ch1":              self._txt_gain_ch1.text(),
             "gain_ch2":              self._txt_gain_ch2.text(),
@@ -2232,9 +2332,7 @@ class EcosGUI(QMainWindow):
         if d.get("emission_blank") is not None:
             self._spin_blank.setValue(int(d["emission_blank"]))
             self._blank_from_session = True
-        region = d.get("region")
-        if region:
-            self._region.setRegion(region)
+        self._restore_region(d)
         self._cmb_excitation.setCurrentIndex(d.get("excitation_index", 0))
         self._txt_gen_fs.setText(d.get("gen_fs", str(DEFAULT_GEN_FS)))
         self._cmb_pulse_param.setCurrentIndex(d.get("pulse_param_index", 0))
