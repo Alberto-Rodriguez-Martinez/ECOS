@@ -274,6 +274,23 @@ class SimSeDaq:
         p = self.params
         return self.front_tof(x_beam, lat, z) + 2.0 * p.thickness * 1e-3 / p.c_sample
 
+    def default_window(self, margin_us=6.0):
+        """
+        (Smin, Smax) holding the front echo and the back wall at the reference point
+        (sample in focus), with margin_us on each side, but neither the main bang nor
+        the first water-path reverberation (at twice the front time of flight).
+        The default Smin–Smax of the GUI in simulator mode.
+        """
+        p = self.params
+        lat, z = p.lat0, p.z0
+        fs = p.fs
+        front = self.front_tof(p.x_focus, lat, z) * fs
+        back = self.back_tof(p.x_focus, lat, z) * fs
+        margin = margin_us * 1e-6 * fs
+        smin = max(int(1.0e-6 * fs), int(front - margin))          # past the main bang
+        smax = min(int(back + margin), int(2.0 * front - margin / 2), self.RecLen)
+        return smin, max(smax, int(front + margin))
+
     def expected_back_focus(self, lat=None, z=None):
         """Beam-axis position where the back-face echo peaks (the wrong answer)."""
         p = self.params

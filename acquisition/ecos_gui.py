@@ -79,6 +79,12 @@ _arg_parser.add_argument(
     "--scanner-sim", action="store_true",
     help="Use the scanner serial simulator and the synthetic SeDaq (implied by demo mode)."
 )
+_arg_parser.add_argument(
+    "--session", metavar="FILE", default=None,
+    help="GUI session file to restore and save (default: ecos_gui_session.json, or "
+         "ecos_gui_session_sim.json in simulator mode; also the ECOS_GUI_SESSION "
+         "environment variable). Tests pass a temporary one."
+)
 _ARGS = _arg_parser.parse_args()
 
 # Simulator mode: synthetic SeDaq (sim_sedaq.SimSeDaq) whose echoes follow the
@@ -156,9 +162,11 @@ ADC_FULL_SCALE = 2 ** ADC_BITS          # counts; midpoint = ADC_FULL_SCALE / 2
 
 DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'data')
 
-SESSION_FILE = os.path.join(
-    os.path.dirname(os.path.abspath(__file__)), 'ecos_gui_session.json'
-)
+# The hardware session (Smin–Smax, gains... of the real set-up) is never touched by a
+# simulator run: the simulator has its own file, and tests pass a temporary one.
+SESSION_FILE = (_ARGS.session or os.environ.get('ECOS_GUI_SESSION') or os.path.join(
+    os.path.dirname(os.path.abspath(__file__)),
+    'ecos_gui_session_sim.json' if _SIM_MODE else 'ecos_gui_session.json'))
 
 SIGNAL_YMIN = -0.5
 SIGNAL_YMAX =  0.5
@@ -275,6 +283,11 @@ class EcosGUI(QMainWindow):
         self._build_menu()
         self._btn_relay.setChecked(True)
         self._syncing = False
+
+        # Synthetic SeDaq: the default Smin–Smax holds its front echo and back wall
+        # (a saved simulator session may override it below).
+        if isinstance(self._sedaq, SimSeDaq):
+            self._region.setRegion(list(self._sedaq.default_window()))
 
         # ── Restore previous session ──────────────────────────────────────────
         if os.path.exists(SESSION_FILE):
