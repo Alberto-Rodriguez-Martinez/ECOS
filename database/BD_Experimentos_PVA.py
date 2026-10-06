@@ -96,7 +96,10 @@ def save_experiment_raw_32(
                         Signal_Ref=np.asarray(Signal_Ref, dtype=np.float64))
     return str(d)
 
-SCAN_SCHEMA_VERSION = "scan-32-3.1"
+SCAN_SCHEMA_VERSION = "scan-32-3.2"
+# 3.2 (2026-10-06): saturation per channel, kept apart: arrays saturated_ch1/ch2 and
+#     n_top_ch1/ch2, witness_n_top_ch1/ch2, ref_<which>_n_top_ch1/ch2; flag names
+#     saturated_ch1 / saturated_ch2 (3.1 had one Ch2 flag, 'saturated').
 # 3.1 (2026-10-06): the 'saturated' flag changes meaning: raw samples at the quantizer
 #     top in any capture, Smin-Smax (scan.saturation_criterion). Before: |x| >= 0.49 on
 #     the averaged float near the echo. Same arrays as 3.0; flags NOT comparable.
@@ -106,7 +109,8 @@ SCAN_SCHEMA_VERSION = "scan-32-3.1"
 #     per-point thickness values. A 2.0 file is still read (a line, all points valid).
 # 2.0 (2026-10): signals stored as integer sums of counts + conversion metadata.
 # 1.0 (float32 signals) is not readable any more: no real scan was ever saved with it.
-SCAN_SCHEMA_READABLE = ("scan-32-2.0", "scan-32-3.0", SCAN_SCHEMA_VERSION)
+SCAN_SCHEMA_READABLE = ("scan-32-2.0", "scan-32-3.0", "scan-32-3.1", SCAN_SCHEMA_VERSION)
+_SCAN_REF_OPTIONAL = ("n_top_ch1", "n_top_ch2")   # saturation of each channel (3.2)
 _SCAN_REF_FIELDS = ("sum1", "sum2", "offset1", "offset2", "avg_n", "gains", "coords",
                     "time", "T1", "T2")
 
@@ -153,7 +157,7 @@ def save_scan_raw_32(
 ):
     """
     Raw data of a scan (line or surface), one folder per scan:
-        <exp_name>/meta.json   schema scan-32-3.1: experiment (id, timestamps,
+        <exp_name>/meta.json   schema scan-32-3.2: experiment (id, timestamps,
                                operator), specimen, protocol, equipment, scanner_session,
                                scan, conversion, comment, and the description of scan.npz
         <exp_name>/scan.npz    (compressed) integer signals per channel
@@ -219,7 +223,7 @@ def save_scan_raw_32(
             continue
         taken.append(which)
         n_ref = int(ref["avg_n"])
-        for key in _SCAN_REF_FIELDS:
+        for key in _SCAN_REF_FIELDS + tuple(k for k in _SCAN_REF_OPTIONAL if k in ref):
             val = np.asarray(ref[key])
             if key in ("sum1", "sum2"):
                 val = _check_sums(f"reference {which} {key}", val, n_ref, adc_bits)

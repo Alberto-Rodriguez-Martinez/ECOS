@@ -121,7 +121,7 @@ class LineResult:
     center: float                # line centre [mm]
     xs: List[float]              # positions measured [mm]
     tof_samples: List[float]     # front-echo ToF from the emission sample, per point
-    flags: List[List[str]]       # per point: 'edge', 'outside', 'saturated', 'weak'
+    flags: List[List[str]]       # per point: 'edge', 'outside', 'saturated_ch2', 'weak'
     used: List[bool]             # per point: in the fit
     status: str = 'no_result'    # 'ok', 'out', 'undetermined', 'no_result'
     angle_deg: float = float('nan')
@@ -264,9 +264,10 @@ def _line_messages(res, measures):
                'no clear echo in the tracking band (defect of the face, or beam off the face)')
         msgs.append(f'Front-echo tracking lost at {_pts([res.xs[k] for k in inner])} mm: '
                     f'{why}. Left out of the fit.')
-    sat = [x for x, f in zip(res.xs, res.flags) if 'saturated' in f]
+    sat = [x for x, f in zip(res.xs, res.flags) if 'saturated_ch2' in f]
     if sat:
-        msgs.append(f'Signal saturated at {_pts(sat)} mm: lower the gain. Left out of the fit.')
+        msgs.append(f'Ch2 (PE) saturated at {_pts(sat)} mm: lower the gain of Ch2. Left out of '
+                    'the fit.')
     return msgs
 
 
@@ -568,7 +569,7 @@ class FlatnessTool(QObject):
             threshold=threshold, c_w=c_w, cw_source=cw_source, emission_sample=emission_sample,
             fs=ACQ_FS, pe_channel=PE_CHANNEL, notices=plan.notices,
             **measurement_meta(settle_ms, avg_n, host_value(self._gains_fn),
-                               host_value(self._temp_fn)),
+                               host_value(self._temp_fn), getattr(self._seq, 'emission_blank', None)),
         ), prefix='flatness_debug') if debug_dump else None
         self._plot.reset(lat)
         for text in plan.notices:
@@ -592,8 +593,9 @@ class FlatnessTool(QObject):
         sig = ch2 if PE_CHANNEL == 2 else ch1
         if self._dump is not None:
             self._last_record = np.array(sig, dtype=float)
-        return self._tracker.measure(sig, self._plan.beam_x,     # saturation: raw, Smin–Smax
-                                     self._seq.top_count(PE_CHANNEL, self._tracker.window))
+        w = self._tracker.window                             # saturation: raw, Smin–Smax
+        return self._tracker.measure(sig, self._plan.beam_x, self._seq.top_count(PE_CHANNEL, w),
+                                     self._seq.top_count(1, w))
 
     def _start_phase(self, phase):
         self._phase = phase
@@ -654,7 +656,7 @@ class FlatnessTool(QObject):
         self._plot.set_points(self._phase, [xx - center for xx in self._xs], disp,
                               [bool(f) for f in flags])
         new = [k for k, f in enumerate(flags) if f and k not in self._warned
-               and ('edge' in f or 'saturated' in f)]
+               and ('edge' in f or 'saturated_ch2' in f)]
         if new:
             self._warned.update(new)
             self.warning.emit(f'{"Lateral" if self._phase == "lateral" else "Z"} line: unreliable '

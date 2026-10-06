@@ -65,7 +65,7 @@ class PeakMeasure:
     amp: float            # envelope peak of the echo used
     index: int            # absolute sample index of that peak
     at_edge: bool         # a clear peak within the edge margin of Smin or Smax
-    saturated: bool       # n_top > 0: raw samples at the quantizer top in Smin–Smax
+    saturated: bool       # PE channel (Ch2): n_top > 0, raw samples at the quantizer top
     contrast: float = float('inf')   # peak / median of the envelope in the window
     # Which echo was used:
     #   'max'      window maximum (window_peak, no tracking)
@@ -81,7 +81,12 @@ class PeakMeasure:
     echo_elsewhere: bool = False              # tracked: a clear echo in the window, off the band
     # Raw samples at the top of the quantizer in Smin–Smax, any capture of the
     # acquisition (scan_counts.top_mask / count_at_top); None: not checked (no raw counts).
+    # Per channel, kept apart: Ch2 (n_top, saturated) is the channel this echo is measured
+    # on and makes the measure 'flagged'; Ch1 (transmission) does not invalidate a
+    # pulse-echo measure but does invalidate what uses Ch1 (water references, Ch1 ToF).
     n_top: Optional[int] = None
+    n_top_ch1: Optional[int] = None
+    saturated_ch1: bool = False
 
     @property
     def flagged(self):
@@ -122,16 +127,19 @@ def _peak_measure(seg, env, smin, k, edge_margin, **extra):
     return PeakMeasure(float(env[k]), smin + int(k), at_edge, False, contrast, **extra)
 
 
-def set_saturation(m, n_top):
+def set_saturation(m, n_top, n_top_ch1=None):
     """
     Saturation of a measure from the RAW counts of its acquisition: n_top samples
     at the top of the quantizer in Smin–Smax, in any capture (scan_counts.top_mask
     and count_at_top, the one detection of ECOS). The float the echo is measured on
     has been averaged and has its mean removed, so it cannot tell for certain.
-    None: no raw counts available, not checked (saturated stays False).
+    None: no raw counts available, not checked (saturated stays False). n_top is the PE
+    channel (Ch2), n_top_ch1 the transmission channel, each with its own mark.
     """
     m.n_top = None if n_top is None else int(n_top)
     m.saturated = bool(n_top)
+    m.n_top_ch1 = None if n_top_ch1 is None else int(n_top_ch1)
+    m.saturated_ch1 = bool(n_top_ch1)
     return m
 
 
@@ -147,12 +155,12 @@ def subsample_peak(env, k):
     return k + 0.5 * (y0 - y2) / den
 
 
-def window_peak(sig, smin, smax, edge_margin=DEFAULT_EDGE_MARGIN, n_top=None):
+def window_peak(sig, smin, smax, edge_margin=DEFAULT_EDGE_MARGIN, n_top=None, n_top_ch1=None):
     """Envelope maximum of sig[smin:smax] (never the whole record). No tracking.
     n_top: raw samples at the quantizer top in Smin–Smax (set_saturation)."""
     seg, env = _window_env(sig, smin, smax)
     return set_saturation(_peak_measure(seg, env, smin, int(np.argmax(env)), edge_margin),
-                          n_top)
+                          n_top, n_top_ch1)
 
 
 def echo_threshold(env, fraction=DEFAULT_THRESHOLD):
@@ -252,7 +260,7 @@ class FrontEchoTracker:
     def new_sweep(self):
         self.measures: List[PeakMeasure] = []
         self.relocks: List[int] = []        # indices in this sweep where it re-locked
-        self._points = []                   # (x, seg, env, n_top) kept for a re-lock
+        self._points = []                   # (x, seg, env, (n_top, n_top_ch1)) for a re-lock
 
     def predict(self, x, anchor=None):
         anchor = anchor if anchor is not None else self.anchor
@@ -260,19 +268,20 @@ class FrontEchoTracker:
             return None
         return anchor[1] + self.samples_per_mm * (float(x) - anchor[0])
 
-    def measure(self, sig, x, n_top=None):
-        """n_top: raw samples at the quantizer top in Smin–Smax for this acquisition
-        (set_saturation); None when the caller has no raw counts."""
+    def measure(self, sig, x, n_top=None, n_top_ch1=None):
+        """n_top, n_top_ch1: raw samples at the quantizer top in Smin–Smax for this
+        acquisition, Ch2 and Ch1 (set_saturation); None when the caller has no raw counts."""
         smin, smax = self.window
         seg, env = _window_env(sig, smin, smax)
         x = float(x)
-        m = set_saturation(self._locate(seg, env, x, self.anchor, allow_relock=True), n_top)
+        m = set_saturation(self._locate(seg, env, x, self.anchor, allow_relock=True), n_top,
+                           n_top_ch1)
         if m.mode in ('first', 'relock') or (m.mode == 'tracked' and m.confident):
             self.anchor = (x, m.index)
         if m.mode == 'relock':
             self.relocks.append(len(self.measures))
             self._retrack_backwards()
-        self._points.append((x, seg, env, n_top))
+        self._points.append((x, seg, env, (n_top, n_top_ch1)))
         self.measures.append(m)
         return m
 
@@ -333,8 +342,8 @@ class FrontEchoTracker:
         """After a re-lock: the earlier points of this sweep, predicted from the new anchor."""
         anchor = self.anchor
         for j in range(len(self._points) - 1, -1, -1):
-            x, seg, env, n_top = self._points[j]
-            m = set_saturation(self._locate(seg, env, x, anchor, allow_relock=False), n_top)
+            x, seg, env, tops = self._points[j]
+            m = set_saturation(self._locate(seg, env, x, anchor, allow_relock=False), *tops)
             self.measures[j] = m
             if m.confident:
                 anchor = (x, m.index)

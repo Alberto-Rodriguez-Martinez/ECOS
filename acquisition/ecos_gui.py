@@ -156,7 +156,9 @@ AVG_MAX_ATTEMPTS_FACTOR = 4  # captures tried per requested average before givin
 # ECOS until now (density_gui / pulser_gui let the user pick it, default 10 bit).
 # It is a parameter: the quantizer midpoint and full scale come from it, and
 # every scan writes it into its metadata (database/scan_counts.py).
-from scan_counts import ADC_BITS_DEFAULT, count_at_top, counts_to_float, top_mask  # noqa: E402
+from scan_counts import (  # noqa: E402
+    ADC_BITS_DEFAULT, count_at_top, counts_to_float, default_emission_blank, top_mask,
+)
 ADC_BITS = ADC_BITS_DEFAULT
 ADC_FULL_SCALE = 2 ** ADC_BITS          # counts; midpoint = ADC_FULL_SCALE / 2
 
@@ -620,6 +622,25 @@ class EcosGUI(QMainWindow):
         form.addRow("Gain Ch2 (dB):", self._txt_gain_ch2)
         form.addRow("Voltage:",        self._txt_voltage)
         form.addRow("RecLen:",         self._txt_reclen)
+        # Live saturation indicator: blanking of the emission zone (the main bang reaches
+        # the quantizer top by design and would keep the indicator always on)
+        self._spin_blank = QSpinBox()
+        self._spin_blank.setRange(0, DEFAULT_RECLEN)
+        self._spin_blank.setSuffix(" samples")
+        self._spin_blank.setToolTip(
+            "Samples from the start of the record left out of the live saturation "
+            "indicator (the excitation pulse clips by design). The indicator covers from "
+            "here to the end of the record, so it still sees clipping outside Smin-Smax. "
+            "Auto: end of the main bang in the current record + 0.5 µs.")
+        self._spin_blank.valueChanged.connect(self._on_blank_changed)
+        btn_blank = QPushButton("Auto")
+        btn_blank.setToolTip("Estimate it from the current record")
+        btn_blank.clicked.connect(self._auto_emission_blank)
+        blank_row = QHBoxLayout()
+        blank_row.addWidget(self._spin_blank)
+        blank_row.addWidget(btn_blank)
+        form.addRow("Emission blanking:", blank_row)
+        self._blank_from_session = False
         form.addRow("",                self._btn_relay)
         form.addRow(type_row)
         form.addRow("Generator Fs:",   self._txt_gen_fs)
@@ -889,23 +910,43 @@ class EcosGUI(QMainWindow):
             ch1 = self._raw_to_float(self._sedaq.DataADC1, self._reclen, quant)
             ch2 = self._raw_to_float(self._sedaq.DataADC2, self._reclen, quant)
             self._plot_ascans(ch1, ch2)
-            self._show_saturation(tuple(
-                top_mask(np.asarray(buf[:self._reclen]), ADC_BITS)
-                for buf in (self._sedaq.DataADC1, self._sedaq.DataADC2)))
+            self._last_raw = tuple(np.asarray(buf[:self._reclen])
+                                   for buf in (self._sedaq.DataADC1, self._sedaq.DataADC2))
+            if not self._blank_from_session:          # no saved value: from the record, once
+                self._auto_emission_blank()
+            self._show_saturation(tuple(top_mask(r, ADC_BITS) for r in self._last_raw))
         except Exception as e:
             print(f"[_update_plots] {e}")
 
     def _show_saturation(self, tops):
         """Red indicator next to each channel name, only when its last acquisition has
         raw samples at the quantizer top (scan_counts.top_mask, the one detection of
-        ECOS). The whole record: any clipping is worth seeing here, also the main bang,
-        which the measurement flags ignore (they look at Smin–Smax only)."""
+        ECOS), from the end of the emission blanking to the end of the record: any
+        clipping is worth seeing, also outside Smin–Smax (the measurement flags look at
+        Smin–Smax only), but not the main bang, which clips by design."""
         for ch, mask in zip((1, 2), tops):
-            n = count_at_top(mask)
+            n = count_at_top(mask, self._indicator_span(len(mask)))
             lbl = self._lbl_sat[ch]
             lbl.setText(f"SATURATED: {n} sample{'s' if n != 1 else ''} at full scale"
                         if n else "")
             lbl.setVisible(n > 0)
+
+    def _indicator_span(self, reclen):
+        """Samples the live saturation indicator covers: blanking .. end of record."""
+        return (min(self._spin_blank.value(), reclen), reclen)
+
+    def _on_blank_changed(self, value):
+        self._blank_from_session = True        # set (by hand, Auto or the session): keep it
+        if getattr(self, '_sequencer', None) is not None:
+            self._sequencer.emission_blank = int(value)     # into the tools' metadata
+
+    def _auto_emission_blank(self):
+        """Blanking from the current record: end of the main bang + margin."""
+        raws = getattr(self, '_last_raw', None)
+        if raws is None:
+            return
+        self._spin_blank.setValue(default_emission_blank(raws, DEFAULT_ACQ_FS))
+        self._blank_from_session = True
 
     def _plot_ascans(self, ch1, ch2):
         """Draw one pair of full-record A-scans on the zoom and overview plots."""
@@ -1050,6 +1091,7 @@ class EcosGUI(QMainWindow):
             print(f"[SetRecLen] {e}")
         self._plot_ov.setXRange(0, reclen - 1, padding=0)
         self._plot_ov.setLimits(xMin=0, xMax=reclen - 1)
+        self._spin_blank.setMaximum(reclen)
         self._region.setBounds([0, reclen])
         rmin, rmax = self._region.getRegion()
         self._region.setRegion([max(0, rmin), min(reclen, rmax)])
@@ -1342,6 +1384,8 @@ class EcosGUI(QMainWindow):
             top_fn=lambda: getattr(self, '_last_top', None),
             parent=self,
         )
+        self._sequencer.emission_blank = (self._spin_blank.value()
+                                          if self._blank_from_session else None)
         seq = self._sequencer
         panel.stop_pressed.connect(seq.abort)
         seq.started.connect(self._on_seq_started)
@@ -1465,7 +1509,7 @@ class EcosGUI(QMainWindow):
         elif m.at_edge:
             text += " · at a window edge"
         if m.saturated:
-            text += " · saturated"
+            text += " · Ch2 saturated"
         label.setText(text, color=(235, 60, 60) if m.flagged else (0, 220, 120))
         label.setPos(x, SIGNAL_YMAX)
         peak.show()
@@ -2073,6 +2117,7 @@ class EcosGUI(QMainWindow):
             "region":                [rmin, rmax],
             "cursor":                self._chk_cursor.isChecked(),
             "full_scale_lines":      self._chk_fullscale.isChecked(),
+            "emission_blank":        self._spin_blank.value(),
             "excitation_index":      self._cmb_excitation.currentIndex(),
             "gen_fs":                self._txt_gen_fs.text(),
             "pulse_param_index":     self._cmb_pulse_param.currentIndex(),
@@ -2109,6 +2154,9 @@ class EcosGUI(QMainWindow):
         self._btn_relay.setChecked(d.get("relay", True))
         self._chk_cursor.setChecked(d.get("cursor", True))
         self._chk_fullscale.setChecked(d.get("full_scale_lines", True))
+        if d.get("emission_blank") is not None:
+            self._spin_blank.setValue(int(d["emission_blank"]))
+            self._blank_from_session = True
         region = d.get("region")
         if region:
             self._region.setRegion(region)

@@ -106,6 +106,9 @@ class ScanSequencer(QObject):
         self._leave_hook = leave_exclusive
         self._top_fn = top_fn
         self.last_top = None       # (mask_ch1, mask_ch2) of the last point's acquisition
+        # Blanking of the live saturation indicator (samples from the record start), set
+        # by the host; only written into the tools' metadata. None: not set.
+        self.emission_blank = None
 
         self._active = False
         self._state = 'idle'

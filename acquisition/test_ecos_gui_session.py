@@ -20,6 +20,7 @@ os.environ.setdefault('QT_QPA_PLATFORM', 'offscreen')
 _HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, _HERE)
 
+import numpy as np  # noqa: E402
 from PyQt5.QtWidgets import QApplication, QMessageBox  # noqa: E402
 
 HW_SESSION = os.path.join(_HERE, 'ecos_gui_session.json')
@@ -211,7 +212,8 @@ class TestFullScaleLines(_LiveWindow):
 
 
 class TestSaturationIndicator(_LiveWindow):
-    """Red indicator per channel, from the raw counts of the last acquisition."""
+    """Red indicator per channel, from the raw counts of the last acquisition, from the
+    end of the emission blanking to the end of the record."""
 
     def setUp(self):
         super().setUp()
@@ -258,19 +260,64 @@ class TestSaturationIndicator(_LiveWindow):
             items = [row.itemAt(i).widget() for i in range(row.count())]
             self.assertEqual(items.index(self.lbl[ch]), items.index(chk) + 1)
 
-    def raw_count(self, buf):
-        return self.count_at_top(self.top_mask(buf[:self.win._reclen]))
+    def span(self):
+        return (self.win._spin_blank.value(), self.win._reclen)
 
-    def test_live_refresh_whole_record(self):
-        self.sim.SetGain1(self.sim.params.gain_ref_ch1 + 30.0)     # Ch1 clips (0.43 → 1.4)
+    def raw_count(self, buf, span=None):
+        return self.count_at_top(self.top_mask(buf[:self.win._reclen]), span)
+
+    def live(self):
         self.win._running, self.win._inspection_mode = True, False
         self.win._update_plots()
-        n1 = self.raw_count(self.sim.DataADC1)
+
+    def test_live_refresh_blanking_to_end_of_record(self):
+        self.sim.SetGain1(self.sim.params.gain_ref_ch1 + 30.0)     # Ch1 clips (0.43 → 1.4)
+        self.live()
+        n1 = self.raw_count(self.sim.DataADC1, self.span())
         self.assertGreater(n1, 0)
         self.assertTrue(self.lbl[1].isVisible())
         self.assertIn(f'{n1} samples', self.lbl[1].text())
-        # Ch2: the simulator's main bang clips on purpose; the whole record is checked
-        self.assertEqual(self.lbl[2].isVisible(), self.raw_count(self.sim.DataADC2) > 0)
+
+    def test_main_bang_blanked_by_default(self):
+        """The simulator's main bang clips by design: blanked, the indicator stays off."""
+        from scan_counts import default_emission_blank
+        self.live()                                           # first record, no session
+        raw1, raw2 = self.win._last_raw
+        blank = self.win._spin_blank.value()
+        self.assertEqual(blank, default_emission_blank((raw1, raw2), 100e6))
+        top = np.flatnonzero(self.top_mask(raw2))
+        self.assertGreater(top.size, 0)                       # the bang does reach the top …
+        self.assertLess(top.max(), blank)                     # … all of it inside the blanking
+        self.assertLess(blank, self.win._get_smin_smax()[0])  # and it stops before Smin
+        self.assertFalse(self.lbl[2].isVisible())
+        self.live()
+        self.assertFalse(self.lbl[2].isVisible())             # stays off
+
+    def test_clipping_outside_smin_smax_still_seen(self):
+        self.live()
+        blank, (smin, _) = self.win._spin_blank.value(), self.win._get_smin_smax()
+        mask = np.zeros(self.win._reclen, dtype=bool)
+        mask[(blank + smin) // 2] = True                       # after the blanking, before Smin
+        self.win._show_saturation((mask, np.zeros_like(mask)))
+        self.assertTrue(self.lbl[1].isVisible())
+        mask[:] = False
+        mask[blank - 1] = True                                # inside the blanking
+        self.win._show_saturation((mask, np.zeros_like(mask)))
+        self.assertFalse(self.lbl[1].isVisible())
+
+    def test_blanking_saved_in_the_session_and_in_the_sequencer(self):
+        self.live()
+        self.win._spin_blank.setValue(321)
+        self.assertEqual(self.win._sequencer.emission_blank, 321)
+        self.win.close()
+        with open(_ENV['session']) as f:
+            self.assertEqual(json.load(f)['emission_blank'], 321)
+        win2 = _ENV['gui'].EcosGUI()                          # restored, not re-estimated
+        self.addCleanup(win2.close)
+        win2._running, win2._inspection_mode = True, False
+        win2._update_plots()
+        self.assertEqual(win2._spin_blank.value(), 321)
+        self.assertEqual(win2._sequencer.emission_blank, 321)
 
     def test_sequence_acquisition_any_capture(self):
         import numpy as np
@@ -278,7 +325,7 @@ class TestSaturationIndicator(_LiveWindow):
         self.win._seq_acquire(4)
         top1 = self.win._last_top[0]
         self.assertTrue(self.lbl[1].isVisible())
-        self.assertIn(f'{self.count_at_top(top1)} samples', self.lbl[1].text())
+        self.assertIn(f'{self.count_at_top(top1, self.span())} samples', self.lbl[1].text())
         self.assertIs(self.win._last_counts['top'], self.win._last_top)
         self.sim.SetGain1(self.sim.params.gain_ref_ch1)             # back to normal
         self.win._seq_acquire(4)

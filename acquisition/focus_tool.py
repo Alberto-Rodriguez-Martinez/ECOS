@@ -64,7 +64,8 @@ point as it arrives, reported at once and marked on the plot (point_flags):
       takes the strongest point with a clear echo as reference and moves it
       2/c_w per mm, with the sign given by the PE side (spec section 2); the
       tracker also sets it directly when its prediction band is out;
-    - 'saturated': the signal reaches full scale around the echo used.
+    - 'saturated_ch2': raw samples of the PE channel at the quantizer top in Smin–Smax
+      (any capture; scan_counts.top_mask). Ch1 has its own mark, kept apart.
 A coarse curve with any marked point is incomplete (the true maximum may be
 hidden where the echo was out): the tool then does not move.
 
@@ -91,10 +92,12 @@ from echo_tracking import (  # window_peak, PeakMeasure: re-exported for ecos_gu
 from scan_sequencer import DEFAULT_AVG_N, DEFAULT_SETTLE_MS
 from scan_counts import SATURATION_CRITERION  # noqa: E402  (database/, put on the path above)
 
-# The 'saturated' flag of every scanner tool, from 2026-10-06 (written in every dump
-# and scan file). Before: |x| >= 0.49 on the averaged, mean-removed float, in the
-# band around the tracked echo. Flags before and after are NOT comparable.
-SATURATION_FLAG = SATURATION_CRITERION + '; PE channel (Ch2), Smin-Smax only'
+# The saturation marks of every scanner tool, from 2026-10-06 (written in every dump
+# and scan file). Before: one 'saturated' flag, |x| >= 0.49 on the averaged,
+# mean-removed float of Ch2, in the band around the tracked echo. Flags before and
+# after are NOT comparable.
+SATURATION_FLAG = (SATURATION_CRITERION + '; each channel apart (saturated_ch1, '
+                   'saturated_ch2), Smin-Smax only')
 
 PE_CHANNEL = 2                 # ecos_gui.py: s_PE is Ch2
 DEFAULT_HALF_RANGE_MM = 5.0
@@ -119,7 +122,9 @@ POSITION_DECIMALS = 2          # X/Y resolve 0.01 mm
 def point_flags(xs, measures, window, edge_margin=DEFAULT_EDGE_MARGIN, samples_per_mm=None):
     """
     Per point, the reasons its measure cannot be trusted: a list of lists among
-    'edge', 'outside', 'saturated' (empty list: fine). See the module docstring.
+    'edge', 'outside', 'saturated_ch2' (empty list: fine). See the module docstring.
+    Only what makes the pulse-echo measure unreliable: a clipped Ch1 is kept apart
+    (PeakMeasure.saturated_ch1), it does not invalidate a PE measure.
     samples_per_mm None: no prediction ('outside' never set).
     """
     smin, smax = window
@@ -132,7 +137,7 @@ def point_flags(xs, measures, window, edge_margin=DEFAULT_EDGE_MARGIN, samples_p
         if m.outside:
             f.append('outside')
         if m.saturated:
-            f.append('saturated')
+            f.append('saturated_ch2')
         flags.append(f)
     if samples_per_mm is None:
         return flags
@@ -159,8 +164,8 @@ def describe_flags(flags):
         text.append('echo pinned at an edge of Smin–Smax')
     if 'outside' in flags:
         text.append('front echo lost (predicted outside Smin–Smax)')
-    if 'saturated' in flags:
-        text.append('signal saturated')
+    if 'saturated_ch2' in flags:
+        text.append('signal saturated (Ch2)')
     return ', '.join(text)
 
 
@@ -179,8 +184,8 @@ def flag_fixes(kinds, echo_elsewhere=False):
             fix.append('Check the PE side in the session settings (with the wrong side the '
                        'prediction moves opposite to the echo); if it is right, the echo left '
                        'the window: widen Smin–Smax.')
-    if 'saturated' in kinds:
-        fix.append('Lower the gain.')
+    if 'saturated_ch2' in kinds:
+        fix.append('Lower the gain of Ch2.')
     return ' '.join(fix)
 
 
@@ -227,19 +232,21 @@ def format_duration(seconds):
     return f'{h} h {m:02d} min'
 
 
-def measurement_meta(settle_ms, avg_n, gains=None, temperature=None):
+def measurement_meta(settle_ms, avg_n, gains=None, temperature=None, emission_blank=None):
     """
     The measurement parameters every debug dump writes into meta_json, with the
     same keys in the three tools (focus, flatness, scan), so dumps can be compared
     with each other: settle_ms, avg_n, gain_ch1_db, gain_ch2_db, temperature
     ({'T1', 'T2', 'time', 'source'} of the reading available at that moment, or None)
-    and saturation_criterion (what the 'saturated' flag means: it changed on 06/10).
-    gains: (g1, g2) or None (unknown).
+    and saturation_criterion (what the saturation marks mean: they changed on 06/10),
+    with emission_blank_samples, the blanking of the live saturation indicator (samples
+    from the record start; None: not set). gains: (g1, g2) or None (unknown).
     """
     g1, g2 = (None, None) if gains is None else (float(gains[0]), float(gains[1]))
     return {'settle_ms': int(settle_ms), 'avg_n': int(avg_n),
             'gain_ch1_db': g1, 'gain_ch2_db': g2, 'temperature': temperature,
-            'saturation_criterion': SATURATION_FLAG}
+            'saturation_criterion': SATURATION_FLAG,
+            'emission_blank_samples': None if emission_blank is None else int(emission_blank)}
 
 
 def host_value(fn):
@@ -634,7 +641,9 @@ class FocusDebugDump:
                                       from mode when a later re-lock re-measured it
         revised           (n,) bool   mode/value changed by a later re-lock
         contrast          (n,)        peak / median of the envelope
-        flags             (n,) str    'edge', 'outside', 'saturated', comma separated
+        flags             (n,) str    'edge', 'outside', 'saturated_ch2', comma separated
+        n_top_ch1/ch2     (n,) int    raw samples at the quantizer top in Smin–Smax, per
+                                      channel (-1: not checked)
         meta_json         ()   str    run parameters and result (JSON)
     With a re-lock the earlier points of that sweep hold the revised measure
     (the one the curve and the result used); their window/envelope do not change.
@@ -702,6 +711,10 @@ class FocusDebugDump:
             revised=np.array([m.mode != d['mode_at_measure'] or m.amp != d['amp_at_measure']
                               for m, d in zip(ms, e)]),
             contrast=np.array([m.contrast for m in ms]),
+            n_top_ch1=np.array([-1 if m.n_top_ch1 is None else m.n_top_ch1 for m in ms],
+                               dtype=np.int64),
+            n_top_ch2=np.array([-1 if m.n_top is None else m.n_top for m in ms],
+                               dtype=np.int64),
             flags=np.array([d['flags'] for d in e]),
             meta_json=np.array(json.dumps(self.meta, default=str)),
             **self._extra_arrays())
@@ -941,7 +954,7 @@ class FocusTool(QObject):
             samples_per_mm=plan.samples_per_mm, fs=ACQ_FS, pe_channel=PE_CHANNEL,
             coarse_positions=plan.coarse_positions, notices=plan.notices,
             **measurement_meta(settle_ms, avg_n, host_value(self._gains_fn),
-                               host_value(self._temp_fn)),
+                               host_value(self._temp_fn), getattr(self._seq, 'emission_blank', None)),
         )) if debug_dump else None
         self._plot.reset(axis)
         for text in plan.notices:
@@ -961,8 +974,10 @@ class FocusTool(QObject):
         x = self._panel.current_coords()[self._axis]
         if self._dump is not None:
             self._last_record = np.array(sig, dtype=float)
-        tracker = self._plan.tracker      # saturation: raw counts in Smin–Smax
-        return tracker.measure(sig, x, self._seq.top_count(PE_CHANNEL, tracker.window))
+        tracker = self._plan.tracker      # saturation: raw counts in Smin–Smax, per channel
+        w = tracker.window
+        return tracker.measure(sig, x, self._seq.top_count(PE_CHANNEL, w),
+                               self._seq.top_count(1, w))
 
     def _start_phase(self, phase, xs):
         self._phase = phase

@@ -235,6 +235,7 @@ class StabilityTool(QObject):
         self._tracker.new_sweep()
         self._t0 = None
         self._ref = None
+        self._sat_warned = set()
         self.t_s, self.epoch, self.T1, self.T2 = [], [], [], []
         self.face_um, self.ch1_dtof_ns, self.amp2_db, self.amp1_db = [], [], [], []
         self.temp_reads = []
@@ -251,7 +252,8 @@ class StabilityTool(QObject):
             band_us=params.band_us, threshold=params.threshold,
             emission_sample=params.emission_sample, fs=ACQ_FS, pe_channel=PE_CHANNEL,
             **measurement_meta(params.interval_s * 1000.0, params.avg_n, g,
-                               start if start is not None and start['ok'] else None),
+                               start if start is not None and start['ok'] else None,
+                               getattr(self._seq, 'emission_blank', None)),
         ), prefix='stability_debug')
         self._plot.reset()
         reason = self._seq.start([{}] * params.n, int(round(params.interval_s * 1000.0)),
@@ -329,8 +331,9 @@ class StabilityTool(QObject):
     # -- per point -------------------------------------------------------------
     def _measure(self, ch1, ch2):
         sig = ch2 if PE_CHANNEL == 2 else ch1
-        m = self._tracker.measure(sig, self._beam_x,             # saturation: raw, Smin–Smax
-                                  self._seq.top_count(PE_CHANNEL, self._tracker.window))
+        w = self._tracker.window                                 # saturation: raw, Smin–Smax
+        m = self._tracker.measure(sig, self._beam_x, self._seq.top_count(PE_CHANNEL, w),
+                                  self._seq.top_count(1, w))
         self._last = (np.array(ch1, dtype=float), np.array(sig, dtype=float))
         return m
 
@@ -367,6 +370,13 @@ class StabilityTool(QObject):
         self.T2.append(temp['T2'] if temp else float('nan'))
         dtof, _, _ = CalcToFAscanCosine_XCRFFT(ch1, self._ref['ch1'])
         self.ch1_dtof_ns.append(float(dtof) / ACQ_FS * 1e9)
+        for ch, n in (('Ch1 (transmission): its ΔToF and amplitude', value.n_top_ch1),
+                      ('Ch2 (PE): the face position', value.n_top)):
+            if n and ch not in self._sat_warned:            # raw counts, Smin–Smax
+                self._sat_warned.add(ch)
+                self.warning.emit(f'{ch.split(":")[0]} saturated ({n} samples at full scale in '
+                                  f'Smin–Smax) from measure {i}: {ch.split(": ")[1]} are not '
+                                  'reliable while it lasts. Lower its gain.')
         self.amp1_db.append(to_db(np.max(Envelope(ch1))) - to_db(self._ref['amp1']))
         # Ch2 face position from the (possibly re-lock revised) tracker measures
         tof = np.array([m.index_frac for m in measures])

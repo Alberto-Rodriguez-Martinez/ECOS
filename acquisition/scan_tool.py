@@ -97,7 +97,7 @@ _DB_DIR = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__
                                         'database'))
 if _DB_DIR not in sys.path:
     sys.path.insert(0, _DB_DIR)
-from scan_counts import ADC_BITS_DEFAULT, counts_to_float  # noqa: E402
+from scan_counts import ADC_BITS_DEFAULT, count_at_top, counts_to_float  # noqa: E402
 
 PE_CHANNEL = 2
 # Settle between neighbouring points of a line. MEASURED on the real equipment
@@ -310,6 +310,10 @@ SCAN_ARRAYS_DOC = {
                      'where there is no echo 2)',
     'echo_polarity': 'int8 (N_line, N_point): +1 / -1 polarity of echo 2 relative to echo 1, '
                      '0 not measured',
+    'saturated_ch1/ch2': 'bool (N_line, N_point): the channel had raw samples at the quantizer '
+                         'top in Smin-Smax in any capture of the point (scan.saturation_'
+                         'criterion); one mark per channel, never combined',
+    'n_top_ch1/ch2': 'int64 (N_line, N_point): how many such samples; -1 not checked',
 }
 PT100_NOTE = ('The PT100 probes are at the bottom of the tank, NOT in the beam path. Measured '
               'on 05/10: 0.07 K in the boundary layer around a freshly immersed piece is worth '
@@ -622,8 +626,13 @@ def reference_drift(initial, final, fs=ACQ_FS, tol_db=DEFAULT_DRIFT_DB, tol_ns=D
         ea, eb = Envelope(a), Envelope(b)
         ca = float(np.max(ea) / np.median(ea)) if np.median(ea) > 0 else float('inf')
         cb = float(np.max(eb) / np.median(eb)) if np.median(eb) > 0 else float('inf')
+        # a reference clipped on this channel is not a measure of it (raw counts)
+        clipped = [w for w, ref in (('initial', initial), ('final', final))
+                   if (ref.get(f'n_top_{ch}') or 0) > 0]
         r = {'amp_initial': float(np.max(ea)), 'amp_final': float(np.max(eb)),
-             'clear': bool(ca >= CONFIDENT_CONTRAST and cb >= CONFIDENT_CONTRAST)}
+             'saturated_in': clipped,
+             'clear': bool(ca >= CONFIDENT_CONTRAST and cb >= CONFIDENT_CONTRAST
+                           and not clipped)}
         if r['clear']:
             r['d_db'] = 20.0 * math.log10(r['amp_final'] / r['amp_initial'])
             dtof, _, _ = CalcToFAscanCosine_XCRFFT(b, a)
@@ -640,7 +649,10 @@ def reference_drift(initial, final, fs=ACQ_FS, tol_db=DEFAULT_DRIFT_DB, tol_ns=D
 def drift_lines(drift):
     lines = []
     r = drift[DRIFT_CHANNEL]
-    if not r['clear']:
+    if r.get('saturated_in'):
+        lines.append('Reference drift (Ch1, transmission): Ch1 saturated in the '
+                     + ' and '.join(r['saturated_in']) + ' reference: drift NOT measured.')
+    elif not r['clear']:
         lines.append('Reference drift (Ch1, transmission): no clear signal in the references: '
                      'drift NOT measured.')
     else:
@@ -658,7 +670,7 @@ def scan_messages(xs, flags, measures):
     msgs = []
     edge = [x for x, f in zip(xs, flags) if 'edge' in f]
     lost = [k for k, f in enumerate(flags) if 'weak' in f or 'outside' in f]
-    sat = [x for x, f in zip(xs, flags) if 'saturated' in f]
+    sat = [x for x, f in zip(xs, flags) if 'saturated_ch2' in f]
     if edge:
         msgs.append(f'Echo pinned at an edge of Smin–Smax at {_pts(edge)} mm: the window is too '
                     'narrow, widen Smin–Smax on the Acquisition tab.')
@@ -670,7 +682,12 @@ def scan_messages(xs, flags, measures):
         msgs.append(f'Front-echo tracking lost at {_pts([xs[k] for k in lost])} mm: {why}. '
                     'Marked; the scan goes on (ToF = NaN there).')
     if sat:
-        msgs.append(f'Signal saturated at {_pts(sat)} mm: lower the gain.')
+        msgs.append(f'Ch2 (PE) saturated at {_pts(sat)} mm: lower the gain of Ch2.')
+    sat1 = [x for x, m in zip(xs, measures) if getattr(m, 'saturated_ch1', False)]
+    if sat1:
+        msgs.append(f'Ch1 (transmission) saturated at {_pts(sat1)} mm: the transmission signal '
+                    'there is clipped (the pulse-echo values are not affected); lower the gain '
+                    'of Ch1.')
     no_back = [x for x, f in zip(xs, flags) if 'no_back' in f]
     low = [x for x, f in zip(xs, flags) if 'low_corr' in f]
     if no_back:
@@ -701,7 +718,7 @@ def point_marked(magnitude, flags):
         return bool(flags)
     if MAGNITUDES[magnitude].uses_echo:
         return any(f not in THICKNESS_FLAGS for f in flags)
-    return 'saturated' in flags or 'edge' in flags
+    return 'saturated_ch2' in flags or 'edge' in flags
 
 
 THICKNESS_REASONS = {
@@ -1140,7 +1157,8 @@ class ScanTool(QObject):
             has_t = start_t['T1'] == start_t['T1'] or start_t['T2'] == start_t['T2']
             self._dump.meta.update(measurement_meta(
                 params.settle_ms, params.avg_n, self._scan_gains,
-                dict(start_t, source='PT100, scan start') if has_t else None))
+                dict(start_t, source='PT100, scan start') if has_t else None,
+                getattr(self._seq, 'emission_blank', None)))
         self._resolve_cw()
         for text in plan.notices:
             self.warning.emit(text)
@@ -1286,6 +1304,12 @@ class ScanTool(QObject):
         self._take_reference('initial')
         return None
 
+    def _last_tops(self):
+        """(mask_ch1, mask_ch2) of the last acquisition: raw samples at the quantizer top
+        (scan_counts.top_mask), or None when the host gives no raw counts."""
+        lc = self._counts_fn() if self._counts_fn is not None else None
+        return (lc or {}).get('top')
+
     def _last_counts(self, smin, smax):
         """Window of the integer sums of the last acquisition, and the offsets."""
         lc = self._counts_fn()
@@ -1308,6 +1332,10 @@ class ScanTool(QObject):
             'gains': [float(p.ref_gain1), float(p.ref_gain2)], 'coords': self._coords4(),
             'time': time.time(),
         }
+        tops = self._last_tops()
+        for k, ch in ((0, 'ch1'), (1, 'ch2')):
+            self._pending_ref[f'n_top_{ch}'] = (-1 if tops is None else
+                                                count_at_top(tops[k], self.window))
         self._review = which
         # Approve what is saved: the averaged reference, held on screen (the live
         # refresh would replace it by single captures) and shown on the big plot.
@@ -1321,6 +1349,15 @@ class ScanTool(QObject):
         self.status.emit(f'Water reference ({which}): {n} averages at gains '
                          f'{p.ref_gain1:g}/{p.ref_gain2:g} dB (the averaged signal shown is the '
                          'one saved). OK, or change the reference gains and Repeat, or Cancel.')
+        r = self._pending_ref
+        if r['n_top_ch1'] > 0:
+            self.warning.emit(f'Water reference ({which}): Ch1 (transmission) SATURATED, '
+                              f'{r["n_top_ch1"]} samples at full scale in Smin-Smax: this '
+                              'reference is not valid. Lower the reference gain of Ch1 and Repeat.')
+        if r['n_top_ch2'] > 0:
+            self.warning.emit(f'Water reference ({which}): Ch2 (PE) saturated, '
+                              f'{r["n_top_ch2"]} samples at full scale in Smin-Smax (Ch2 is saved '
+                              'but not compared). Lower the reference gain of Ch2 and Repeat.')
 
     def repeat_reference(self, gain1=None, gain2=None):
         """Measure the reference again, optionally with new reference gains."""
@@ -1458,7 +1495,8 @@ class ScanTool(QObject):
                 self._dump_line_start = len(self._dump) if self._dump is not None else 0
         sig = ch2 if PE_CHANNEL == 2 else ch1
         m = tracker.measure(sig, self.plan.beam_x,            # saturation: raw, Smin–Smax
-                            self._seq.top_count(PE_CHANNEL, self.window))
+                            self._seq.top_count(PE_CHANNEL, self.window),
+                            self._seq.top_count(1, self.window))
         seg, env = tracker.point_signals(-1)
         self._last = (seg, env, np.array(ch1[smin:smax], dtype=float),
                       np.array(sig, dtype=float) if self._dump is not None else None,
@@ -1509,6 +1547,9 @@ class ScanTool(QObject):
         if f and not self._warned_kinds >= set(f):
             self._warned_kinds |= set(f)
             self.warning.emit(' '.join(scan_messages([xs[-1]], [f], [d.measures[-1]])))
+        if d.measures[-1].saturated_ch1 and 'saturated_ch1' not in self._warned_kinds:
+            self._warned_kinds.add('saturated_ch1')
+            self.warning.emit(' '.join(scan_messages([xs[-1]], [[]], [d.measures[-1]])))
         nxt = self._schedule[self._cursor] if self._cursor < len(self._schedule) else None
         if nxt is None or nxt.kind != 'point' or nxt.line != e.line:
             self._line_done(e.line)
@@ -1884,6 +1925,11 @@ class ScanTool(QObject):
                           f'the start {plan.axis} first, then {plan.other}',
             'temperature_note': PT100_NOTE,
             'saturation_criterion': SATURATION_FLAG,
+            'emission_blank_samples': getattr(self._seq, 'emission_blank', None),
+            'emission_blank_note': 'samples from the record start left out of the LIVE '
+                                   'saturation indicator (it covers blanking .. end of record; '
+                                   'the main bang clips by design); the saturated_ch1/ch2 '
+                                   'marks of this file look at Smin-Smax only',
             'start_point': plan.start_coords,
             'settle_ms': p.settle_ms, 'avg_n': p.avg_n,
             'settle_avg_note': 'default settle 100 ms measured 2026-10-05, valid for steps '
@@ -1918,7 +1964,7 @@ class ScanTool(QObject):
             'witness': self._witness_meta(),
         }
         refs = {w: {k: r[k] for k in ('sum1', 'sum2', 'offset1', 'offset2', 'avg_n', 'gains',
-                                      'coords', 'time', 'T1', 'T2')}
+                                      'coords', 'time', 'T1', 'T2', 'n_top_ch1', 'n_top_ch2')}
                 for w, r in d.references.items()}
         name = self.exp_name()
         path = save_scan_raw_32(
@@ -1964,7 +2010,11 @@ class ScanTool(QObject):
                 'line': col('after_line', np.int64), 'visit': col('visit', np.int64),
                 'tof_us': col('tof_us'), 'amplitude': col('amplitude'),
                 'face_um': col('face_um'), 'thickness_mm': col('thickness_mm'),
-                'thickness_corr': col('thickness_corr'), 'lost': col('lost', bool)}
+                'thickness_corr': col('thickness_corr'), 'lost': col('lost', bool),
+                'n_top_ch1': np.array([-1 if v['measure'].n_top_ch1 is None
+                                       else v['measure'].n_top_ch1 for v in w], dtype=np.int64),
+                'n_top_ch2': np.array([-1 if v['measure'].n_top is None
+                                       else v['measure'].n_top for v in w], dtype=np.int64)}
 
     def _witness_meta(self):
         p, d = self.params, self.data
@@ -2021,6 +2071,14 @@ class ScanTool(QObject):
              for q in d.pairs])
         out['echo_polarity'] = self._cube([q.polarity if q is not None else 0 for q in d.pairs],
                                           0, np.int8)
+        # saturation, each channel apart (raw counts in Smin-Smax; -1: not checked)
+        for ch, attr, flag in (('ch1', 'n_top_ch1', 'saturated_ch1'),
+                               ('ch2', 'n_top', 'saturated')):
+            out[f'n_top_{ch}'] = self._cube(
+                [-1 if getattr(m, attr) is None else getattr(m, attr) for m in d.measures],
+                -1, np.int64)
+            out[f'saturated_{ch}'] = self._cube([getattr(m, flag) for m in d.measures],
+                                                False, bool)
         return out
 
     def save_copy(self, base_dir):
