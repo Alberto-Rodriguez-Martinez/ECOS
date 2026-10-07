@@ -16,25 +16,17 @@ tracker gets the same beam position on every point: the prediction is t_prev
 and the band absorbs the shift due to the tilt (2·step·tanθ/c_w per point,
 ~7 samples per mm at 3°). ToF = sub-sample envelope peak − emission sample.
 
-Per line: weighted parabola ToF(u) = b0 + b1·u + b2·u², u = x − centre
-(weights ∝ contrast², since the timing jitter of a peak scales as 1/SNR; the
-absolute scale comes from the residuals, n − 3 degrees of freedom). The face
-is curved, and the curvature grows with the square of the range: a straight
-line would leave it in the residual and inflate σθ the longer the line. The
-tilt is the slope at the centre, where the beam hits:
-    θ = atan(c_w · Δt / (2 · Δx)),   with Δt/Δx = b1
-with its 1σ from the parabola's covariance (with points symmetric about the
-centre and similar weights u² is orthogonal to u, so adding it does not
-inflate var(b1)), the
-curvature of the face and its equivalent radius, the RMS residual of the
-parabola (as face displacement, µm: noise plus roughness) and a tolerance
-indicator:
+Per line: weighted straight line ToF(x) (weights ∝ contrast², since the timing
+jitter of a peak scales as 1/SNR; the absolute scale comes from the residuals,
+n − 2 degrees of freedom), and
+    θ = atan(c_w · Δt / (2 · Δx))
+with its 1σ from the slope's, the RMS residual (as face displacement, µm) and
+a tolerance indicator:
     'ok'            |θ| ≤ tolerance
     'out'           |θ| > tolerance
     'undetermined'  σθ > UNDETERMINED_FRACTION · tolerance: the measure cannot
-                    tell whether it is within tolerance (undetermined_message:
-                    more points, then more averages; or the face is not a
-                    parabola)
+                    tell whether it is within tolerance; the message gives the
+                    longer range that would (undetermined_message)
     'no_result'     fewer than MIN_FIT_POINTS usable points
 When |θ| < SIGNIFICANCE·σθ the angle is reported as not distinguishable from 0
 instead of a number with false precision, and no correction is proposed.
@@ -90,11 +82,12 @@ DEFAULT_LAT_STEP_MM = 1.0
 DEFAULT_Z_HALF_MM = 5.0
 DEFAULT_Z_STEP_MM = 0.5
 DEFAULT_TOLERANCE_DEG = 0.3    # what the manual stages can apply vs what the echo needs: spec 5.5
-MIN_FIT_POINTS = 4             # parabola: 3 parameters + 1 degree of freedom for σ
+MIN_FIT_POINTS = 3
 SIGNIFICANCE = 2.0             # |θ| below this × σθ: not distinguishable from 0
 UNDETERMINED_FRACTION = 0.5    # σθ above this × tolerance: cannot judge the tolerance
+TARGET_FRACTION = 1.0 / 3.0    # range recommended when undetermined: 1σ down to this × tolerance
 MEASUREMENT_NOISE_UM = 1.0     # ToF noise as face displacement, measured 06/10/2026
-PARABOLA_RESIDUAL_LIMIT = 3.0  # RMS residual above this × the noise: the face is not a parabola
+NOISE_COMPARABLE = 3.0         # RMS residual within this × the noise: averages help too
 DEFAULT_DUMP_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                 '..', 'data', 'flatness_debug')   # data/ is local only
 
@@ -137,12 +130,9 @@ class LineResult:
     status: str = 'no_result'    # 'ok', 'out', 'undetermined', 'no_result'
     angle_deg: float = float('nan')
     sigma_deg: float = float('nan')
-    tof_center: float = float('nan')     # fitted ToF at the line centre [samples]
-    slope: float = float('nan')          # at the centre [samples/mm]
-    quad: float = float('nan')           # quadratic term [samples/mm²]
-    curvature_m: float = float('nan')    # face curvature [1/m], > 0 convex (see curvature_text)
-    sigma_curvature_m: float = float('nan')
-    rms_um: float = float('nan')         # RMS residual of the parabola, as face displacement
+    slope: float = float('nan')          # samples/mm
+    intercept: float = float('nan')      # samples at x = 0
+    rms_um: float = float('nan')         # RMS residual as face displacement
     span: Optional[tuple] = None         # (lo, hi) positions used [mm]
     ends_lost: List[float] = field(default_factory=list)   # positions lost at the ends
     suggested_half: Optional[float] = None                  # ± range with a clear echo
@@ -169,26 +159,6 @@ class LineResult:
             return (f'not distinguishable from 0 (θ = {self.angle_deg:+.{dec}f}° ± '
                     f'{self.sigma_deg:.{dec}f}°, |θ| < {SIGNIFICANCE:g}σ)')
         return f'θ = {self.angle_deg:+.{dec}f}° ± {self.sigma_deg:.{dec}f}° (1σ)'
-
-    @property
-    def curvature_significant(self):
-        return (self.status != 'no_result'
-                and abs(self.curvature_m) >= SIGNIFICANCE * self.sigma_curvature_m)
-
-    def curvature_text(self):
-        """Curvature ± 1σ with its equivalent radius, or 'not distinguishable from flat'.
-        > 0: the ends of the line are farther from the PE transducer than the
-        centre, i.e. the face is convex toward it."""
-        if self.status == 'no_result':
-            return 'no result'
-        dec = decimals_for(self.sigma_curvature_m)
-        value = f'{self.curvature_m:+.{dec}f} ± {self.sigma_curvature_m:.{dec}f} 1/m'
-        if not self.curvature_significant:
-            return f'Curvature not distinguishable from flat ({value})'
-        radius_mm = 1e3 / abs(self.curvature_m)
-        radius = f'{radius_mm / 1e3:.2g} m' if radius_mm >= 1e3 else f'{radius_mm:.0f} mm'
-        shape = 'convex' if self.curvature_m > 0 else 'concave'
-        return f'Curvature {value} (R ≈ {radius}, {shape} toward the PE transducer)'
 
 
 def decimals_for(sigma):
@@ -252,23 +222,18 @@ def analyse_line(line, axis, center, xs, measures, window, c_w, tolerance_deg,
     t = np.array([tof[k] for k in good])
     w = np.array([measures[k].contrast if math.isfinite(measures[k].contrast) else 1e3
                   for k in good]) ** 2
-    u = x - center
-    X = np.column_stack([np.ones_like(u), u, u * u])
+    X = np.column_stack([np.ones_like(x), x - center])
     cov = np.linalg.inv(X.T @ (X * w[:, None]))
-    b = cov @ (X.T @ (w * t))
-    r = t - X @ b
-    dof = len(x) - 3
+    b0, b1 = cov @ (X.T @ (w * t))
+    r = t - X @ np.array([b0, b1])
+    dof = len(x) - 2
     s2 = float(np.sum(w * r * r)) / dof if dof > 0 else float('nan')
     sigma_b1 = math.sqrt(max(s2 * cov[1, 1], 0.0))
-    sigma_b2 = math.sqrt(max(s2 * cov[2, 2], 0.0))
-    k = c_w / (2.0 * fs) * 1e3            # samples → mm of face displacement (slope → tan θ)
-    b0, b1, b2 = (float(v) for v in b)
-    res.tof_center, res.slope, res.quad = b0, b1, b2
-    res.angle_deg = math.degrees(math.atan(k * b1))
+    k = c_w / (2.0 * fs) * 1e3            # samples/mm → tan θ
+    theta = math.atan(k * b1)
+    res.slope, res.intercept = float(b1), float(b0 - b1 * center)
+    res.angle_deg = math.degrees(theta)
     res.sigma_deg = math.degrees(k * sigma_b1 / (1.0 + (k * b1) ** 2))
-    bend = (1.0 + (k * b1) ** 2) ** 1.5
-    res.curvature_m = 2.0 * k * b2 / bend * 1e3
-    res.sigma_curvature_m = 2.0 * k * sigma_b2 / bend * 1e3
     res.rms_um = float(np.sqrt(np.mean(res.displacement_um(r) ** 2)))
     res.span = (float(x.min()), float(x.max()))
     if res.sigma_deg > UNDETERMINED_FRACTION * tolerance_deg:
@@ -283,26 +248,32 @@ def analyse_line(line, axis, center, xs, measures, window, c_w, tolerance_deg,
 
 def undetermined_message(res, tolerance_deg):
     """
-    σθ too large to judge the tolerance. With the parabola the residual is
-    measurement noise plus roughness, and σθ falls as 1/√points: more points
-    first (they average both), then more averages (only the noise). A longer
-    line is NOT the remedy: the curvature it adds grows with the square of the
-    range. If the residual stays far above the noise, the face is not
-    described even by a parabola, and that is what the message says.
+    σθ too large to judge the tolerance: recommend a longer line, with the
+    range that would bring 1σ down to TARGET_FRACTION of the tolerance.
+    σθ goes as 1/range but only as 1/√points, and what dominates it is the
+    structure of the face (the RMS residual), not the measurement noise, so
+    more points or averages barely help. The range is scaled as 1/range at a
+    fixed number of points: conservative, a longer line at the same step also
+    adds points.
     """
-    text = f'1σ = {res.sigma_deg:.3f}° is too large to judge a tolerance of {tolerance_deg:g}°.'
-    if res.rms_um > PARABOLA_RESIDUAL_LIMIT * MEASUREMENT_NOISE_UM:
-        return text + (
-            f' The parabola leaves an RMS residual of {res.rms_um:.1f} µm, far above the '
-            f'measurement noise (~{MEASUREMENT_NOISE_UM:g} µm): the face is not described well '
-            'even by a parabola (steps, defects or a wavy face; see the plot), so its tilt at '
-            'the beam point is not defined to this tolerance. More points reduce 1σ only as '
-            '1/√points and more averages barely at all.')
-    return text + (
-        f' The RMS residual of the parabola ({res.rms_um:.1f} µm) is at the level of the '
-        'measurement noise, and 1σ falls as 1/√points: first use more points (a smaller step; '
-        'halving it divides 1σ by about √2), which average both the noise and the roughness of '
-        'the face, then more averages, which only reduce the noise.')
+    lo, hi = res.span
+    half = (hi - lo) / 2.0
+    target = TARGET_FRACTION * tolerance_deg
+    needed = math.ceil(half * res.sigma_deg / target * 2.0) / 2.0     # up to 0.5 mm
+    name = 'lateral' if res.line == 'lateral' else 'Z'
+    text = (f'1σ = {res.sigma_deg:.3f}° is too large to judge a tolerance of {tolerance_deg:g}°. '
+            f'Lengthen the line: 1σ falls as 1/range but only as 1/√points, so a longer line '
+            f'pays off far more than more points or averages (the RMS residual, '
+            f'{res.rms_um:.1f} µm, is the shape of the face, not measurement noise). '
+            f'For 1σ ≤ {target:.2f}° (a third of the tolerance) the {name} range should be about '
+            f'±{needed:g} mm (this run: ±{half:g} mm with a clear echo).')
+    if res.ends_lost:
+        text += (' The echo is already lost at the ends of this line, so the face may not allow '
+                 'it: the tolerance cannot be judged on this face along this axis.')
+    if res.rms_um <= NOISE_COMPARABLE * MEASUREMENT_NOISE_UM:
+        text += (f' The residual is comparable to the measurement noise (~{MEASUREMENT_NOISE_UM:g} '
+                 'µm): more averages can also help here.')
+    return text
 
 
 def _line_messages(res, measures):
@@ -352,11 +323,8 @@ class FlatnessOutcome:
             head = 'Lateral' if name == 'lateral' else 'Z'
             line = f'{head} ({r.axis}): {r.angle_text()}'
             if r.status != 'no_result':
-                line += (f' at the centre, RMS residual {r.rms_um:.1f} µm, '
-                         f'{STATUS_TEXT[r.status]}')
+                line += f', RMS residual {r.rms_um:.1f} µm, {STATUS_TEXT[r.status]}'
             out.append(line + '.')
-            if r.status != 'no_result':
-                out.append(f'  {r.curvature_text()}.')
             if r.correction is not None and r.status in ('out', 'undetermined'):
                 out.append(f'  → {r.correction.text}')
             elif r.status == 'ok':
@@ -516,10 +484,9 @@ class FlatnessPlot:
         if res.status == 'no_result':
             return
         lo, hi = res.span
-        uu = np.linspace(lo, hi, 41) - res.center
-        yy = res.displacement_um(res.tof_center + res.slope * uu + res.quad * uu * uu
-                                 - ref_samples)
-        self._pw.plot(uu, yy, pen=pg.mkPen(_COL[res.line], width=2))
+        xx = np.array([lo, hi])
+        yy = res.displacement_um(res.intercept + res.slope * xx - ref_samples)
+        self._pw.plot(xx - res.center, yy, pen=pg.mkPen(_COL[res.line], width=2))
 
 
 class FlatnessTool(QObject):
@@ -776,9 +743,7 @@ class FlatnessTool(QObject):
             return ''
         dump.meta.update(result=text, completed=completed, lines={
             n: dict(angle_deg=r.angle_deg, sigma_deg=r.sigma_deg, rms_um=r.rms_um,
-                    status=r.status, span=r.span, slope_samples_per_mm=r.slope,
-                    quad_samples_per_mm2=r.quad, curvature_m=r.curvature_m,
-                    sigma_curvature_m=r.sigma_curvature_m)
+                    status=r.status, span=r.span, slope_samples_per_mm=r.slope)
             for n, r in self._results.items()})
         try:
             self.last_dump_path = dump.save(self._dump_dir)
@@ -924,8 +889,6 @@ class FlatnessGroup(QGroupBox):
                 lbl.setStyleSheet(_STATUS_STYLE['no_result'])
                 continue
             text = f'{r.angle_text()} — {STATUS_TEXT[r.status]}'
-            if r.status != 'no_result':
-                text += f'\n{r.curvature_text()}'
             if r.correction is not None and r.status != 'ok':
                 text += f'\n{r.correction.text}'
             lbl.setText(text)

@@ -8,6 +8,7 @@ Run from the repo root with the 32-bit interpreter of the machine (CLAUDE.md):
 """
 import json
 import os
+import re
 import shutil
 import sys
 import tempfile
@@ -105,35 +106,6 @@ class TestFlatnessMeasure(unittest.TestCase):
                     within += abs(err) < r.sigma_deg
                     n += 1
         self.assertGreaterEqual(within / n, 0.6, f'{within}/{n} within 1σ')
-
-    def test_curved_face_tilt_at_centre_curvature_and_residual(self):
-        """
-        Curved face of known curvature (convex along lateral, concave along Z):
-        the slope at the centre is the tilt, the curvature (1/m) comes back
-        within 3σ, and the parabola's residual is at the noise level, that of
-        the same run on a flat face, while a straight line would leave the
-        curvature in it.
-        """
-        truth = {'lateral': (0.8, 1 / 150.0), 'z': (-0.5, -1 / 100.0)}    # (θ °, κ 1/mm)
-        kw = dict(theta_lat=truth['lateral'][0], curv_lat=truth['lateral'][1],
-                  theta_z=truth['z'][0], curv_z=truth['z'][1])
-        curved = run_lines(tf.make_sim(seed=60, **kw), lat_step=1.0, z_step=0.5)
-        flat = run_lines(tf.make_sim(seed=61), lat_step=1.0, z_step=0.5)
-        for line, (theta, kappa) in truth.items():
-            with self.subTest(line=line):
-                r = curved[line]
-                self.assertTrue(all(r.used))
-                self.assertLess(abs(r.angle_deg - theta), 3 * r.sigma_deg,
-                                f'{r.angle_deg:.4f} ± {r.sigma_deg:.4f} vs {theta}')
-                k_true = kappa * 1e3 / (1 + np.tan(np.radians(theta)) ** 2) ** 1.5
-                self.assertLess(abs(r.curvature_m - k_true), 3 * r.sigma_curvature_m,
-                                f'{r.curvature_m:.3f} ± {r.sigma_curvature_m:.3f} vs {k_true:.3f}')
-                self.assertTrue(r.curvature_significant)
-                self.assertIn('convex' if kappa > 0 else 'concave', r.curvature_text())
-                self.assertLess(r.rms_um, 2.0 * flat[line].rms_um)
-                disp = r.displacement_um(r.tof_samples)
-                line_rms = np.std(disp - np.polyval(np.polyfit(r.xs, disp, 1), r.xs))
-                self.assertGreater(line_rms, 3.0 * r.rms_um)
 
     def test_zero_tilt_is_not_significant(self):
         sim = tf.make_sim(seed=50)
@@ -245,30 +217,37 @@ class TestFlatnessHelpers(unittest.TestCase):
         self.assertEqual(r.status, 'undetermined')
         self.assertTrue(any('too large to judge' in m for m in r.messages))
 
-    def undetermined_text(self, timing_noise, tolerance):
+    def test_undetermined_recommends_a_longer_line_that_reaches_the_target(self):
+        """The message gives the range for 1σ ≤ tolerance/3; measuring the same
+        residuals over that range (same number of points) does reach it."""
+        tol = 0.3
+        xs = [45.0 + k for k in range(11)]
+        noise = np.random.default_rng(1).normal(0, 30.0, 11)
+        ms = self.measures(11)
+        for m, e in zip(ms, noise):
+            m.index_frac += e
+        r = analyse_line('lateral', 'X', 50.0, xs, ms, tf.WIDE, 1497.0, tol)
+        self.assertEqual(r.status, 'undetermined')
+        text = next(m for m in r.messages if 'too large to judge' in m)
+        self.assertIn('Lengthen the line', text)
+        self.assertNotIn('increase the averages', text)
+        self.assertNotIn('averages can also help', text)       # residual ≫ noise
+        found = re.search(r'range should be about ±([\d.]+) mm', text)
+        self.assertIsNotNone(found, text)
+        half = float(found.group(1))
+        self.assertGreater(half, 5.0)
+        xs2 = list(np.linspace(50.0 - half, 50.0 + half, 11))
+        r2 = analyse_line('lateral', 'X', 50.0, xs2, ms, tf.WIDE, 1497.0, tol)
+        self.assertLessEqual(r2.sigma_deg, tol / 3.0)
+
+    def test_undetermined_mentions_averages_only_near_the_noise(self):
         xs = [45.0 + k for k in range(11)]
         ms = self.measures(11)
-        for m, e in zip(ms, np.random.default_rng(2).normal(0, timing_noise, 11)):
+        for m, e in zip(ms, np.random.default_rng(2).normal(0, 0.1, 11)):   # ~0.7 µm
             m.index_frac += e
-        r = analyse_line('lateral', 'X', 50.0, xs, ms, tf.WIDE, 1497.0, tolerance)
+        r = analyse_line('lateral', 'X', 50.0, xs, ms, tf.WIDE, 1497.0, 0.0005)
         self.assertEqual(r.status, 'undetermined')
-        return r, next(m for m in r.messages if 'too large to judge' in m)
-
-    def test_undetermined_near_the_noise_asks_for_points_then_averages(self):
-        r, text = self.undetermined_text(0.1, 0.0005)              # ~0.7 µm RMS
-        self.assertLess(r.rms_um, 3.0)
-        self.assertIn('more points', text)
-        self.assertIn('more averages', text)
-        self.assertLess(text.index('more points'), text.index('more averages'))
-        self.assertNotIn('Lengthen', text)
-        self.assertNotIn('range', text)
-
-    def test_undetermined_far_above_the_noise_says_the_face_is_not_a_parabola(self):
-        r, text = self.undetermined_text(30.0, 0.3)                # ~200 µm RMS
-        self.assertGreater(r.rms_um, 3.0)
-        self.assertIn('not described well even by a parabola', text)
-        self.assertNotIn('Lengthen', text)
-        self.assertNotIn('range', text)
+        self.assertTrue(any('averages can also help' in m for m in r.messages))
 
 
 # ===========================================================================

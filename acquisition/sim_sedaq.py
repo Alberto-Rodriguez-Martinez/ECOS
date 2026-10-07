@@ -16,7 +16,6 @@ The host injects the scanner position after every move (set_scanner_state).
 
 Pulse-echo channel (PE_CHANNEL = Ch2, as everywhere in ecos_gui.py):
     d        = F + s·(x_beam − x_focus) + tan(θ_lat)·(lat − lat0) + tan(θ_z)·(z − z0)
-               + κ_lat·(lat − lat0)²/2 + κ_z·(z − z0)²/2   (curved face, flatness)
                + shift(t)   (the sample's own movement: drift and jumps, phase 6)
                s = +1 with PE side 'origin' (moving + takes the face away),
                s = −1 with PE side 'max'.  F is the focal distance, so the
@@ -27,9 +26,7 @@ Pulse-echo channel (PE_CHANNEL = Ch2, as everywhere in ecos_gui.py):
     (resp. Z) counter grows, so dt/dlat = 2·tan(θ_lat)/c_w and
     θ = atan(c_w·Δt / (2·Δx)) returns θ_lat and θ_z exactly. Z grows downwards
     (spec section 1). It does not depend on the PE side: it is the face as the
-    PE transducer sees it. Curvature κ > 0 (1/mm): the face is convex toward
-    the PE transducer (its centre lat0, z0 is the closest point); the slope at
-    lat0, z0 is still tan θ.
+    PE transducer sees it.
     t_front  = 2·d / c_w
     A_front  = A0·exp(−(d − F)² / (2σ²))   (= exp(−(x_beam − x_focus)²/(2σ²))
                at lat0, z0; with tilt the focus position moves accordingly,
@@ -91,9 +88,7 @@ class SimParams:
     # -- flatness (tilt of the front face) --------------------------------------
     theta_lat: float = 0.0
     theta_z: float = 0.0
-    curv_lat: float = 0.0        # face curvature along lateral [1/mm], > 0 convex toward PE
-    curv_z: float = 0.0          # idem along Z
-    lat0: float = 50.0           # tilt (and curvature) reference point (session mm)
+    lat0: float = 50.0           # tilt reference point (session mm)
     z0: float = 25.0
     # -- medium / sample --------------------------------------------------------
     c_w: float = 1497.0          # m/s, water at ~25 °C
@@ -249,8 +244,7 @@ class SimSeDaq:
     def _tilt_mm(self, lat, z):
         p = self.params
         return (np.tan(np.radians(p.theta_lat)) * (lat - p.lat0)
-                + np.tan(np.radians(p.theta_z)) * (z - p.z0)
-                + 0.5 * p.curv_lat * (lat - p.lat0) ** 2 + 0.5 * p.curv_z * (z - p.z0) ** 2)
+                + np.tan(np.radians(p.theta_z)) * (z - p.z0))
 
     def restart_drift(self):
         """The steady drift of the sample counts from now."""
@@ -389,8 +383,6 @@ _PANEL_FIELDS = (
     ('focal_distance', 'Focal distance F', 'mm', 1.0, 200.0, 1, 1.0),
     ('theta_lat', 'θ lateral', '°', -45.0, 45.0, 2, 0.1),
     ('theta_z', 'θ Z', '°', -45.0, 45.0, 2, 0.1),
-    ('curv_lat', 'κ lateral', '1/mm', -0.1, 0.1, 4, 0.001),
-    ('curv_z', 'κ Z', '1/mm', -0.1, 0.1, 4, 0.001),
     ('lat0', 'lat₀', 'mm', -1000.0, 1000.0, 1, 1.0),
     ('z0', 'z₀', 'mm', -1000.0, 1000.0, 1, 1.0),
     ('c_w', 'c_w', 'm/s', 1300.0, 1700.0, 1, 1.0),
