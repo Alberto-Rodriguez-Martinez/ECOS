@@ -177,6 +177,8 @@ Posición, STOP y estado van en la **cabecera fija**, encima de las tres subpest
 ### 5.5 Planitud
 Implementada en `acquisition/flatness_tool.py` (fase 4, `task_scanner_phase4.md`).
 
+**Alcance (07/10).** La planitud existe para **ayudar al usuario a orientar la pieza antes de un barrido**. Es una comprobación de **pasa o no pasa**, con una corrección a aplicar. **No es un estudio** de la forma, la curvatura ni las propiedades de la muestra: eso corresponde al procesado, con los datos del barrido, que tiene muchos más puntos y mejor relación señal-ruido. **Cualquier propuesta que añada aquí caracterización de la pieza queda fuera de alcance.**
+
 - Parámetros:
   - rango ±N mm en el eje lateral y ±M mm en Z, alrededor de la posición actual, con el paso de cada eje; por defecto ±10 mm con paso 1 mm, y ±5 mm con paso 0,5 mm;
   - promedios y asentamiento, los de la fase 3 (100 y 5000 ms);
