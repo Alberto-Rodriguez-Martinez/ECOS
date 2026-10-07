@@ -180,7 +180,11 @@ Implementada en `acquisition/flatness_tool.py` (fase 4, `task_scanner_phase4.md`
 - Parámetros:
   - rango ±N mm en el eje lateral y ±M mm en Z, alrededor de la posición actual, con el paso de cada eje; por defecto ±10 mm con paso 1 mm, y ±5 mm con paso 0,5 mm;
   - promedios y asentamiento, los de la fase 3 (100 y 5000 ms);
-  - tolerancia en grados (0,1° por defecto), banda de seguimiento y volcado de depuración.
+  - tolerancia en grados (0,3° por defecto, ver abajo), banda de seguimiento y volcado de depuración.
+- **Tolerancia por defecto: 0,3°** (antes 0,1°, cambiada el 07/10). Tiene que cumplir dos condiciones a la vez, y quien la cambie debe comprobarla contra las dos:
+  - **Lo que el ajuste puede aplicar** (cota inferior). Las correcciones son manuales, con el goniómetro GN1/M (Z) y la platina de rotación CR1/M (lateral), cuyas escalas están graduadas en grados: el ajuste más fino que se aplica a mano es de en torno a un cuarto de grado. Con 0,1° el usuario quedaba atrapado en un bucle de corregir y volver a medir sin llegar nunca al verde. Una tolerancia por debajo de ~0,25° no es alcanzable con estos ajustes.
+  - **Lo que la medida necesita** (cota superior). La aceptación angular del transductor enfocado es del orden de 1,5°, y la amplitud del eco cae unos 1,4 dB por grado de inclinación (medido en el equipo el 06/10/2026). A 0,3° la pérdida es de unos 0,4 dB, muy por debajo de lo que afecta a la medida.
+  - Si cambia el ajuste (otro goniómetro, un micrómetro) o el transductor, hay que revisar la condición correspondiente.
 - Tiempo estimado antes de empezar, como en el foco.
 - Mide dos líneas de tiempo de vuelo del **eco frontal**, lateral y Z. **El eje del haz no se mueve.** Reutiliza el secuenciador de la fase 2 y el seguimiento de la fase 3 (`FrontEchoTracker`), con un tracker por línea (regla del primer pico en su primer punto) y siempre la misma posición del haz: la predicción es t_previo y la banda absorbe el desplazamiento por la inclinación. La línea Z se hace con el lateral en el centro. Al terminar, el escáner vuelve al centro; con STOP no se mueve y solo informa.
 - ToF de cada punto: pico de la envolvente interpolado bajo la muestra, desde la muestra de emisión.
