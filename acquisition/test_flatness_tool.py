@@ -8,6 +8,7 @@ Run from the repo root with the 32-bit interpreter of the machine (CLAUDE.md):
 """
 import json
 import os
+import re
 import shutil
 import sys
 import tempfile
@@ -215,6 +216,38 @@ class TestFlatnessHelpers(unittest.TestCase):
         r = analyse_line('lateral', 'X', 50.0, xs, ms, tf.WIDE, 1497.0, 0.1)
         self.assertEqual(r.status, 'undetermined')
         self.assertTrue(any('too large to judge' in m for m in r.messages))
+
+    def test_undetermined_recommends_a_longer_line_that_reaches_the_target(self):
+        """The message gives the range for 1σ ≤ tolerance/3; measuring the same
+        residuals over that range (same number of points) does reach it."""
+        tol = 0.3
+        xs = [45.0 + k for k in range(11)]
+        noise = np.random.default_rng(1).normal(0, 30.0, 11)
+        ms = self.measures(11)
+        for m, e in zip(ms, noise):
+            m.index_frac += e
+        r = analyse_line('lateral', 'X', 50.0, xs, ms, tf.WIDE, 1497.0, tol)
+        self.assertEqual(r.status, 'undetermined')
+        text = next(m for m in r.messages if 'too large to judge' in m)
+        self.assertIn('Lengthen the line', text)
+        self.assertNotIn('increase the averages', text)
+        self.assertNotIn('averages can also help', text)       # residual ≫ noise
+        found = re.search(r'range should be about ±([\d.]+) mm', text)
+        self.assertIsNotNone(found, text)
+        half = float(found.group(1))
+        self.assertGreater(half, 5.0)
+        xs2 = list(np.linspace(50.0 - half, 50.0 + half, 11))
+        r2 = analyse_line('lateral', 'X', 50.0, xs2, ms, tf.WIDE, 1497.0, tol)
+        self.assertLessEqual(r2.sigma_deg, tol / 3.0)
+
+    def test_undetermined_mentions_averages_only_near_the_noise(self):
+        xs = [45.0 + k for k in range(11)]
+        ms = self.measures(11)
+        for m, e in zip(ms, np.random.default_rng(2).normal(0, 0.1, 11)):   # ~0.7 µm
+            m.index_frac += e
+        r = analyse_line('lateral', 'X', 50.0, xs, ms, tf.WIDE, 1497.0, 0.0005)
+        self.assertEqual(r.status, 'undetermined')
+        self.assertTrue(any('averages can also help' in m for m in r.messages))
 
 
 # ===========================================================================
