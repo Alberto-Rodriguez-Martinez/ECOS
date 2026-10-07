@@ -12,6 +12,7 @@ import shutil
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 os.environ.setdefault('QT_QPA_PLATFORM', 'offscreen')
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -20,8 +21,9 @@ import numpy as np  # noqa: E402
 
 import test_focus_tool as tf  # noqa: E402  (module import: its tests are not collected twice)
 from echo_tracking import PeakMeasure  # noqa: E402
+import flatness_tool  # noqa: E402
 from flatness_tool import (  # noqa: E402
-    FlatnessPlan, FlatnessTool, analyse_line, line_flags,
+    OUTLIER_MIN_POINTS, FlatnessPlan, FlatnessTool, analyse_line, line_flags,
 )
 
 FS = tf.FS
@@ -202,6 +204,48 @@ class TestFlatnessHelpers(unittest.TestCase):
         self.assertIn('exceeds the band', ' '.join(r2.messages))
         self.assertNotIn('too narrow', ' '.join(r2.messages))
 
+    def noisy_line(self, n=21, seed=5):
+        """Clean straight line with ~1 µm timing noise, 0.5 mm apart around 25."""
+        xs = list(np.linspace(25.0 - (n - 1) / 4.0, 25.0 + (n - 1) / 4.0, n))
+        ms = self.measures(n)
+        for m, e in zip(ms, np.random.default_rng(seed).normal(0, 0.13, n)):
+            m.index_frac += e
+        return xs, ms
+
+    def test_outlier_at_the_end_is_left_out_and_reported(self):
+        xs, ms = self.noisy_line()
+        clean = analyse_line('z', 'Z', 25.0, xs, ms, tf.WIDE, 1497.0, 0.3)
+        self.assertEqual(clean.outliers, [])
+        ms[0].index_frac += 8.0                       # ~60 µm: beam off the sample at Z−
+        r = analyse_line('z', 'Z', 25.0, xs, ms, tf.WIDE, 1497.0, 0.3)
+        self.assertEqual(r.outliers, [xs[0]])
+        self.assertIn('outlier', r.flags[0])
+        self.assertFalse(r.used[0])
+        self.assertEqual(sum(r.used), 20)
+        self.assertEqual(r.status, clean.status)
+        self.assertLess(abs(r.angle_deg - clean.angle_deg), clean.sigma_deg)
+        self.assertTrue(any(m.startswith(f'1 outlier left out of the fit at {xs[0]:g} mm')
+                            for m in r.messages), r.messages)
+
+    def test_no_outlier_test_with_few_points(self):
+        xs, ms = self.noisy_line(n=OUTLIER_MIN_POINTS - 1)
+        ms[0].index_frac += 8.0
+        r = analyse_line('z', 'Z', 25.0, xs, ms, tf.WIDE, 1497.0, 0.3)
+        self.assertEqual(r.outliers, [])
+        self.assertTrue(all(r.used))
+
+    def test_not_valid_when_too_few_points_remain(self):
+        """Only reachable with very few points (fewer than half can be outliers):
+        allow the test at 3 points, where one outlier leaves 2."""
+        xs, ms = [24.0, 25.0, 26.0], self.measures(3)
+        ms[1].index_frac += 5.0
+        with mock.patch.object(flatness_tool, 'OUTLIER_MIN_POINTS', 3):
+            r = analyse_line('z', 'Z', 25.0, xs, ms, tf.WIDE, 1497.0, 0.3)
+        self.assertEqual(r.outliers, [25.0])
+        self.assertEqual(r.status, 'no_result')
+        self.assertIsNone(r.correction)
+        self.assertTrue(any('not valid' in m for m in r.messages), r.messages)
+
     def test_line_flags_weak(self):
         ms = self.measures(3, k1='weak')
         self.assertEqual(line_flags([0, 1, 2], ms, tf.WIDE), [[], ['weak'], []])
@@ -332,6 +376,25 @@ class TestFlatnessToolQt(unittest.TestCase):
         meta = json.loads(str(d['meta_json']))
         self.assertEqual(meta['tool'], 'flatness')
         self.assertIn('lateral', meta['lines'])
+
+    def test_outlier_at_the_z_minus_end_is_reported_marked_and_dumped(self):
+        """The field case: one point at the Z− end off the sample (here 0.25 mm off
+        the face, Z step 0.5 mm): left out, reported with its position, marked in the plot and
+        in the dump, and it does not decide the result."""
+        face = self.sim.face_distance
+        self.sim.face_distance = lambda xb, lat, z: face(xb, lat, z) + (0.25 if z < 22.25 else 0.0)
+        self.assertIsNone(self.tool.run(**dict(self.params, z_step=0.5)))
+        self.wait_done()
+        r = self.outcomes[-1].lines['z']
+        self.assertEqual(r.outliers, [22.0])
+        self.assertEqual(r.status, 'out')
+        self.assertLess(abs(r.angle_deg + 0.6), 3 * r.sigma_deg)
+        self.assertIn('1 outlier left out of the fit at 22 mm', self.statuses[-1])
+        self.assertIn(-3.0, self.tool._plot._flagged['z'][0])
+        d = np.load(os.path.join(self.dump_dir, os.listdir(self.dump_dir)[0]))
+        z = np.flatnonzero(d['phase'] == 'z')
+        self.assertIn('outlier', str(d['flags'][z[0]]))
+        self.assertEqual(json.loads(str(d['meta_json']))['lines']['z']['outliers'], [22.0])
 
     def test_stop_midway_does_not_move(self):
         """Point 4."""

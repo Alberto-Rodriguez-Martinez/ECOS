@@ -44,7 +44,12 @@ step is far too coarse; R is for rough orientation only) and the sequencer
 cannot move it anyway (SEQUENCE_AXES).
 
 Unreliable points (point flags of the focus tool plus 'weak': no clear echo in
-the tracking band) are marked and left out of the fit. When the echo fades at
+the tracking band) are marked and left out of the fit. Then, with at least
+OUTLIER_MIN_POINTS points, those whose residual exceeds OUTLIER_SIGMAS robust σ
+(1.4826 × the median absolute deviation of the residuals) are marked 'outlier' and the line
+is fitted once more without them (a point where the beam was not on the
+sample must not decide the orientation); if fewer than MIN_FIT_POINTS remain,
+the line has no result. When the echo fades at
 the ends of a line (the beam leaves the face), the fit is restricted to the
 span with a clear echo and the tool says so, suggesting a range.
 
@@ -84,6 +89,9 @@ DEFAULT_TOLERANCE_DEG = 0.3    # what the manual stages can apply vs what the ec
 MIN_FIT_POINTS = 3
 SIGNIFICANCE = 2.0             # |θ| below this × σθ: not distinguishable from 0
 UNDETERMINED_FRACTION = 0.5    # σθ above this × tolerance: cannot judge the tolerance
+OUTLIER_SIGMAS = 4.0           # residual above this × robust σ (1.4826·MAD): outlier, refit once
+OUTLIER_FLOOR_SAMPLES = 0.1    # outlier limit never below this (~0.75 µm): a near-perfect fit
+OUTLIER_MIN_POINTS = 2 * MIN_FIT_POINTS   # below, the MAD of a few residuals is meaningless
 DEFAULT_DUMP_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                 '..', 'data', 'flatness_debug')   # data/ is local only
 
@@ -121,7 +129,7 @@ class LineResult:
     center: float                # line centre [mm]
     xs: List[float]              # positions measured [mm]
     tof_samples: List[float]     # front-echo ToF from the emission sample, per point
-    flags: List[List[str]]       # per point: 'edge', 'outside', 'saturated_ch2', 'weak'
+    flags: List[List[str]]       # per point: 'edge', 'outside', 'saturated_ch2', 'weak', 'outlier'
     used: List[bool]             # per point: in the fit
     status: str = 'no_result'    # 'ok', 'out', 'undetermined', 'no_result'
     angle_deg: float = float('nan')
@@ -131,6 +139,7 @@ class LineResult:
     rms_um: float = float('nan')         # RMS residual as face displacement
     span: Optional[tuple] = None         # (lo, hi) positions used [mm]
     ends_lost: List[float] = field(default_factory=list)   # positions lost at the ends
+    outliers: List[float] = field(default_factory=list)    # positions left out as outliers
     suggested_half: Optional[float] = None                  # ± range with a clear echo
     correction: Optional[Correction] = None
     messages: List[str] = field(default_factory=list)
@@ -223,14 +232,37 @@ def analyse_line(line, axis, center, xs, measures, window, c_w, tolerance_deg,
         res.messages.append(f'Fewer than {MIN_FIT_POINTS} points with a clear front echo: '
                             'no result for this line.')
         return res
-    x = np.array([xs[k] for k in good])
-    t = np.array([tof[k] for k in good])
-    w = np.array([measures[k].contrast if math.isfinite(measures[k].contrast) else 1e3
-                  for k in good]) ** 2
-    X = np.column_stack([np.ones_like(x), x - center])
-    cov = np.linalg.inv(X.T @ (X * w[:, None]))
-    b0, b1 = cov @ (X.T @ (w * t))
-    r = t - X @ np.array([b0, b1])
+    def fit(idx):
+        x = np.array([xs[k] for k in idx])
+        t = np.array([tof[k] for k in idx])
+        w = np.array([measures[k].contrast if math.isfinite(measures[k].contrast) else 1e3
+                      for k in idx]) ** 2
+        X = np.column_stack([np.ones_like(x), x - center])
+        cov = np.linalg.inv(X.T @ (X * w[:, None]))
+        b0, b1 = cov @ (X.T @ (w * t))
+        return x, w, cov, b0, b1, t - X @ np.array([b0, b1])
+
+    x, w, cov, b0, b1, r = fit(good)
+    if len(good) >= OUTLIER_MIN_POINTS:
+        dev = np.abs(r - np.median(r))
+        limit = max(OUTLIER_SIGMAS * 1.4826 * float(np.median(dev)), OUTLIER_FLOOR_SAMPLES)
+        out = [k for k, d in zip(good, dev) if d > limit]
+        if out:
+            for k in out:
+                flags[k].append('outlier')
+                res.used[k] = False
+            res.outliers = [xs[k] for k in out]
+            res.messages.append(
+                f'{len(out)} outlier{"s" if len(out) > 1 else ""} left out of the fit at '
+                f'{_pts(res.outliers)} mm (residual above {OUTLIER_SIGMAS:g} robust σ of the residuals, '
+                '1.4826 × their median absolute deviation: beam off the sample or on the holder '
+                'edge).')
+            good = [k for k in good if k not in out]
+            if len(good) < MIN_FIT_POINTS:
+                res.messages.append(f'Fewer than {MIN_FIT_POINTS} points left after the outliers: '
+                                    'the measurement of this line is not valid.')
+                return res
+            x, w, cov, b0, b1, r = fit(good)
     dof = len(x) - 2
     s2 = float(np.sum(w * r * r)) / dof if dof > 0 else float('nan')
     sigma_b1 = math.sqrt(max(s2 * cov[1, 1], 0.0))
@@ -664,7 +696,8 @@ class FlatnessTool(QObject):
         self._ref = ref
         disp = self._plan.c_w * (tofs - ref) / self._plan.fs / 2.0 * 1e6
         center = self._plan.centers[self._phase]
-        self._plot.set_points(self._phase, [xx - center for xx in self._xs], disp,
+        self._rel_xs, self._disp = [xx - center for xx in self._xs], disp
+        self._plot.set_points(self._phase, self._rel_xs, disp,
                               [bool(f) for f in flags])
         new = [k for k, f in enumerate(flags) if f and k not in self._warned
                and ('edge' in f or 'saturated_ch2' in f)]
@@ -695,6 +728,11 @@ class FlatnessTool(QObject):
         if phase in LINES:
             res = self._plan.analyse(phase, self._xs, self._measures)
             self._results[phase] = res
+            if res.outliers:                                  # mark them like the other flags
+                self._plot.set_points(phase, self._rel_xs, self._disp,
+                                      [not u for u in res.used])
+                if self._dump is not None:
+                    self._dump.revise(self._dump_start, self._measures, res.flags)
             self._plot.show_fit(res, getattr(self, '_ref', 0.0) - self._plan.emission_sample)
             nxt = 'z' if phase == 'lateral' else 'return'
             reason = self._start_phase(nxt)
@@ -721,7 +759,8 @@ class FlatnessTool(QObject):
             return ''
         dump.meta.update(result=text, completed=completed, lines={
             n: dict(angle_deg=r.angle_deg, sigma_deg=r.sigma_deg, rms_um=r.rms_um,
-                    status=r.status, span=r.span, slope_samples_per_mm=r.slope)
+                    status=r.status, span=r.span, slope_samples_per_mm=r.slope,
+                    outliers=r.outliers)
             for n, r in self._results.items()})
         try:
             self.last_dump_path = dump.save(self._dump_dir)
