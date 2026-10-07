@@ -192,10 +192,12 @@ Implementada en `acquisition/flatness_tool.py` (fase 4, `task_scanner_phase4.md`
 - ToF de cada punto: pico de la envolvente interpolado bajo la muestra, desde la muestra de emisión.
 - **Ajuste**: recta ponderada de ToF frente a posición en cada línea. Los pesos son proporcionales al contraste², porque el jitter del pico escala con 1/SNR, y la escala absoluta sale de los residuos (n − 2 grados de libertad). Ángulo θ = atan(c_w · Δt / (2 · Δx)), con c_w de los PT100 por el mismo mecanismo que el foco.
   - **La recta es suficiente; no se ajusta una parábola** (probado y revertido el 07/10, commits c684196 y 64867bc, revertidos en 10ba454 y 0008b47). Con los puntos repartidos simétricamente alrededor del centro, la recta ya da la inclinación en el centro sin sesgo, porque el término cuadrático es ortogonal al lineal. Comprobado sobre un barrido real: la pendiente de la recta y la pendiente en el centro de la parábola dan el mismo número, −19,674 µm/mm. La parábola solo reducía la dispersión, y con la tolerancia en 0,3° la recta ya daba una incertidumbre cuatro veces menor que la tolerancia. La curvatura de la cara es caracterización de la pieza y queda fuera de alcance (ver arriba).
-- **Resultado por eje**:
-  - el ángulo con su incertidumbre 1σ (propagada desde la pendiente) y el residuo RMS como desplazamiento de la cara, en µm;
-  - un indicador: verde (|θ| ≤ tolerancia), rojo (fuera), naranja (σ mayor que la mitad de la tolerancia, no se puede juzgar) o gris (sin resultado);
-  - si |θ| < 2σ, dice «no distinguible de 0» en lugar de dar un número con falsa precisión, y no propone corrección. Los decimales se ajustan a la σ.
+- **Resultado por eje**, en este orden (07/10, por el alcance de arriba), tanto en la etiqueta de cada eje como en el informe:
+  1. **el veredicto y la acción**: un indicador, verde (|θ| ≤ tolerancia), rojo (fuera), naranja (σ mayor que la mitad de la tolerancia, no se puede juzgar) o gris (sin resultado), y lo que hay que hacer a mano: nada si cumple; si no, cuántos grados girar, con qué control y en qué sentido (ver Correcciones);
+  2. **el ángulo con su incertidumbre 1σ** (propagada desde la pendiente), que hace falta para no perseguir ruido: si |θ| < 2σ, dice «no distinguible de 0» en lugar de dar un número con falsa precisión, y no propone corrección. Los decimales se ajustan a la σ;
+  3. los avisos del eje (puntos fuera del ajuste, cara que se acaba…);
+  4. **el residuo RMS** como desplazamiento de la cara, en µm, como detalle secundario y solo en el informe: no sirve para orientar la pieza.
+- **Mensaje de «indeterminado»** (naranja), una sola línea: la incertidumbre no permite juzgar la tolerancia, y se mejora con más puntos y, en segundo lugar, más promedios. Sin cálculos de recorrido ni diagnósticos sobre la forma de la cara.
 - **Convenio de signo** (el mismo del SeDaq sintético): θ > 0 cuando la cara se **aleja** del transductor PE al crecer el contador lateral (o Z; Z crece hacia abajo). No depende del lado PE.
 - **Correcciones, siempre manuales**: la herramienta mide e informa y no mueve ningún eje para corregir.
   - Inclinación lateral → platina manual de rotación alrededor del eje vertical: «gira θ° de modo que el extremo X+ (o Y+) de la cara se acerque/aleje del transductor PE».

@@ -214,7 +214,10 @@ class TestFlatnessHelpers(unittest.TestCase):
             m.index_frac += rng.normal(0, 30.0)      # very noisy timing
         r = analyse_line('lateral', 'X', 50.0, xs, ms, tf.WIDE, 1497.0, 0.1)
         self.assertEqual(r.status, 'undetermined')
-        self.assertTrue(any('too large to judge' in m for m in r.messages))
+        text = next(m for m in r.messages if 'too large to judge' in m)
+        self.assertLess(text.index('more points'), text.index('more averages'))
+        self.assertNotIn('range', text)
+        self.assertNotIn('\n', text)
 
 
 # ===========================================================================
@@ -286,6 +289,11 @@ class TestFlatnessToolQt(unittest.TestCase):
                      'Back at the centre'):
             self.assertIn(word, final)
         self.assertNotIn(' R ', final)
+        # verdict and action first, then the angle, the RMS residual last (spec 5.5, scope)
+        lateral = final[final.index('Lateral (X)'):final.index('Z (Z)')]
+        order = [lateral.index(w) for w in ('OUT of tolerance', '→ Turn the rotation stage',
+                                            'Angle: θ', 'RMS residual')]
+        self.assertEqual(order, sorted(order), lateral)
         self.assertTrue(self.live['on'])
 
     def test_debug_dump_measurement_parameters(self):
@@ -369,6 +377,17 @@ class TestFlatnessToolQt(unittest.TestCase):
         self.assertEqual((g._spin_settle.value(), g._spin_avg.value()), (5000, 100))
         self.assertIn('Estimated time', g._lbl_estimate.text())
         self.assertFalse(g._btn_repeat.isEnabled())
+
+    def test_axis_labels_lead_with_verdict_and_action(self):
+        from flatness_tool import FlatnessGroup
+        g = FlatnessGroup(self.tool, self.seq)
+        self.assertIsNone(self.tool.run(**self.params))
+        self.wait_done()
+        lines = g._lbl_axis['lateral'].text().split('\n')
+        self.assertEqual(lines[0], 'OUT of tolerance')
+        self.assertTrue(lines[1].startswith('Turn the rotation stage'), lines)
+        self.assertTrue(lines[2].startswith('Angle: θ ='), lines)
+        self.assertNotIn('RMS', g._lbl_axis['lateral'].text())
 
 
 if __name__ == '__main__':

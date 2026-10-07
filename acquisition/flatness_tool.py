@@ -25,7 +25,7 @@ a tolerance indicator:
     'ok'            |θ| ≤ tolerance
     'out'           |θ| > tolerance
     'undetermined'  σθ > UNDETERMINED_FRACTION · tolerance: the measure cannot
-                    tell whether it is within tolerance (more averages / range)
+                    tell whether it is within tolerance (more points, then averages)
     'no_result'     fewer than MIN_FIT_POINTS usable points
 When |θ| < SIGNIFICANCE·σθ the angle is reported as not distinguishable from 0
 instead of a number with false precision, and no correction is proposed.
@@ -156,6 +156,15 @@ class LineResult:
                     f'{self.sigma_deg:.{dec}f}°, |θ| < {SIGNIFICANCE:g}σ)')
         return f'θ = {self.angle_deg:+.{dec}f}° ± {self.sigma_deg:.{dec}f}° (1σ)'
 
+    def action_text(self):
+        """What to do by hand: nothing when within tolerance, else the correction
+        (degrees, control and direction) when the angle is distinguishable from 0."""
+        if self.status == 'ok':
+            return 'No correction needed.'
+        if self.correction is not None and self.status in ('out', 'undetermined'):
+            return self.correction.text
+        return ''
+
 
 def decimals_for(sigma):
     """Decimals so that the 1σ shows two significant digits (2 to 4)."""
@@ -235,7 +244,7 @@ def analyse_line(line, axis, center, xs, measures, window, c_w, tolerance_deg,
     if res.sigma_deg > UNDETERMINED_FRACTION * tolerance_deg:
         res.status = 'undetermined'
         res.messages.append(f'1σ = {res.sigma_deg:.3f}° is too large to judge a tolerance of '
-                            f'{tolerance_deg:g}°: increase the averages or the range.')
+                            f'{tolerance_deg:g}°: use more points and, second, more averages.')
     else:
         res.status = 'ok' if abs(res.angle_deg) <= tolerance_deg else 'out'
     if res.significant:
@@ -282,21 +291,23 @@ class FlatnessOutcome:
     notices: List[str] = field(default_factory=list)
 
     def report(self):
+        """Per axis, in order of use (spec 5.5, scope): verdict and action, then
+        the angle ± 1σ, the notes, and the RMS residual as a secondary detail."""
         out = []
         for name in LINES:
             r = self.lines.get(name)
             if r is None:
                 continue
             head = 'Lateral' if name == 'lateral' else 'Z'
-            line = f'{head} ({r.axis}): {r.angle_text()}'
+            out.append(f'{head} ({r.axis}): {STATUS_TEXT[r.status]}.')
+            action = r.action_text()
+            if action:
+                out.append(f'  → {action}')
             if r.status != 'no_result':
-                line += f', RMS residual {r.rms_um:.1f} µm, {STATUS_TEXT[r.status]}'
-            out.append(line + '.')
-            if r.correction is not None and r.status in ('out', 'undetermined'):
-                out.append(f'  → {r.correction.text}')
-            elif r.status == 'ok':
-                out.append('  → Within tolerance: no correction needed.')
+                out.append(f'  Angle: {r.angle_text()}.')
             out.extend('  ' + m for m in r.messages)
+            if r.status != 'no_result':
+                out.append(f'  RMS residual {r.rms_um:.1f} µm.')
         return out
 
 
@@ -855,8 +866,12 @@ class FlatnessGroup(QGroupBox):
                 lbl.setText('not measured')
                 lbl.setStyleSheet(_STATUS_STYLE['no_result'])
                 continue
-            text = f'{r.angle_text()} — {STATUS_TEXT[r.status]}'
-            if r.correction is not None and r.status != 'ok':
-                text += f'\n{r.correction.text}'
+            verdict = STATUS_TEXT[r.status]
+            text = verdict[0].upper() + verdict[1:]
+            action = r.action_text()
+            if action:
+                text += f'\n{action}'
+            if r.status != 'no_result':
+                text += f'\nAngle: {r.angle_text()}'
             lbl.setText(text)
             lbl.setStyleSheet(_STATUS_STYLE[r.status])
