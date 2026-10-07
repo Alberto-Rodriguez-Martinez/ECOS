@@ -25,8 +25,7 @@ a tolerance indicator:
     'ok'            |θ| ≤ tolerance
     'out'           |θ| > tolerance
     'undetermined'  σθ > UNDETERMINED_FRACTION · tolerance: the measure cannot
-                    tell whether it is within tolerance; the message gives the
-                    longer range that would (undetermined_message)
+                    tell whether it is within tolerance (more averages / range)
     'no_result'     fewer than MIN_FIT_POINTS usable points
 When |θ| < SIGNIFICANCE·σθ the angle is reported as not distinguishable from 0
 instead of a number with false precision, and no correction is proposed.
@@ -85,9 +84,6 @@ DEFAULT_TOLERANCE_DEG = 0.3    # what the manual stages can apply vs what the ec
 MIN_FIT_POINTS = 3
 SIGNIFICANCE = 2.0             # |θ| below this × σθ: not distinguishable from 0
 UNDETERMINED_FRACTION = 0.5    # σθ above this × tolerance: cannot judge the tolerance
-TARGET_FRACTION = 1.0 / 3.0    # range recommended when undetermined: 1σ down to this × tolerance
-MEASUREMENT_NOISE_UM = 1.0     # ToF noise as face displacement, measured 06/10/2026
-NOISE_COMPARABLE = 3.0         # RMS residual within this × the noise: averages help too
 DEFAULT_DUMP_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                 '..', 'data', 'flatness_debug')   # data/ is local only
 
@@ -238,42 +234,13 @@ def analyse_line(line, axis, center, xs, measures, window, c_w, tolerance_deg,
     res.span = (float(x.min()), float(x.max()))
     if res.sigma_deg > UNDETERMINED_FRACTION * tolerance_deg:
         res.status = 'undetermined'
-        res.messages.append(undetermined_message(res, tolerance_deg))
+        res.messages.append(f'1σ = {res.sigma_deg:.3f}° is too large to judge a tolerance of '
+                            f'{tolerance_deg:g}°: increase the averages or the range.')
     else:
         res.status = 'ok' if abs(res.angle_deg) <= tolerance_deg else 'out'
     if res.significant:
         res.correction = correction_for(line, axis, res.angle_deg, decimals_for(res.sigma_deg))
     return res
-
-
-def undetermined_message(res, tolerance_deg):
-    """
-    σθ too large to judge the tolerance: recommend a longer line, with the
-    range that would bring 1σ down to TARGET_FRACTION of the tolerance.
-    σθ goes as 1/range but only as 1/√points, and what dominates it is the
-    structure of the face (the RMS residual), not the measurement noise, so
-    more points or averages barely help. The range is scaled as 1/range at a
-    fixed number of points: conservative, a longer line at the same step also
-    adds points.
-    """
-    lo, hi = res.span
-    half = (hi - lo) / 2.0
-    target = TARGET_FRACTION * tolerance_deg
-    needed = math.ceil(half * res.sigma_deg / target * 2.0) / 2.0     # up to 0.5 mm
-    name = 'lateral' if res.line == 'lateral' else 'Z'
-    text = (f'1σ = {res.sigma_deg:.3f}° is too large to judge a tolerance of {tolerance_deg:g}°. '
-            f'Lengthen the line: 1σ falls as 1/range but only as 1/√points, so a longer line '
-            f'pays off far more than more points or averages (the RMS residual, '
-            f'{res.rms_um:.1f} µm, is the shape of the face, not measurement noise). '
-            f'For 1σ ≤ {target:.2f}° (a third of the tolerance) the {name} range should be about '
-            f'±{needed:g} mm (this run: ±{half:g} mm with a clear echo).')
-    if res.ends_lost:
-        text += (' The echo is already lost at the ends of this line, so the face may not allow '
-                 'it: the tolerance cannot be judged on this face along this axis.')
-    if res.rms_um <= NOISE_COMPARABLE * MEASUREMENT_NOISE_UM:
-        text += (f' The residual is comparable to the measurement noise (~{MEASUREMENT_NOISE_UM:g} '
-                 'µm): more averages can also help here.')
-    return text
 
 
 def _line_messages(res, measures):
