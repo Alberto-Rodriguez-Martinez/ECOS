@@ -376,6 +376,58 @@ class TestAxisCwFrozen(_LiveWindow):
         self.assertEqual(win._axis_unit()[1], 1480.0)
 
 
+class TestScanMetadataFields(_LiveWindow):
+    """Probes and transducers typed in the Acquisition tab reach the scan metadata and the
+    session file; the tab (and its own Arduino reads) is locked during a scan session."""
+
+    def fill(self):
+        win = self.win
+        win._txt_transducer_pe.setText('V310 5 MHz')
+        win._txt_transducer_tt.setText('V311 5 MHz')
+        win._txt_probe[('T1', 'id')].setText('S-17')
+        win._txt_probe[('T1', 'position')].setText('bottom, left')
+        win._txt_probe[('T2', 'class')].setText('A')
+
+    def test_scan_info_carries_them_empty_when_not_filled(self):
+        info = self.win._scan_experiment_info()
+        self.assertEqual((info['equipment1']['transductor_pe'],
+                          info['equipment1']['transductor_tt']), ('', ''))
+        self.assertEqual(info['equipment2']['probes']['T1'],
+                         {'id': '', 'position': '', 'class': ''})
+        self.fill()
+        info = self.win._scan_experiment_info()
+        self.assertEqual(info['equipment1']['transductor_pe'], 'V310 5 MHz')
+        self.assertEqual(info['equipment2']['probes']['T1']['position'], 'bottom, left')
+        self.assertEqual(info['equipment2']['probes']['T2']['class'], 'A')
+
+    def test_kept_in_the_session(self):
+        self.fill()
+        saved = self.win._collect_session()
+        for txt in [self.win._txt_transducer_pe] + list(self.win._txt_probe.values()):
+            txt.setText('')
+        self.win._restore_session(saved)
+        self.assertEqual(self.win._txt_transducer_tt.text(), 'V311 5 MHz')
+        self.assertEqual(self.win._txt_probe[('T1', 'id')].text(), 'S-17')
+        self.win._restore_session({})                     # an old session: empty, no error
+        self.assertEqual(self.win._txt_probe[('T1', 'id')].text(), '')
+
+    def test_acquisition_tab_locked_during_a_scan_session(self):
+        self.win._scan_lock(True)
+        self.assertFalse(self.win._acq_scroll.isEnabled())   # "Read from Arduino" included
+        self.win._scan_lock(False)
+        self.assertTrue(self.win._acq_scroll.isEnabled())
+
+    def test_point_measurement_still_works(self):
+        win = self.win
+        win._on_acquire_pett()
+        win._on_acquire_wp()
+        for s in (win._state.PE_Ascan, win._state.TT_Ascan, win._state.WP_Ascan):
+            self.assertIsNotNone(s)
+        win._on_apply_window()
+        self.assertEqual(win._lbl_res_d.text(), f'{win._L * 1e3:.3f}')
+        self.assertTrue(win._btn_save.isEnabled())
+
+
 class TestCorruptSessionRegion(unittest.TestCase):
     """06/10: the unit bug saved an empty Smin–Smax ([16384, 16384]) in the session."""
 

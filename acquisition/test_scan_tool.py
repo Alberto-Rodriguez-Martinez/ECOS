@@ -25,8 +25,9 @@ sys.path.insert(0, os.path.join(_HERE, '..', 'database'))
 import numpy as np  # noqa: E402
 
 import test_focus_tool as tf  # noqa: E402  (module import: its tests are not collected twice)
+import test_temperature_logger as ttl  # noqa: E402  (same: FakeSerial / FakeArduino)
 from BD_Experimentos_PVA import (  # noqa: E402
-    experiment_name, load_scan_raw_32, save_scan_raw_32,
+    SCAN_SCHEMA_VERSION, experiment_name, load_scan_raw_32, save_scan_raw_32,
 )
 from scan_counts import counts_to_float, sum_dtype, top_mask  # noqa: E402
 from scan_tool import (  # noqa: E402
@@ -280,7 +281,7 @@ class TestScanSaveFormat(unittest.TestCase):
         kw = self.kwargs()
         path = save_scan_raw_32(**kw)
         meta, data = load_scan_raw_32(path)
-        self.assertEqual(meta['schema_version'], 'scan-32-3.2')
+        self.assertEqual(meta['schema_version'], 'scan-32-3.3')
         self.assertEqual(meta['experiment']['operator'], 'Ana')
         self.assertFalse(os.path.exists(os.path.join(path, 'results.json')))
         np.testing.assert_array_equal(data['signals_ch2_sum'], -kw['signals_ch1'])
@@ -618,25 +619,11 @@ class Worker(QObject):
         QTimer.singleShot(delay, lambda: self.point_moved.emit(token, True))
 
 
-class FakeArduino:
-    instances = 0
-
-    def __init__(self):
-        FakeArduino.instances += 1
-        self.reads = 0
-        self.closed = False
-
-    def getTemperatures(self):
-        self.reads += 1
-        return 24.5, 24.7
-
-    def close(self):
-        self.closed = True
-
-
 class ScanHarness(unittest.TestCase):
 
-    def make(self, worker_speed=None, temp=True, **sim_params):
+    def make(self, worker_speed=None, temp=True, serial_script=(), **sim_params):
+        """serial_script: chunks the simulated PT100 port hands out first (bytes or an
+        exception to raise), then '24.5<tab>24.7' every 10 ms."""
         sim_params.setdefault('snr_db', 40.0)
         self.sim = GainLogSim(SimParams(**sim_params), reclen=8192, seed=3)
         self.panel = Panel(self.sim)
@@ -664,7 +651,7 @@ class ScanHarness(unittest.TestCase):
         self.arduinos = []
 
         def factory():
-            a = FakeArduino()
+            a = ttl.FakeArduino(ttl.FakeSerial(script=serial_script))
             self.arduinos.append(a)
             return a
 
@@ -892,7 +879,7 @@ class TestScanSaturationFlag(ScanHarness):
         meta, _ = self.load_saved()
         self.assertIn('any single capture', meta['scan']['saturation_criterion'].lower())
         self.assertIn('Smin-Smax', meta['scan']['saturation_criterion'])
-        self.assertEqual(meta['schema_version'], 'scan-32-3.2')
+        self.assertEqual(meta['schema_version'], SCAN_SCHEMA_VERSION)
 
     def test_each_channel_apart(self):
         """A clipped Ch1 has its own mark, saved apart; the PE values stay valid."""
@@ -1573,7 +1560,7 @@ class TestScanGroup(ScanHarness):
         g._spin_end2.setValue(1.0)
         g._spin_step2.setValue(1.0)
         self.assertIsNone(self.tool.start(replace(g.params(), settle_ms=0, line_settle_ms=0,
-                                                  avg_n=1)))
+                                                  avg_n=1, references=False)))
         self.assertEqual(self.tool.state, 'scan')
         self.tool.stop()
         self.wait(lambda: self.tool.state in ('stopped', 'idle'))
@@ -1621,6 +1608,194 @@ class TestScanGroup(ScanHarness):
         self.assertIn('half an hour', g._lbl_estimate.text())
         self.assertTrue(g._btn_start.isEnabled())
         self.assertFalse(g._btn_continue.isEnabled())
+
+    def small(self, g):
+        for w, v in ((g._spin_start, -1.0), (g._spin_end, 1.0), (g._spin_step, 1.0),
+                     (g._spin_settle, 0), (g._spin_line_settle, 0), (g._spin_avg, 1)):
+            w.setValue(v)
+        g._chk_witness.setChecked(False)
+
+    def test_references_checked_by_default(self):
+        self.make()
+        g = ScanGroup(self.tool, self.seq, confirm_fn=lambda *_: self.fail('asked'))
+        self.assertTrue(g._chk_refs.isChecked())
+        self.assertTrue(g.params().references)
+        self.assertIn('thermal correction', g._chk_refs.toolTip())
+
+    def test_without_references_asks_and_can_go_on(self):
+        """B2: unchecked → a clear warning; No keeps it idle, Yes starts the scan."""
+        for answer in (False, True):
+            with self.subTest(go_on=answer):
+                self.make()
+                asked = []
+
+                def confirm(title, text):
+                    asked.append(text)
+                    return answer
+                g = ScanGroup(self.tool, self.seq, confirm_fn=confirm)
+                self.small(g)
+                g._chk_refs.setChecked(False)
+                g._on_start()
+                self.assertEqual(len(asked), 1)
+                self.assertIn('thermal correction of t_tw', asked[0])
+                if not answer:
+                    self.assertEqual(self.tool.state, 'idle')
+                    self.assertIn('Not started', g._lbl_status.text())
+                    continue
+                self.assertNotEqual(self.tool.state, 'idle')
+                self.assertTrue(any('thermal correction of t_tw' in w for w in self.warnings))
+                self.wait(lambda: self.dones)
+                meta, _ = self.load_saved()
+                self.assertFalse(meta['scan']['references'])
+
+
+class TestTemperatureLog(ScanHarness):
+    """The continuous PT100 log of a scan session (temperature_logger.TemperatureLogger)."""
+
+    P = dict(start=-1, end=1, step=1, settle_ms=0, line_settle_ms=0, avg_n=1, witness=False)
+
+    def run_scan(self, **over):
+        self.assertIsNone(self.tool.start(ScanParams(**dict(self.P, **over))))
+        self.wait(lambda: self.dones)
+        return self.load_saved()
+
+    def test_series_saved_and_events_from_the_newest_sample(self):
+        self.make()
+        meta, d = self.run_scan(surface=True, start2=-1, end2=0, step2=1)
+        self.assertEqual(meta['schema_version'], 'scan-32-3.3')
+        wall, mono = d['temp_series_wall'], d['temp_series_mono']
+        self.assertGreater(len(mono), 3)                     # every line, not one per event
+        for k in ('wall', 'mono', 'T1', 'T2'):
+            self.assertEqual(d[f'temp_series_{k}'].dtype, np.float64)
+            self.assertEqual(len(d[f'temp_series_{k}']), len(mono))
+        self.assertTrue(np.all(np.diff(mono) >= 0))          # ordered, never backwards
+        self.assertTrue(np.all(np.diff(wall) >= 0))
+        np.testing.assert_array_equal(np.unique(d['temp_series_T1']), [24.5])
+        self.assertEqual(int(d['temp_series_discarded']), 0)
+        # the event readings keep their format, from the newest sample, with its age
+        self.assertEqual(list(d['temp_label']), ['start', 'line_end', 'line_end', 'end'])
+        self.assertEqual(list(d['temp_T1']), [24.5] * 4)
+        self.assertFalse(d['temp_stale'].any())
+        self.assertTrue(np.all((d['temp_age_s'] >= 0) & (d['temp_age_s'] < 1.0)))
+        # the scan itself never read the port: the fake raises if anyone does
+        self.assertEqual(len(self.arduinos), 1)
+        self.assertTrue(self.arduinos[0].closed)
+        self.assertFalse(self.tool._temp_log.running)        # thread stopped at the end
+        t = meta['scan']['temperature_log']
+        self.assertTrue(t['enabled'] and t['complete'] and t['stopped_cleanly'])
+        self.assertEqual((t['n_lines'], t['n_discarded']), (len(mono), 0))
+        self.assertIsNotNone(t['port_open_s'])
+        self.assertIsNotNone(t['last_temp_read_s'])
+
+    def test_metadata_added(self):
+        self.make()
+        meta, _ = self.run_scan()
+        s = meta['scan']
+        self.assertEqual(s['c_w_origin'], 'pt100')
+        m = s['c_w_model']
+        self.assertEqual(m['module'], __name__)              # the test's lambda
+        self.assertIn('1402.7', m['source'])                 # rebuildable without the repo
+        cv = s['code_version']
+        self.assertEqual(set(cv), {'commit', 'dirty', 'error'})
+        if cv['commit'] is not None:                         # run inside the git checkout
+            self.assertRegex(cv['commit'], r'^[0-9a-f]{40}$')
+            self.assertIsInstance(cv['dirty'], bool)
+        from echo_tracking import CONFIDENT_CONTRAST, EDGE_MIN_CONTRAST
+        self.assertEqual(s['tracking']['confident_contrast'], CONFIDENT_CONTRAST)
+        self.assertEqual(s['tracking']['edge_min_contrast'], EDGE_MIN_CONTRAST)
+        e1, e2 = meta['equipment']['device_1_ultrasound'], meta['equipment']['device_2_aux']
+        self.assertEqual((e1['transductor_pe'], e1['transductor_tt']), ('', ''))   # present
+        for name in ('T1', 'T2'):
+            self.assertEqual((e2['probes'][name]['id'], e2['probes'][name]['position'],
+                              e2['probes'][name]['class']), ('', '', ''))
+            self.assertEqual(e2['probes'][name]['wires'], 4)
+        self.assertEqual(e2['firmware']['baudrate'], 115200)
+        self.assertEqual(e2['firmware']['identifier'], '')
+
+    def test_probes_and_transducers_from_the_host(self):
+        self.make()
+        info = self.tool._info_fn()
+        info['equipment1'].update(transductor_pe='V310 5 MHz', transductor_tt='V310 5 MHz')
+        info['equipment2'] = {'probes': {'T1': {'id': 'S-17', 'position': 'bottom left',
+                                                'class': 'A'}}}
+        self.tool._info_fn = lambda: info
+        meta, _ = self.run_scan()
+        e1, e2 = meta['equipment']['device_1_ultrasound'], meta['equipment']['device_2_aux']
+        self.assertEqual(e1['transductor_pe'], 'V310 5 MHz')
+        self.assertEqual(e2['probes']['T1']['id'], 'S-17')
+        self.assertEqual(e2['probes']['T2']['id'], '')
+
+    def test_port_failure_half_way_does_not_stop_the_scan(self):
+        # moves of 100 ms per mm: the port dies ~40 ms after opening, the end reading
+        # comes ≥ 0.5 s later, well past the (shortened) stale limit
+        self.make(worker_speed=10.0, serial_script=[ttl.GOOD] * 3 + [OSError('USB cable pulled')])
+        self.assertIsNone(self.tool.start(ScanParams(**dict(self.P, start=-2, end=2))))
+        self.tool._temp_log.stale_after_s = 0.1
+        self.wait(lambda: self.dones)
+        meta, d = self.load_saved()
+        self.assertEqual(self.dones, ['completed'])
+        self.assertEqual(int(d['point_valid'].sum()), 5)
+        self.assertTrue(any('PT100 log stopped' in w and 'USB cable pulled' in w
+                            for w in self.warnings))
+        t = meta['scan']['temperature_log']
+        self.assertFalse(t['complete'])
+        self.assertIn('USB cable pulled', t['failure']['error'])
+        self.assertEqual(len(d['temp_series_T1']), 3)        # what arrived is kept
+        self.assertTrue(d['temp_stale'][-1])                 # the end reading: stale, NaN
+        self.assertTrue(np.isnan(d['temp_T1'][-1]))
+        self.assertTrue(self.arduinos[0].closed)
+
+    def test_malformed_lines_counted(self):
+        self.make(serial_script=[b'\r\n', b'garbage\r\n', b'24.1\r\n'])
+        meta, d = self.run_scan()
+        self.assertEqual(int(d['temp_series_discarded']), 3)
+        self.assertEqual(meta['scan']['temperature_log']['n_discarded'], 3)
+        self.assertEqual(len(meta['scan']['temperature_log']['discarded_examples']), 3)
+
+    def test_without_arduino_empty_series(self):
+        self.make(temp=False)
+        meta, d = self.run_scan()
+        self.assertEqual(self.dones, ['completed'])
+        for k in ('wall', 'mono', 'T1', 'T2'):
+            self.assertEqual(d[f'temp_series_{k}'].shape, (0,))
+        self.assertEqual(int(d['temp_series_discarded']), 0)
+        self.assertTrue(np.isnan(d['temp_T1']).all() and d['temp_stale'].all())
+        t = meta['scan']['temperature_log']
+        self.assertFalse(t['enabled'])
+        self.assertIsNone(meta['equipment']['device_2_aux']['firmware']['baudrate'])
+        self.assertEqual(meta['scan']['c_w_origin'], 'host')
+
+    def test_shutdown_stops_a_running_log(self):
+        self.make()
+        self.seq.point_done.connect(lambda i, *_: i == 1 and self.tool.stop())
+        self.assertIsNone(self.tool.start(ScanParams(**self.P)))
+        self.wait(lambda: self.tool.state == 'stopped')
+        self.assertTrue(self.tool._temp_log.running)         # still logging until save/discard
+        self.tool.shutdown()                                 # the application closes
+        self.assertFalse(self.tool._temp_log.running)
+        self.assertTrue(self.arduinos[0].closed)
+        self.tool.discard()
+
+    def test_loader_reads_a_32_file(self):
+        """A file of the previous schema (no series, no ages) still loads."""
+        self.make()
+        _, _ = self.run_scan()
+        folder = os.path.join(self.base, os.listdir(self.base)[0])
+        meta_path = os.path.join(folder, 'meta.json')
+        with open(meta_path, encoding='utf-8') as f:
+            meta = json.load(f)
+        meta['schema_version'] = 'scan-32-3.2'
+        with open(meta_path, 'w', encoding='utf-8') as f:
+            json.dump(meta, f)
+        with np.load(os.path.join(folder, 'scan.npz')) as z:
+            old = {k: z[k] for k in z.files if not (k.startswith('temp_series_')
+                                                      or k in ('temp_age_s', 'temp_stale'))}
+        np.savez_compressed(os.path.join(folder, 'scan.npz'), **old)
+        meta2, d = load_scan_raw_32(folder)
+        self.assertEqual(meta2['schema_version'], 'scan-32-3.2')
+        self.assertNotIn('temp_series_wall', d)
+        self.assertEqual(list(d['temp_T1']), [24.5, 24.5])
+        self.assertEqual(d['signals_ch1'].dtype, np.float64)
 
 
 class TestScannerSubTabs(unittest.TestCase):

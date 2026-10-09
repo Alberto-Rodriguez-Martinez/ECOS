@@ -96,7 +96,11 @@ def save_experiment_raw_32(
                         Signal_Ref=np.asarray(Signal_Ref, dtype=np.float64))
     return str(d)
 
-SCAN_SCHEMA_VERSION = "scan-32-3.2"
+SCAN_SCHEMA_VERSION = "scan-32-3.3"
+# 3.3 (2026-10-09): continuous PT100 series (temp_series_wall/mono/T1/T2, every line the
+#     Arduino sent, and temp_series_discarded); the event readings (temp_*) gain temp_age_s
+#     and temp_stale (their value is the newest sample of the series). Same arrays as 3.2
+#     otherwise; a 3.2 file is read as before (no series).
 # 3.2 (2026-10-06): saturation per channel, kept apart: arrays saturated_ch1/ch2 and
 #     n_top_ch1/ch2, witness_n_top_ch1/ch2, ref_<which>_n_top_ch1/ch2; flag names
 #     saturated_ch1 / saturated_ch2 (3.1 had one Ch2 flag, 'saturated').
@@ -109,7 +113,8 @@ SCAN_SCHEMA_VERSION = "scan-32-3.2"
 #     per-point thickness values. A 2.0 file is still read (a line, all points valid).
 # 2.0 (2026-10): signals stored as integer sums of counts + conversion metadata.
 # 1.0 (float32 signals) is not readable any more: no real scan was ever saved with it.
-SCAN_SCHEMA_READABLE = ("scan-32-2.0", "scan-32-3.0", "scan-32-3.1", SCAN_SCHEMA_VERSION)
+SCAN_SCHEMA_READABLE = ("scan-32-2.0", "scan-32-3.0", "scan-32-3.1", "scan-32-3.2",
+                        SCAN_SCHEMA_VERSION)
 _SCAN_REF_OPTIONAL = ("n_top_ch1", "n_top_ch2")   # saturation of each channel (3.2)
 _SCAN_REF_FIELDS = ("sum1", "sum2", "offset1", "offset2", "avg_n", "gains", "coords",
                     "time", "T1", "T2")
@@ -142,7 +147,8 @@ def save_scan_raw_32(
     gains,              # (gain_ch1, gain_ch2) [dB] of the scan
     coords,             # (N_line, N_point, 4): real X, Y, Z, R read back from the scanner
     point_time,         # (N_line, N_point): epoch seconds of each acquisition
-    temperatures,       # list of {label, point, time, T1, T2} (NaN when no PT100)
+    temperatures,       # list of {label, point, time, T1, T2} (NaN when no PT100), optional
+                        # age_s (age of the sample used) and stale
     references=None,    # {'initial': {...}, 'final': {...}}, each with _SCAN_REF_FIELDS
     witness=None,       # witness point series {name: array (N_visit, ...)}: sum1, sum2
                         # (N_visit, N_samples) as the signals, offset1/2, coords, time,
@@ -154,15 +160,18 @@ def save_scan_raw_32(
     exp_name=None,
     extra_arrays=None,  # optional {name: array} also stored in scan.npz
     files_extra=None,   # optional {name: description} of extra_arrays, into meta "files"
+    temp_series=None,   # continuous PT100 series {wall, mono, T1, T2, discarded}; None or
+                        # empty: stored empty (no Arduino)
 ):
     """
     Raw data of a scan (line or surface), one folder per scan:
-        <exp_name>/meta.json   schema scan-32-3.2: experiment (id, timestamps,
+        <exp_name>/meta.json   schema scan-32-3.3: experiment (id, timestamps,
                                operator), specimen, protocol, equipment, scanner_session,
                                scan, conversion, comment, and the description of scan.npz
         <exp_name>/scan.npz    (compressed) integer signals per channel
                                (N_line × N_point × N_samples) and their offsets, real
-                               coordinates, times, temperatures and water references
+                               coordinates, times, temperatures (event readings and the
+                               continuous PT100 series) and water references
     Samples stored: ONLY the analysis window, Smin..Smax-1, for the signals, the
     witness and the references: what is measured is saved. The per-point offsets are
     the one value taken from the whole record (the mean ECOS removes from each
@@ -221,7 +230,16 @@ def save_scan_raw_32(
         "temp_time": np.array([float(t["time"]) for t in temperatures], dtype=np.float64),
         "temp_T1": np.array([float(t["T1"]) for t in temperatures], dtype=np.float64),
         "temp_T2": np.array([float(t["T2"]) for t in temperatures], dtype=np.float64),
+        "temp_age_s": np.array([float(t.get("age_s", float("nan"))) for t in temperatures],
+                               dtype=np.float64),
+        "temp_stale": np.array([bool(t.get("stale", False)) for t in temperatures], dtype=bool),
     }
+    ts_in = temp_series or {}
+    for key in ("wall", "mono", "T1", "T2"):
+        arrays[f"temp_series_{key}"] = np.asarray(ts_in.get(key, ()), dtype=np.float64).ravel()
+    if len({arrays[f"temp_series_{k}"].size for k in ("wall", "mono", "T1", "T2")}) != 1:
+        raise ValueError("temp_series: wall, mono, T1 and T2 must have the same length")
+    arrays["temp_series_discarded"] = np.array(int(ts_in.get("discarded", 0)), dtype=np.int64)
     taken, ref_conv = [], {}
     for which, ref in (references or {}).items():
         if ref is None:
@@ -257,8 +275,15 @@ def save_scan_raw_32(
         "point_time": "float64 (N_line, N_point): epoch [s] of each acquisition",
         "temp_*": "one entry per reading: label, point (index of the last acquired point, "
                   "-1 before the first), line (index of its line, -1 before the first), time "
-                  "(epoch), T1, T2 [°C] (NaN without PT100). PT100 at the bottom of the tank, "
-                  "not in the beam path: see scan.temperature_note",
+                  "(epoch), T1, T2 [°C] (NaN without PT100), age_s (age of the newest sample "
+                  "of the series used, s; NaN: no sample) and stale (no sample newer than "
+                  "scan.temperature_log.stale_after_s: T1, T2 NaN). PT100 at the bottom of the "
+                  "tank, not in the beam path: see scan.temperature_note",
+        "temp_series_*": "every line the Arduino sent during the session, in arrival order: "
+                         "wall (time.time() epoch, s), mono (time.monotonic(), s, never "
+                         "decreasing), T1, T2 [°C] (float64, empty without Arduino); "
+                         "temp_series_discarded: malformed lines dropped (int). Summary in "
+                         "scan.temperature_log",
         "ref_<initial|final>_*": "water references: sum1, sum2 (N_samples, integer sums), "
                                  "offset1, offset2, avg_n, gains (Ch1, Ch2), coords "
                                  "(X, Y, Z, R), time, T1, T2; conversion in "

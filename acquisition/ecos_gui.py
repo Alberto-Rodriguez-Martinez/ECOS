@@ -476,6 +476,8 @@ class EcosGUI(QMainWindow):
     #  Window close
     # ==========================================================================
     def closeEvent(self, event):
+        if getattr(self, "_scan_tool", None) is not None:
+            self._scan_tool.shutdown()   # PT100 log thread of a scan session, if any
         if self._sequencer is not None:
             self._sequencer.shutdown()   # its leave hook restarts the timer: stop it after
         self._timer.stop()
@@ -807,7 +809,27 @@ class EcosGUI(QMainWindow):
 
         self._lbl_temp = QLabel("T1: — °C   T2: — °C   Cw1: — m/s   Cw2: — m/s")
         layout.addWidget(self._lbl_temp)
+
+        # Probe identification, written into every scan (meta.json, equipment
+        # device_2_aux.probes). Empty unless filled in: no defaults are guessed.
+        probes = QFormLayout()
+        self._txt_probe = {}
+        for name in ("T1", "T2"):
+            row = QHBoxLayout()
+            for key, hint in (("id", "id"), ("position", "position in the tank"),
+                              ("class", "class")):
+                txt = QLineEdit("")
+                txt.setPlaceholderText(hint)
+                self._txt_probe[(name, key)] = txt
+                row.addWidget(txt)
+            probes.addRow(f"{name} probe (PT100, 4-wire):", row)
+        layout.addLayout(probes)
         return box
+
+    def _probe_dict(self):
+        """{'T1': {id, position, class}, 'T2': {...}} as typed (scan metadata)."""
+        return {name: {key: self._txt_probe[(name, key)].text().strip()
+                       for key in ("id", "position", "class")} for name in ("T1", "T2")}
 
     # ==========================================================================
     #  Block 3 — Signal Acquisition
@@ -830,6 +852,17 @@ class EcosGUI(QMainWindow):
         self._txt_smin.editingFinished.connect(self._on_smin_smax_edited)
         self._txt_smax.editingFinished.connect(self._on_smin_smax_edited)
         layout.addLayout(win_row)
+
+        # Transducers of the scans (meta.json, transductor_pe / transductor_tt). The point
+        # measurement below still saves its own fixed description.
+        transd = QFormLayout()
+        self._txt_transducer_pe = QLineEdit("")
+        self._txt_transducer_tt = QLineEdit("")
+        self._txt_transducer_pe.setPlaceholderText("e.g. model, frequency, focus")
+        self._txt_transducer_tt.setPlaceholderText("e.g. model, frequency, focus")
+        transd.addRow("Transducer PE (scans):", self._txt_transducer_pe)
+        transd.addRow("Transducer TT (scans):", self._txt_transducer_tt)
+        layout.addLayout(transd)
 
         # Acquisition buttons
         self._btn_pett = QPushButton("Acquire s_PE + s_TT  (sample, 0°)")
@@ -1707,6 +1740,11 @@ class EcosGUI(QMainWindow):
         if isinstance(self._sedaq, SimSeDaq):
             return self._sedaq.params.c_w, "synthetic SeDaq"
         if self._state.Cw_mean:
+            manual = getattr(self, "_manual_temp", None)
+            if manual is not None:
+                return self._state.Cw_mean, (
+                    f"manual temperature T = {manual['T']:.2f} °C (Acquisition tab), c_w by "
+                    "1402.7 + 4.88·T − 0.0482·T² (_approx_cw), PT100 unavailable now")
             return self._state.Cw_mean, "last temperature reading, PT100 unavailable now"
         return None
 
@@ -1736,8 +1774,8 @@ class EcosGUI(QMainWindow):
                          "notes": self._txt_notes.text()},
             "equipment1": {
                 "nombre": "SEDAQ" + (" (synthetic)" if isinstance(self._sedaq, SimSeDaq) else ""),
-                "transductor_pe": "",
-                "transductor_tt": "",
+                "transductor_pe": self._txt_transducer_pe.text().strip(),
+                "transductor_tt": self._txt_transducer_tt.text().strip(),
                 "params": {
                     "Voltaje": self._txt_voltage.text(),
                     "Fp": DEFAULT_FP,
@@ -1747,7 +1785,8 @@ class EcosGUI(QMainWindow):
                     "gen_fs": self._txt_gen_fs.text(),
                 },
             },
-            "equipment2": {"nombre": "Arduino", "puerto": self._txt_arduino_port.text()},
+            "equipment2": {"nombre": "Arduino", "puerto": self._txt_arduino_port.text(),
+                           "probes": self._probe_dict()},
             "name_parts": {"pva": self._txt_pva_pct.text(),
                            "additive": self._txt_additive_pct.text(),
                            "sample_id": self._txt_sample_id.text(),
@@ -2293,6 +2332,9 @@ class EcosGUI(QMainWindow):
             "dopants":               self._txt_dopants.text(),
             "notes":                 self._txt_notes.text(),
             "exp_name":              self._txt_exp_name.text(),
+            "transducer_pe":         self._txt_transducer_pe.text(),
+            "transducer_tt":         self._txt_transducer_tt.text(),
+            "probes":                self._probe_dict(),
         }
 
     def _restore_session(self, d):
@@ -2330,6 +2372,11 @@ class EcosGUI(QMainWindow):
         self._txt_dopants.setText(d.get("dopants",            ""))
         self._txt_notes.setText(d.get("notes",                ""))
         self._txt_exp_name.setText(d.get("exp_name",          ""))
+        self._txt_transducer_pe.setText(d.get("transducer_pe", ""))
+        self._txt_transducer_tt.setText(d.get("transducer_tt", ""))
+        probes = d.get("probes") or {}
+        for (name, key), txt in self._txt_probe.items():
+            txt.setText(str((probes.get(name) or {}).get(key, "") or ""))
 
 
 # ==============================================================================

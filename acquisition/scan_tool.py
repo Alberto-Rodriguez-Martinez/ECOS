@@ -43,9 +43,14 @@ reference gains (Gain2 always set again after Gain1: known pulser fault) and
 their own averages. The order in which the user moves the axes to take the
 sample out is recorded; the way back is one move per axis in reverse order.
 
-Temperature: read at the start, at each reference and at the end, never per
-point; ONE Arduino instance for the whole scan session, closed at the end.
-Without PT100: NaN and a warning at the start, never the (modal) manual dialog.
+Temperature: ONE Arduino instance for the whole scan session, opened at Start and
+closed at the end, and read by a TemperatureLogger thread (temperature_logger.py)
+that stores every line the firmware sends (every 200 ms) with the PC time: the
+continuous series saved in scan.npz (temp_series_*). Nothing else reads the port
+during the session. The event readings (start, each reference, line ends, end)
+take the newest sample of the series and its age; a stale one (no new line for
+several periods) is stored as NaN. Without PT100: NaN, an empty series and a
+warning at the start, never the (modal) manual dialog.
 
 Saving: one folder per scan, database/<PVA_..._SCAN_<ts>>/ meta.json + scan.npz
 (BD_Experimentos_PVA.save_scan_raw_32, schema scan-32-2.0), automatically at
@@ -71,9 +76,12 @@ real equipment (see the constant); DEFAULT_SCAN_AVG_N still pending.
 """
 from __future__ import annotations
 
+import inspect
 import math
 import os
+import subprocess
 import sys
+import textwrap
 import time
 from collections import OrderedDict
 from dataclasses import dataclass, field, replace
@@ -87,7 +95,8 @@ from echo_tracking import (
 )
 from flatness_tool import line_flags
 from ECOS_US_ToolBox import CalcToFAscanCosine_XCRFFT, Envelope
-from echo_tracking import CONFIDENT_CONTRAST
+from echo_tracking import CONFIDENT_CONTRAST, EDGE_MIN_CONTRAST
+from temperature_logger import FIRST_SAMPLE_TIMEOUT_S, TemperatureLogger, probe_fields
 from focus_tool import (
     DEFAULT_EMISSION_SAMPLE, MOVE_MM_S, POSITION_DECIMALS, SATURATION_FLAG, FocusDebugDump,
     acq_time, format_duration, measurement_meta, resolve_cw,
@@ -258,7 +267,8 @@ class ScanParams:
     step: float = DEFAULT_SCAN_STEP_MM
     settle_ms: int = DEFAULT_SCAN_SETTLE_MS
     avg_n: int = DEFAULT_SCAN_AVG_N
-    references: bool = False
+    references: bool = False             # the GUI checkbox is checked by default
+
     ref_gain1: float = 0.0
     ref_gain2: float = 0.0
     ref_avg_n: int = DEFAULT_REF_AVG_N
@@ -315,11 +325,59 @@ SCAN_ARRAYS_DOC = {
                          'criterion); one mark per channel, never combined',
     'n_top_ch1/ch2': 'int64 (N_line, N_point): how many such samples; -1 not checked',
 }
+NO_REFERENCES_WARNING = ('No water references (WP) in this scan: without them the thermal '
+                         'correction of t_tw (through-transmission) cannot be done in the '
+                         'analysis.')
+FIRMWARE_ID_NOTE = ('none received: the firmware in hardware/arduino sends only "T1 T2" lines, '
+                    'no identifier or header; malformed lines, if any, are in '
+                    'scan.temperature_log.discarded_examples')
+_REPO_DIR = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'))
 PT100_NOTE = ('The PT100 probes are at the bottom of the tank, NOT in the beam path. Measured '
               'on 05/10: 0.07 K in the boundary layer around a freshly immersed piece is worth '
               '5 µm of time of flight. These temperatures follow the trend of the water; they '
               'are not the temperature of the water the beam crosses. A limitation of the '
               'set-up, not of the program.')
+
+
+def describe_cw_model(fn):
+    """The c_w(T) function, rebuildable without the repository: name, module and source
+    (the coefficients are in it). None fields when there is no function."""
+    out = {'name': None, 'module': None, 'source': None}
+    if fn is None:
+        return out
+    out['name'] = getattr(fn, '__name__', repr(fn))
+    out['module'] = getattr(fn, '__module__', None)
+    try:
+        out['source'] = textwrap.dedent(inspect.getsource(fn))
+    except (OSError, TypeError) as e:
+        out['source_error'] = f'{type(e).__name__}: {e}'
+    return out
+
+
+def code_version(repo_dir=_REPO_DIR, timeout_s=5.0):
+    """
+    {'commit', 'dirty', 'error'} of the git working tree the program runs from. dirty:
+    tracked files changed and not committed (untracked files do not count). Without
+    git or outside a repository: commit and dirty None, and why in 'error'.
+    """
+    out = {'commit': None, 'dirty': None, 'error': None}
+    kw = dict(cwd=repo_dir, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+              universal_newlines=True, timeout=timeout_s,
+              creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
+    try:
+        r = subprocess.run(['git', 'rev-parse', 'HEAD'], **kw)
+        if r.returncode != 0:
+            out['error'] = r.stderr.strip() or 'git rev-parse failed'
+            return out
+        out['commit'] = r.stdout.strip()
+        r = subprocess.run(['git', 'status', '--porcelain', '--untracked-files=no'], **kw)
+        if r.returncode == 0:
+            out['dirty'] = bool(r.stdout.strip())
+        else:
+            out['error'] = r.stderr.strip() or 'git status failed'
+    except Exception as e:
+        out['error'] = f'{type(e).__name__}: {e}'
+    return out
 
 
 class ScanPlan:
@@ -743,7 +801,7 @@ from PyQt5.QtCore import QObject, QRectF, Qt, QTimer, pyqtSignal  # noqa: E402
 from PyQt5.QtGui import QImage  # noqa: E402
 from PyQt5.QtWidgets import (  # noqa: E402
     QCheckBox, QComboBox, QDoubleSpinBox, QFileDialog, QFormLayout, QGroupBox, QHBoxLayout,
-    QLabel, QLineEdit, QPushButton, QSpinBox, QWidget,
+    QLabel, QLineEdit, QMessageBox, QPushButton, QSpinBox, QWidget,
 )
 
 _COL_MAP = (80, 160, 255)
@@ -1000,7 +1058,8 @@ class ScanTool(QObject):
                      is saved, not single live captures
         gains_fn() -> (gain1, gain2) of the Acquisition tab (the scan gains)
         set_gains_fn(g1, g2): Gain1 then Gain2, always both (pulser fault)
-        temp_factory() -> Arduino-like (getTemperatures, close) or None: opened ONCE
+        temp_factory() -> Arduino-like (its serial port as `ser`, close) or None: opened
+                     ONCE per session and read only by the TemperatureLogger thread
         sos_fn(T) -> c_w from the water temperature (ECOS: water_temp2sos)
         cw_fn() -> (c_w, source) WITHOUT opening the Arduino, when there is no PT100
         info_fn() -> {specimen, protocol, equipment1, equipment2, name_parts}
@@ -1023,7 +1082,13 @@ class ScanTool(QObject):
         self.drift_corrected = False     # face ToF map corrected with the witness (live only)
         self.companion = True            # amplitude map beside the main one
         self._map_names = []
-        self.last_temp_read_s = None
+        self.last_temp_read_s = None     # last event reading (the newest sample of the log)
+        self.temp_open_s = None          # opening the Arduino (its constructor waits 2 s)
+        self._temp_log = None            # TemperatureLogger of the session (kept after the end
+                                         # for "Save to another folder…")
+        self._temp_warned = set()
+        self._code_version = None
+        self.cw_origin = None            # 'pt100', 'host' or 'nominal'
         self._acquire = acquire_fn
         self._counts_fn = counts_fn
         self.adc_bits = int(adc_bits)
@@ -1087,8 +1152,8 @@ class ScanTool(QObject):
         except Exception as e:
             return None, f'Estimate not available ({e}).', False
         acq_s, timed = acq_time(self._acq_time_fn)
-        temp_s = (self.last_temp_read_s or 0.0) if params.surface else 0.0
-        total = estimate_scan_s(plan, acq_s, overhead_s=self._move_overhead_s, temp_s=temp_s)
+        # The line-end temperature comes from the log in memory: no time per line.
+        total = estimate_scan_s(plan, acq_s, overhead_s=self._move_overhead_s)
         long_ = total > LONG_SCAN_S
         refs = ' + two water references (manual steps not included)' if params.references else ''
         wit = f' + witness point × {n_wit}' if n_wit else ''
@@ -1101,8 +1166,6 @@ class ScanTool(QObject):
                 f'{params.settle_ms / 1000.0:g} s settle ({params.line_settle_ms / 1000.0:g} s '
                 f'after a line change or a witness visit) + {params.avg_n} × {acq_s * 1e3:.0f} ms '
                 f'({"timed" if timed else "assumed"}) + {self._move_overhead_s:g} s per move.')
-        if params.surface and self.last_temp_read_s is None:
-            text += ' Temperature reading per line not timed yet (not included).'
         if long_:
             text += ' ⚠ Longer than half an hour.'
         return total, text, long_
@@ -1151,6 +1214,9 @@ class ScanTool(QObject):
         self._seq.reserve(self, 'A scan session is in progress (scanner tab).')
         if self._lock_fn:
             self._lock_fn(True)
+        self._code_version = code_version()
+        if not params.references:
+            self.warning.emit(NO_REFERENCES_WARNING)
         self._open_temperature()
         start_t = self._read_temperature('start', -1)
         if self._dump is not None:
@@ -1169,36 +1235,97 @@ class ScanTool(QObject):
         return None
 
     def _open_temperature(self):
-        self._arduino = None
+        """The session's Arduino and its TemperatureLogger, the only reader of the port
+        until _end. Waits up to FIRST_SAMPLE_TIMEOUT_S for a first line (the start
+        reading); without PT100 everything is NaN, as before."""
+        self._arduino = self._temp_log = None
+        self.temp_open_s = None
+        self._temp_warned = set()
         if self._temp_factory is not None:
+            t0 = time.monotonic()
             try:
                 self._arduino = self._temp_factory()
             except Exception as e:
                 self.warning.emit(f'PT100 could not be opened ({e}).')
                 self._arduino = None
-        if self._arduino is None:
+            self.temp_open_s = time.monotonic() - t0
+        if self._arduino is not None:
+            try:
+                self._temp_log = TemperatureLogger(self._arduino)
+                self._temp_log.start()
+            except Exception as e:
+                self.warning.emit(f'PT100 opened but its lines cannot be logged ({e}).')
+                self._close_arduino()
+                self._temp_log = None
+        if self._temp_log is None:
             self.warning.emit('PT100 not available: the temperatures of this scan are stored '
                               'as NaN (not available).')
+        elif not self._temp_log.wait_first(FIRST_SAMPLE_TIMEOUT_S):
+            self.warning.emit(f'PT100 opened, but no valid line in {FIRST_SAMPLE_TIMEOUT_S:g} s: '
+                              'the readings are NaN until one arrives.')
+
+    def _close_arduino(self):
+        try:
+            if self._arduino is not None:
+                self._arduino.close()
+        except Exception:
+            pass
+        self._arduino = None
+
+    def _check_temp_log(self, stale=False):
+        """Warn once if the log thread lost the port (the scan goes on) or, at an
+        event reading, if there was no fresh line."""
+        log = self._temp_log
+        if log is None:
+            return
+        if log.failure and 'failure' not in self._temp_warned:
+            self._temp_warned.add('failure')
+            self.warning.emit(f'PT100 log stopped ({log.failure["error"]}): the temperature '
+                              'series of this scan is incomplete. The scan goes on.')
+        elif stale and not log.failure and 'stale' not in self._temp_warned:
+            self._temp_warned.add('stale')
+            self.warning.emit(f'PT100: no new line for more than {log.stale_after_s:g} s: that '
+                              'reading is stored as NaN (stale), with its age.')
 
     def _read_temperature(self, label, point, line=None):
-        """One reading, with its time, the index of the last acquired point and the
-        line (the last line with acquired points when not given; −1 before any)."""
-        t1 = t2 = float('nan')
-        if self._arduino is not None:
+        """
+        One event reading: the newest sample of the PT100 log (never the port), with
+        its age; NaN when there is none or it is stale (temp_stale). Stamped with the
+        time of the event, the index of the last acquired point and the line (the last
+        line with acquired points when not given; −1 before any).
+        """
+        t1 = t2 = age = float('nan')
+        stale = True
+        if self._temp_log is not None:
             t0 = time.monotonic()
-            try:
-                r1, r2 = self._arduino.getTemperatures()
-                t1 = float('nan') if r1 is None else float(r1)
-                t2 = float('nan') if r2 is None else float(r2)
-            except Exception as e:
-                self.warning.emit(f'Temperature read failed ({e}): stored as NaN.')
+            s = self._temp_log.latest()
             self.last_temp_read_s = time.monotonic() - t0
+            age, stale = s['age_s'], bool(s['stale'])
+            if not stale:
+                t1, t2 = s['T1'], s['T2']
+            self._check_temp_log(stale)
         if line is None:
             line = self.data.line[-1] if self.data.line else -1
         entry = {'label': label, 'point': int(point), 'line': int(line), 'time': time.time(),
-                 'T1': t1, 'T2': t2}
+                 'T1': t1, 'T2': t2, 'age_s': age, 'stale': stale}
         self.data.temperatures.append(entry)
         return entry
+
+    def _stop_temperature(self):
+        """Stop the PT100 log (joins the thread, closes the port); idempotent. The log
+        object is kept: its series is saved, also by "Save to another folder…"."""
+        log = self._temp_log
+        if log is not None:
+            if log.stopped_cleanly is None and not log.stop():
+                self.warning.emit('The PT100 log thread did not stop in time (left as a '
+                                  'daemon thread: it does not keep the program open).')
+            self._arduino = None
+        else:
+            self._close_arduino()
+
+    def shutdown(self):
+        """Application closing: stop the PT100 log (and close its port) if it runs."""
+        self._stop_temperature()
 
     def _resolve_cw(self):
         t = self.data.temperatures[-1]
@@ -1206,8 +1333,10 @@ class ScanTool(QObject):
         if temps and self._sos_fn is not None:
             self.c_w = float(np.mean([self._sos_fn(v) for v in temps]))
             self.cw_source = 'PT100 ' + ', '.join(f'{v:.2f} °C' for v in temps)
+            self.cw_origin = 'pt100'
         else:
             self.c_w, self.cw_source = resolve_cw(self._cw_fn)
+            self.cw_origin = 'nominal' if self.cw_source.startswith('nominal') else 'host'
 
     def _coords4(self):
         c = self._panel.current_coords()
@@ -1505,6 +1634,7 @@ class ScanTool(QObject):
     def _on_point(self, i, coords, value):
         if self._phase != 'scan':
             return
+        self._check_temp_log()                   # the PT100 log may have lost its port
         e = self._schedule[i]
         self._cursor = i + 1
         if e.kind == 'witness':
@@ -1841,6 +1971,7 @@ class ScanTool(QObject):
     # -- saving ----------------------------------------------------------------
     def _finish_and_save(self, how):
         self._read_temperature('end', self.data.n - 1)
+        self._stop_temperature()                 # the series ends here and is saved whole
         self._completion = how
         try:
             path = self.save(self.base_dir)
@@ -1893,6 +2024,14 @@ class ScanTool(QObject):
         valid = cube([True] * n, False, bool)
         line_status = ['complete' if valid[k].all() else 'partial' for k in range(n_line)]
         equipment1 = dict(info.get('equipment1', {'nombre': 'SEDAQ'}))
+        for key in ('transductor_pe', 'transductor_tt'):       # present even when empty
+            equipment1[key] = str(equipment1.get(key, '') or '')
+        log = self._temp_log
+        equipment2 = dict(info.get('equipment2', {}))
+        equipment2['probes'] = probe_fields(equipment2.get('probes'))
+        equipment2['firmware'] = {
+            'baudrate': log.baudrate if log is not None else equipment2.get('baudrate'),
+            'identifier': '', 'identifier_note': FIRMWARE_ID_NOTE}
         params = dict(equipment1.get('params', {}))
         params.update(Gain_Ch1=self._scan_gains[0], Gain_Ch2=self._scan_gains[1],
                       F_muestreo=ACQ_FS, Smin=smin, Smax=smax, Slen=n_samp,
@@ -1929,12 +2068,31 @@ class ScanTool(QObject):
             'settle_avg_note': 'default settle 100 ms measured 2026-10-05, valid for steps '
                                '<= 0.5 mm; default averages (20) pending characterization',
             'c_w': self.c_w, 'c_w_source': self.cw_source,
+            'c_w_origin': self.cw_origin,
+            'c_w_origin_note': "pt100: c_w_model applied to the start sample of the PT100 "
+                               "series (mean of T1 and T2); host: the value the program had "
+                               "(c_w_source says where it came from: last reading, manual "
+                               "temperature, synthetic SeDaq); nominal: no temperature at all",
+            'c_w_model': dict(describe_cw_model(self._sos_fn),
+                              note='c_w(T) [m/s] from the water temperature [°C], used when '
+                                   'c_w_origin is pt100; the analysis can apply it to the '
+                                   'temperature series'),
+            'temperature_log': self._temperature_log_meta(),
+            'code_version': self._code_version,
             'references': p.references, 'ref_gains': [p.ref_gain1, p.ref_gain2],
             'ref_avg_n': p.ref_avg_n, 'reference_position': d.reference_position,
             'manual_axis_order': d.axis_order,
             'manual_moves': [{'axis': a, 'value': v, 'time': t} for a, v, t in d.manual_log],
             'tracking': {'band_us': p.band_us, 'threshold': p.threshold,
-                         'edge_margin': p.edge_margin, 'emission_sample': p.emission_sample},
+                         'edge_margin': p.edge_margin, 'emission_sample': p.emission_sample,
+                         'confident_contrast': CONFIDENT_CONTRAST,
+                         'edge_min_contrast': EDGE_MIN_CONTRAST,
+                         'contrast_note': 'echo_tracking constants: a clear echo has its '
+                                          'envelope peak >= confident_contrast × the median '
+                                          'envelope (also the noise floor of the lobe '
+                                          'threshold, max(confident_contrast·median, '
+                                          'threshold·max)); below edge_min_contrast a peak at '
+                                          'the window edge is noise'},
             'flags': {f'{k},{j}': f for k, j, f in zip(d.line, d.j, d.flags) if f},
             'flags_key': 'line,j',
             'reference_drift': d.drift,
@@ -1963,7 +2121,7 @@ class ScanTool(QObject):
         name = self.exp_name()
         path = save_scan_raw_32(
             specimen=info.get('specimen', {}), protocol=info.get('protocol', {}),
-            equipment1=equipment1, equipment2=info.get('equipment2', {}),
+            equipment1=equipment1, equipment2=equipment2,
             scanner_session=(self._panel.session_dict() if hasattr(self._panel, 'session_dict')
                              else {}),
             scan=scan,
@@ -1973,6 +2131,7 @@ class ScanTool(QObject):
             n_avg=p.avg_n, gains=self._scan_gains, adc_bits=self.adc_bits,
             coords=cube(d.coords, tail=(4,)), point_time=cube(d.times),
             temperatures=d.temperatures, references=refs, witness=self._witness_arrays(),
+            temp_series=log.series() if log is not None else None,
             operator=p.operator, comment=p.comment, base_dir=base_dir, exp_name=name,
             extra_arrays=dict(
                 self._point_cubes(),
@@ -2009,6 +2168,20 @@ class ScanTool(QObject):
                                        else v['measure'].n_top_ch1 for v in w], dtype=np.int64),
                 'n_top_ch2': np.array([-1 if v['measure'].n_top is None
                                        else v['measure'].n_top for v in w], dtype=np.int64)}
+
+    def _temperature_log_meta(self):
+        """The continuous PT100 log of the session (the series is in scan.npz)."""
+        timing = {'port_open_s': self.temp_open_s, 'last_temp_read_s': self.last_temp_read_s,
+                  'last_temp_read_note': 'an event reading takes the newest sample of the log '
+                                         'in memory; port_open_s includes the 2 s the Arduino '
+                                         'constructor waits for the board reset'}
+        if self._temp_log is None:
+            return dict(timing, enabled=False, n_lines=0, n_discarded=0, complete=None,
+                        note='no Arduino in this session: empty series, readings NaN')
+        return dict(timing, enabled=True, **self._temp_log.meta(),
+                    method='one thread reads every line the firmware sends and stamps it with '
+                           'time.time() and time.monotonic() of the PC when it is complete; '
+                           'the event readings (temp_*) take the newest sample and its age')
 
     def _witness_meta(self):
         p, d = self.params, self.data
@@ -2089,12 +2262,7 @@ class ScanTool(QObject):
         self._phase = None
         self._stop_watching()
         self._hold_live(False)
-        try:
-            if self._arduino is not None:
-                self._arduino.close()
-        except Exception:
-            pass
-        self._arduino = None
+        self._stop_temperature()
         if self._dump is not None and len(self._dump):
             self._dump.meta.update(result=text)
             try:
@@ -2117,10 +2285,13 @@ class ScanGroup(QGroupBox):
     of a single line: «Surface» enables the second-axis fields and the path.
     """
 
-    def __init__(self, tool, sequencer, parent=None):
+    def __init__(self, tool, sequencer, parent=None, confirm_fn=None):
+        """confirm_fn(title, text) -> bool: asks before a scan without water references
+        (a Yes/No dialog when None)."""
         super().__init__('Scan', parent)
         self._tool = tool
         self._seq = sequencer
+        self._confirm = confirm_fn or self._ask_yes_no
         form = QFormLayout(self)
 
         def dspin(lo, hi, val, dec, step, suffix):
@@ -2265,6 +2436,10 @@ class ScanGroup(QGroupBox):
         form.addRow(self._lbl_thick)
 
         self._chk_refs = QCheckBox('Take water references at the start and at the end')
+        self._chk_refs.setChecked(True)
+        self._chk_refs.setToolTip('Water path (WP) with the sample out, before and after the '
+                                  'scan. Without them the thermal correction of t_tw cannot '
+                                  'be done in the analysis.')
         self._spin_rg1 = dspin(0.0, 100.0, 0.0, 1, 1.0, ' dB')
         self._spin_rg2 = dspin(0.0, 100.0, 0.0, 1, 1.0, ' dB')
         self._rg2_touched = False
@@ -2464,11 +2639,22 @@ class ScanGroup(QGroupBox):
         if reason:
             self._lbl_status.setText(reason)
 
+    def _ask_yes_no(self, title, text):
+        return QMessageBox.question(self, title, text, QMessageBox.Yes | QMessageBox.No,
+                                    QMessageBox.No) == QMessageBox.Yes
+
     def _on_start(self):
         self._refresh_estimate()
+        params = self.params()
+        if not params.references and not self._confirm(
+                'Scan without water references',
+                NO_REFERENCES_WARNING + '\n\nStart the scan anyway?'):
+            self._lbl_status.setText('Not started: check «Take water references» or confirm '
+                                     'the scan without them.')
+            return
         self._lbl_warn.setText('')
         self._tool.set_magnitude(self._cmb_mag.currentData())
-        self._report(self._tool.start(self.params()))
+        self._report(self._tool.start(params))
 
     def _on_pause(self):
         if self._seq.state == 'paused':
