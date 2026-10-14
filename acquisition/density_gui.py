@@ -114,6 +114,12 @@ AVG_N             = 20       # A-scans averaged per acquisition
 AVG_MAX_ATTEMPTS_FACTOR = 4
 C_W_DEFAULT       = 1480.0   # m/s, when the temperature field is empty or not a number
 T_DEFAULT         = 20.0     # °C, shown with it
+# The temperature read at sW1 and at sW2 are kept apart; beyond this difference of their
+# means (°C) a warning is shown (never blocks). The same value as TEMP_DIFF_WARN_C in
+# ecos_gui.py (not imported: importing ecos_gui runs its whole start-up). Between the two
+# signals 0.1 °C changes c_w enough to read as 0.4–1.3 % of the level rise (3 × 30 × 30 mm
+# sample, 4–5 cm column).
+TEMP_DIFF_WARN_C  = 0.1
 
 _DB_DIR      = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'database')
 DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'data')
@@ -237,6 +243,7 @@ class DensityGUI(QMainWindow):
         # Acquisition state
         self._sW1 = None
         self._sW2 = None
+        self._temp_readings = {}      # {'sW1' | 'sW2': reading at that acquisition}
         self._r_vessel_cal = None   # calibrated vessel radius [cm]
 
         # ── Build UI ─────────────────────────────────────────────────────
@@ -623,6 +630,11 @@ class DensityGUI(QMainWindow):
         self._lbl_cw = QLabel(f"T = {self._T:.1f} °C   cw = {self._cw:.1f} m/s  ({self._cw_source})")
         self._lbl_cw.setWordWrap(True)
         layout.addWidget(self._lbl_cw)
+        # The temperature read at sW1 and at sW2 (both saved) and their mean, to type
+        # into T manual; the c_w of the calculation stays the one above.
+        self._lbl_temp_readings = QLabel("sW1: —\nsW2: —")
+        self._lbl_temp_readings.setWordWrap(True)
+        layout.addWidget(self._lbl_temp_readings)
         return box
 
     # =======================================================================
@@ -1084,10 +1096,82 @@ class DensityGUI(QMainWindow):
     # =======================================================================
     #  Acquisition buttons
     # =======================================================================
+    def _read_temperature_record(self, label):
+        """
+        The temperature at an acquisition (label 'sW1' or 'sW2'): T1, T2, c_w, time and
+        source. From the Arduino (read_arduino_once: opened and closed here) when there is
+        one; if it does not answer, or there is none, the T manual field at this moment
+        ('manual'), or the values in use if the field is not a number ('default'). Never a
+        dialog, never blocks the acquisition, and the c_w of the calculation is unchanged.
+        """
+        T1 = T2 = None
+        source, note = None, None
+        if self._arduino_factory is not None or _HW_AVAILABLE:
+            port = self._txt_arduino_port.text().strip()
+            try:
+                r1, r2 = read_arduino_once(port, self._arduino_factory)
+                temps = [float(t) for t in (r1, r2) if t is not None]
+                if temps:
+                    T1, T2 = temps[0], temps[-1]
+                    source = "PT100"
+                else:
+                    note = f"no temperature received from the Arduino on {port}"
+            except Exception as e:
+                note = f"Arduino on {port} not read ({e})"
+            if note:
+                print(f"[density_gui] {label}: {note}; the T manual field is used.")
+        if source is None:
+            try:
+                T1 = T2 = float(self._txt_temp_manual.text())
+                source = "manual"
+            except ValueError:
+                T1 = T2 = self._T
+                source = "default"
+        now = time.time()
+        rec = {"label": label, "T1": T1, "T2": T2,
+               "cw_ms": (cw_from_temperature(T1) + cw_from_temperature(T2)) / 2.0,
+               "time": now,
+               "time_iso": datetime.datetime.fromtimestamp(now).isoformat(timespec="seconds"),
+               "source": source}
+        if note:
+            rec["note"] = note
+        return rec
+
+    def _store_temperature(self, label, reading):
+        """Keep the reading of an acquisition that succeeded and show both."""
+        self._temp_readings[label] = reading
+        self._update_temp_readings_label()
+
+    def _update_temp_readings_label(self):
+        """The two readings, the mean of both (to type into T manual) and an orange
+        warning, never blocking, when their means differ by more than TEMP_DIFF_WARN_C."""
+        r = self._temp_readings
+        parts, means = [], []
+        for key in ("sW1", "sW2"):
+            rec = r.get(key)
+            if rec is None:
+                parts.append(f"{key}: —")
+                continue
+            means.append((rec["T1"] + rec["T2"]) / 2.0)
+            parts.append(f"{key}: T1 {rec['T1']:.2f} / T2 {rec['T2']:.2f} °C at "
+                         f"{rec['time_iso'][11:]} ({rec['source']})")
+        if means:
+            parts.append(f"Mean of the readings: {sum(means) / len(means):.2f} °C "
+                         "(type it into T manual to use it)")
+        text, style = "\n".join(parts), ""
+        if len(means) == 2 and abs(means[0] - means[1]) > TEMP_DIFF_WARN_C:
+            text += (f"\n⚠ sW1 and sW2 differ by {abs(means[0] - means[1]):.2f} °C "
+                     f"(> {TEMP_DIFF_WARN_C} °C): the change of c_w reads as level rise.")
+            style = "color: rgb(230, 120, 0);"
+        self._lbl_temp_readings.setText(text)
+        self._lbl_temp_readings.setStyleSheet(style)
+
     def _on_acquire_sw1(self):
         self._timer.stop()
         try:
+            reading = self._read_temperature_record('sW1')
             self._sW1 = self._acquire_ch2_avg()
+            self._store_temperature('sW1', reading)
             self._lbl_acq_status.setText("sW1 acquired — ready for sW2")
             self._btn_compute.setEnabled(self._sW1 is not None and self._sW2 is not None)
         except AcquisitionCancelled as e:
@@ -1100,7 +1184,9 @@ class DensityGUI(QMainWindow):
     def _on_acquire_sw2(self):
         self._timer.stop()
         try:
+            reading = self._read_temperature_record('sW2')
             self._sW2 = self._acquire_ch2_avg()
+            self._store_temperature('sW2', reading)
             self._lbl_acq_status.setText("sW2 acquired — ready to compute")
             self._btn_compute.setEnabled(self._sW1 is not None and self._sW2 is not None)
         except AcquisitionCancelled as e:
@@ -1187,6 +1273,11 @@ class DensityGUI(QMainWindow):
             "density_gcm3":  density,
             "reclen":        self._reclen,
             "avg_n":         int(self._txt_n_avg.text()),
+            # The reading at each acquisition, apart (T_C / cw_ms above stay the values the
+            # calculation used, from the T manual field or the last Arduino read).
+            "temperature_sW1": self._temp_readings.get('sW1'),
+            "temperature_sW2": self._temp_readings.get('sW2'),
+            "cw_model":        "water_temp2sos",
         }
         with open(str(exp_dir / "density.json"), "w") as f:
             json.dump(result, f, indent=2)

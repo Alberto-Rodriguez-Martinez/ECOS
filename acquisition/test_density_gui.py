@@ -199,6 +199,102 @@ class TestArduinoReading(_Window):
         self.assertEqual((self.win._T, self.win._cw), before)
 
 
+class TestTwoTemperatureReadings(_Window):
+    """A temperature read at sW1 and at sW2, kept apart, shown with their mean, a warning
+    beyond TEMP_DIFF_WARN_C; the c_w of the calculation unchanged."""
+
+    def acquire_at(self, ports, t_sw1, t_sw2):
+        ports.temps = (t_sw1, t_sw1)
+        self.win._on_acquire_sw1()
+        ports.temps = (t_sw2, t_sw2)
+        self.win._on_acquire_sw2()
+
+    def test_two_readings_from_the_arduino(self):
+        ports = FakeArduinoPorts()
+        self.win._arduino_factory = ports
+        cw_before = self.win._cw
+        self.acquire_at(ports, 24.0, 24.3)
+        r = self.win._temp_readings
+        self.assertEqual((r['sW1']['T1'], r['sW2']['T1']), (24.0, 24.3))
+        self.assertEqual((r['sW1']['source'], r['sW2']['source']), ('PT100', 'PT100'))
+        self.assertAlmostEqual(r['sW2']['cw_ms'], self.dg.cw_from_temperature(24.3))
+        self.assertLessEqual(r['sW1']['time'], r['sW2']['time'])
+        self.assertEqual(ports.open, set())                     # closed after every read
+        self.assertEqual(self.win._cw, cw_before)               # the calculation's c_w kept
+        label = self.win._lbl_temp_readings.text()
+        self.assertIn('Mean of the readings: 24.15 °C', label)
+        self.assertIn('differ by 0.30', label)
+
+    def test_warning_threshold(self):
+        self.assertEqual(self.dg.TEMP_DIFF_WARN_C, 0.1)
+        ports = FakeArduinoPorts()
+        self.win._arduino_factory = ports
+        self.acquire_at(ports, 24.0, 24.05)                     # clearly below 0.1 °C
+        self.assertNotIn('differ', self.win._lbl_temp_readings.text())
+        self.assertEqual(self.win._lbl_temp_readings.styleSheet(), '')
+        self.acquire_at(ports, 24.0, 24.15)                     # clearly above
+        self.assertIn('differ by 0.15', self.win._lbl_temp_readings.text())
+        self.assertIn('230, 120, 0', self.win._lbl_temp_readings.styleSheet())
+
+    def test_manual_without_arduino(self):
+        self.win._txt_temp_manual.setText("22.5")              # not applied: only read
+        self.win._on_acquire_sw1()
+        rec = self.win._temp_readings['sW1']
+        self.assertEqual((rec['T1'], rec['T2'], rec['source']), (22.5, 22.5, 'manual'))
+        self.win._txt_temp_manual.setText("abc")
+        self.win._on_acquire_sw2()
+        self.assertEqual(self.win._temp_readings['sW2']['source'], 'default')
+        self.assertEqual(self.win._temp_readings['sW2']['T1'], self.win._T)
+
+    def test_arduino_failing_falls_back_to_the_field_without_dialogs(self):
+        self.win._arduino_factory = FakeArduinoPorts(fail_open=True)
+        self.win._txt_temp_manual.setText("21.0")
+        with mock.patch.object(self.dg.QMessageBox, 'warning') as warn, \
+                mock.patch.object(self.dg.QMessageBox, 'critical') as crit:
+            self.win._on_acquire_sw1()
+        self.assertFalse(warn.called or crit.called)
+        rec = self.win._temp_readings['sW1']
+        self.assertEqual((rec['T1'], rec['source']), (21.0, 'manual'))
+        self.assertIn('not read', rec['note'])
+        self.assertIsNotNone(self.win._sW1)                     # the acquisition went on
+
+    def test_cancelled_acquisition_keeps_no_reading(self):
+        with mock.patch.object(self.dg.QProgressDialog, 'wasCanceled', return_value=True):
+            self.win._on_acquire_sw1()
+        self.assertNotIn('sW1', self.win._temp_readings)
+
+    def test_density_unchanged_and_new_keys_saved(self):
+        out = tempfile.mkdtemp(prefix='density_save_')
+        self.addCleanup(shutil.rmtree, out, ignore_errors=True)
+        self.win._txt_temp_manual.setText("23.0")
+        self.win._on_temp_manual_changed()
+        cw = self.dg.cw_from_temperature(23.0)
+        self.win._txt_r_vessel.setText("2.25")
+        self.win._txt_mass.setText("6.5")
+        ports = FakeArduinoPorts()
+        self.win._arduino_factory = ports
+        self.acquire_at(ports, 30.0, 30.2)                      # readings ≠ the field
+        with mock.patch.object(self.dg.QFileDialog, 'getExistingDirectory', return_value=out):
+            self.win._on_compute_save()
+        folder = os.path.join(out, os.listdir(out)[0])
+        with open(os.path.join(folder, 'density.json')) as f:
+            d = json.load(f)
+        delta_tof = 1.5e-6                                      # the demo ΔToF
+        delta_h = cw * delta_tof / 2.0 * 100.0
+        density = 6.5 / (np.pi * 2.25 ** 2 * delta_h)
+        self.assertAlmostEqual(d['delta_tof_s'], delta_tof)
+        self.assertAlmostEqual(d['delta_h_cm'], delta_h)
+        self.assertAlmostEqual(d['density_gcm3'], density)      # same formula, same c_w
+        self.assertAlmostEqual(d['cw_ms'], cw)
+        self.assertEqual(d['T_C'], 23.0)
+        self.assertEqual((d['temperature_sW1']['T1'], d['temperature_sW2']['T1']), (30.0, 30.2))
+        self.assertEqual(d['temperature_sW1']['source'], 'PT100')
+        self.assertEqual(d['cw_model'], 'water_temp2sos')
+        for key in ('datetime', 'sample_id', 'pva_pct', 'r_vessel_cm', 'mass_g', 'V_disp_cm3',
+                    'reclen', 'avg_n'):
+            self.assertIn(key, d)                               # the existing keys kept
+
+
 class _ZeroSeDaq:
     """A digitizer that only delivers constant (all-zero after the mean) captures."""
 
