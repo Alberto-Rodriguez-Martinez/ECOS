@@ -54,6 +54,10 @@ from PyQt5.QtWidgets import (
 from hardware.scanner.Scanner import Scanner
 from hardware.scanner.sim_scanner import FakeSerial
 
+if _THIS_DIR not in sys.path:          # session_io lives next to this file
+    sys.path.append(_THIS_DIR)
+from session_io import keep_damaged, load_session  # noqa: E402
+
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
@@ -649,30 +653,16 @@ class ScannerPanel(QWidget):
 
         self._coords = {ax: 0.0 for ax in AXES}
 
-        self._session = self._load_session_from_disk()
-        beam = self._session.get('beam_axis', 'Y')
-        self._role_axis = role_axis_map(beam)
-        self._pe_side = self._session.get('pe_side', 'origin')
-        self._limits = {ax: float(self._session.get('limits', {}).get(ax, SESSION_DEFAULT_LIMITS_MM[ax]))
-                         for ax in AXES}
-        # task_scanner_jog.md: 'jog' replaces the old 'step' session key. An
-        # old JSON with 'step' still loads (used as the initial jog); the
-        # next save writes only 'jog'.
-        jog_source = self._session.get('jog', self._session.get('steps', {}))
-        self._jogs = {ax: float(jog_source.get(ax, JOG_DEFAULTS_MM[ax])) for ax in AXES}
-        # SPR has no effect on R (verified 23/09/2026): only X/Y/Z carry a
-        # speed. An old session JSON with a speeds.R value is simply never
-        # read here, so it is ignored without error (task_scanner_r_axis.md
-        # point 3).
-        self._speeds = {ax: int(self._session.get('speeds', {}).get(ax, 100))
-                         for ax in SPEED_AXES}
-
-        # task_scanner_r_axis.md point 1: R-stepwise mode (default on) and
-        # the pause between its 1.8 deg sub-steps, both persisted to the
-        # session.
-        self._r_stepwise = bool(self._session.get('r_stepwise', True))
-        self._r_step_pause_ms = self._clamp_r_pause(
-            self._session.get('r_step_pause_ms', R_STEP_PAUSE_MS_DEFAULT))
+        # A session that cannot be read (bad JSON, or values of the wrong type) is
+        # kept aside as .bak and the defaults are used; session_notice says so
+        # (shown in the Connection result and, embedded, in the ECOS status bar).
+        self._session, self.session_notice = self._load_session_from_disk()
+        try:
+            self._read_session_values(self._session)
+        except Exception as e:
+            self.session_notice = keep_damaged(SESSION_FILE, e)
+            self._session = {}
+            self._read_session_values({})
 
         self._movement_widgets = []
         # Subset of movement controls that only make sense as absolute
@@ -714,6 +704,35 @@ class ScannerPanel(QWidget):
         self._refresh_role_speed_fields()
         self._refresh_role_jog_fields()
         self._update_enabled_state()
+        if self.session_notice:
+            print(f'[scanner_panel] {self.session_notice}')
+            self._lbl_result.setText(self.session_notice)
+
+    def _read_session_values(self, session):
+        """Session values into the panel state (no widgets: called before _build_ui)."""
+        beam = session.get('beam_axis', 'Y')
+        self._role_axis = role_axis_map(beam)
+        self._pe_side = session.get('pe_side', 'origin')
+        self._limits = {ax: float(session.get('limits', {}).get(ax, SESSION_DEFAULT_LIMITS_MM[ax]))
+                        for ax in AXES}
+        # task_scanner_jog.md: 'jog' replaces the old 'step' session key. An
+        # old JSON with 'step' still loads (used as the initial jog); the
+        # next save writes only 'jog'.
+        jog_source = session.get('jog', session.get('steps', {}))
+        self._jogs = {ax: float(jog_source.get(ax, JOG_DEFAULTS_MM[ax])) for ax in AXES}
+        # SPR has no effect on R (verified 23/09/2026): only X/Y/Z carry a
+        # speed. An old session JSON with a speeds.R value is simply never
+        # read here, so it is ignored without error (task_scanner_r_axis.md
+        # point 3).
+        self._speeds = {ax: int(session.get('speeds', {}).get(ax, 100))
+                        for ax in SPEED_AXES}
+
+        # task_scanner_r_axis.md point 1: R-stepwise mode (default on) and
+        # the pause between its 1.8 deg sub-steps, both persisted to the
+        # session.
+        self._r_stepwise = bool(session.get('r_stepwise', True))
+        self._r_step_pause_ms = self._clamp_r_pause(
+            session.get('r_step_pause_ms', R_STEP_PAUSE_MS_DEFAULT))
 
     # =======================================================================
     #  UI construction
@@ -1707,8 +1726,18 @@ class ScannerPanel(QWidget):
         self._lbl_result.setText('Session saved.')
 
     def _on_load_session_clicked(self):
-        self._session = self._load_session_from_disk()
-        self._apply_session_dict(self._session)
+        session, notice = self._load_session_from_disk()
+        if notice is None:
+            try:
+                self._apply_session_dict(session)
+                self._session = session
+            except Exception as e:
+                notice = keep_damaged(SESSION_FILE, e)
+                self._apply_session_dict(self._session)   # back to the values in use
+        if notice:
+            print(f'[scanner_panel] {notice}')
+            self._lbl_result.setText(notice + ' The current values are kept.')
+            return
         self._lbl_result.setText('Session loaded.')
 
     def _apply_session_dict(self, d):
@@ -1746,13 +1775,10 @@ class ScannerPanel(QWidget):
 
     @staticmethod
     def _load_session_from_disk():
-        if os.path.exists(SESSION_FILE):
-            try:
-                with open(SESSION_FILE) as f:
-                    return json.load(f)
-            except Exception:
-                return {}
-        return {}
+        """(session dict, notice): {} and a notice when the file cannot be read (it is
+        then kept as .bak, session_io); ({}, None) when there is no file."""
+        data, notice = load_session(SESSION_FILE)
+        return (data or {}), notice
 
     def _write_session_file(self):
         data = self._session_file_data()
@@ -1760,6 +1786,7 @@ class ScannerPanel(QWidget):
             with open(SESSION_FILE, 'w') as f:
                 json.dump(data, f, indent=2)
         except Exception as e:
+            print(f'[scanner_panel] Could not save session to {SESSION_FILE}: {e}')
             self._lbl_result.setText(f'Could not save session: {e}')
 
     def _session_file_data(self):

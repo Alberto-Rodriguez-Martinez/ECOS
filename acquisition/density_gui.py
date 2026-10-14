@@ -61,6 +61,8 @@ _ACQ_DIR = os.path.dirname(os.path.abspath(__file__))
 if _ACQ_DIR not in sys.path:
     sys.path.append(_ACQ_DIR)
 from session_io import keep_damaged, load_session  # noqa: E402
+# The one c_w(T) model of ECOS, also in demo mode: the same T gives the same c_w.
+from SpeedsoundWater import water_temp2sos  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # CLI arguments
@@ -88,7 +90,6 @@ else:
     try:
         from SeDaq import SeDaqDLL
         from GenCode_ToolBox import MakeGenCode
-        from SpeedsoundWater import water_temp2sos
         from temperature_Alberto_temporal import Arduino
         from ECOS_US_ToolBox import CalcToFAscanCosine_XCRFFT
         _HW_AVAILABLE = True
@@ -130,11 +131,9 @@ class AcquisitionCancelled(Exception):
 
 
 def cw_from_temperature(T):
-    """c_w [m/s] at T [°C]: water_temp2sos with the hardware modules, else the Marczak
-    approximation (demo), as the temperature handlers always did."""
-    if _HW_AVAILABLE:
-        return float(water_temp2sos(T))
-    return 1402.7 + 4.88 * T - 0.0482 * T ** 2  # Marczak approximation
+    """c_w [m/s] at T [°C]: water_temp2sos, with or without hardware (as ecos_gui and the
+    scans), whatever the origin of the temperature (field or Arduino)."""
+    return float(water_temp2sos(T))
 
 
 def read_arduino_once(port, factory=None):

@@ -120,6 +120,26 @@ class TestTemperatureFieldNotANumber(_Window):
         self.assertNotIn("not a number", self.win._lbl_cw.text())
 
 
+class TestOneCwModel(_Window):
+    """The same T gives the same c_w from the field and from the Arduino, by
+    water_temp2sos also in demo (it used 1402.7 + 4.88·T − 0.0482·T² there)."""
+
+    def test_field_and_arduino_agree(self):
+        T = 25.0
+        expected = float(self.dg.water_temp2sos(T))
+        self.win._txt_temp_manual.setText(f"{T}")
+        self.win._on_temp_manual_changed()
+        cw_field = self.win._cw
+        self.win._arduino_factory = FakeArduinoPorts(temps=(T, T))
+        self.win._on_read_arduino()
+        cw_arduino = self.win._cw
+        self.assertAlmostEqual(cw_field, expected, places=9)
+        self.assertAlmostEqual(cw_arduino, expected, places=9)
+        self.assertAlmostEqual(self.dg.cw_from_temperature(T), expected, places=9)
+        self.assertGreater(abs(expected - (1402.7 + 4.88 * T - 0.0482 * T ** 2)), 1.0)
+        self.assertFalse(self.dg._HW_AVAILABLE)                 # demo mode, all the same
+
+
 class FakeArduinoPorts:
     """Arduino-like objects on simulated ports: a second open of a port that was not
     closed fails, as a busy COM port does on Windows."""

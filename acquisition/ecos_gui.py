@@ -145,7 +145,7 @@ else:
 
 DEFAULT_GAIN_CH1  = 65
 DEFAULT_GAIN_CH2  = 35
-DEFAULT_VOLTAGE   = 100
+DEFAULT_VOLTAGE   = 50       # V; a saved session overrides it
 DEFAULT_RECLEN    = 16384
 DEFAULT_ACQ_FS    = 100e6
 DEFAULT_GEN_FS    = 200e6
@@ -406,6 +406,8 @@ class EcosGUI(QMainWindow):
         # ── Scanner panel (embedded as a tab, see _build_right_panel) ─────────
         if ScannerPanel is not None:
             self._scanner_panel = ScannerPanel(use_sim=self._demo or _SIM_MODE)
+            if self._scanner_panel.session_notice:     # its session could not be read
+                self._show_startup_notice("Scanner: " + self._scanner_panel.session_notice)
         else:
             self._scanner_panel = None
 
@@ -907,15 +909,15 @@ class EcosGUI(QMainWindow):
         self._txt_smax.editingFinished.connect(self._on_smin_smax_edited)
         layout.addLayout(win_row)
 
-        # Transducers of the scans (meta.json, transductor_pe / transductor_tt). The point
-        # measurement below still saves its own fixed description.
+        # Transducers, written into meta.json (transductor_pe / transductor_tt) by the point
+        # measurement and by the scans; empty unless filled in (no default is guessed).
         transd = QFormLayout()
         self._txt_transducer_pe = QLineEdit("")
         self._txt_transducer_tt = QLineEdit("")
         self._txt_transducer_pe.setPlaceholderText("e.g. model, frequency, focus")
         self._txt_transducer_tt.setPlaceholderText("e.g. model, frequency, focus")
-        transd.addRow("Transducer PE (scans):", self._txt_transducer_pe)
-        transd.addRow("Transducer TT (scans):", self._txt_transducer_tt)
+        transd.addRow("Transducer PE (point and scans):", self._txt_transducer_pe)
+        transd.addRow("Transducer TT (point and scans):", self._txt_transducer_tt)
         layout.addLayout(transd)
 
         # Acquisition buttons
@@ -2307,8 +2309,8 @@ class EcosGUI(QMainWindow):
         specimen = self._specimen_dict()
         equipment1 = {
             "nombre":          "SEDAQ",
-            "transductor_pe":  "No enfocado 10MHz",
-            "transductor_tt":  "No enfocado 10MHz",
+            "transductor_pe":  self._txt_transducer_pe.text().strip(),
+            "transductor_tt":  self._txt_transducer_tt.text().strip(),
             "params": {
                 "Gain_Ch1":        int(float(self._txt_gain_ch1.text())),
                 "Gain_Ch2":        int(float(self._txt_gain_ch2.text())),

@@ -519,6 +519,46 @@ class TestPointMeasurementFlow(_LiveWindow):
         self.assertEqual(meta['temperatures']['cw_model'], 'water_temp2sos')
         self.assertEqual(signals['Signal_Ref'].size, signals['Signal_PE'].size)
 
+    def save_point(self, name):
+        """Acquire, apply and save with the real save function into a temporary folder;
+        (meta, results) read back."""
+        from unittest import mock
+        gui = _ENV['gui']
+        sys.path.insert(0, os.path.join(_HERE, '..', 'database'))
+        import BD_Experimentos_PVA as bd
+        self.acquire_both()
+        self.win._on_apply_window()
+        out = tempfile.mkdtemp(prefix='ecos_point_save_')
+        self.addCleanup(shutil.rmtree, out, ignore_errors=True)
+        self.win._txt_exp_name.setText(name)
+        with mock.patch.object(gui, '_HW_AVAILABLE', True), \
+                mock.patch.object(gui, 'save_experiment_raw_32', bd.save_experiment_raw_32,
+                                  create=True), \
+                mock.patch.object(gui.QFileDialog, 'getExistingDirectory', return_value=out):
+            self.win._on_compute_save()
+        meta, results, _, _ = bd.load_raw32(os.path.join(out, name))
+        return meta, results
+
+    def test_point_transducers_from_the_fields(self):
+        """The point measurement writes the Transducer PE / TT fields (shared with the
+        scans), never the old fixed text; empty when not filled in."""
+        meta, _ = self.save_point('PVA_10_PG_05_A_C003_US_20261014_130000')
+        e1 = meta['equipment']['device_1_ultrasound']
+        self.assertEqual((e1['transductor_pe'], e1['transductor_tt']), ('', ''))
+        self.win._txt_transducer_pe.setText(' V310 5 MHz ')
+        self.win._txt_transducer_tt.setText('V311 5 MHz')
+        meta, _ = self.save_point('PVA_10_PG_05_A_C003_US_20261014_130001')
+        e1 = meta['equipment']['device_1_ultrasound']
+        self.assertEqual((e1['transductor_pe'], e1['transductor_tt']),
+                         ('V310 5 MHz', 'V311 5 MHz'))
+        self.assertNotIn('No enfocado', json.dumps(meta))
+
+    def test_transducer_labels_say_point_and_scans(self):
+        from PyQt5.QtWidgets import QLabel
+        texts = [lbl.text() for lbl in self.win.findChildren(QLabel)]
+        self.assertIn('Transducer PE (point and scans):', texts)
+        self.assertIn('Transducer TT (point and scans):', texts)
+
     def test_save_without_folder_says_so(self):
         from unittest import mock
         self.acquire_both()
@@ -585,8 +625,10 @@ class TestOldPointFilesLoad(unittest.TestCase):
         self.addCleanup(shutil.rmtree, d, ignore_errors=True)
         os.makedirs(os.path.join(d, 'signals'))
         meta = {'schema_version': 'raw-32-1.0', 'experiment': {'id': 'X'}, 'specimen': {},
-                'equipment': {'device_1_ultrasound': {'params': {'F_muestreo': 1e8,
-                                                                 'Smin': 10}}}}
+                'equipment': {'device_1_ultrasound': {
+                    'transductor_pe': 'No enfocado 10MHz',     # the old fixed text
+                    'transductor_tt': 'No enfocado 10MHz',
+                    'params': {'F_muestreo': 1e8, 'Smin': 10}}}}
         with open(os.path.join(d, 'meta.json'), 'w') as f:
             json.dump(meta, f)
         with open(os.path.join(d, 'results.json'), 'w') as f:
@@ -603,6 +645,47 @@ class TestOldPointFilesLoad(unittest.TestCase):
         except ImportError:
             return
         self.assertEqual(ecos_loader.load_us(d)['Cl'], 1548.0)
+
+
+class TestVoltageDefault(unittest.TestCase):
+    """Voltage defaults to 50 V; a saved session overrides it."""
+
+    def open_with(self, session):
+        if os.path.exists(_ENV['session']):
+            os.remove(_ENV['session'])
+        if session is not None:
+            with open(_ENV['session'], 'w') as f:
+                json.dump(session, f)
+        win = _ENV['gui'].EcosGUI()
+        win._timer.stop()
+        self.addCleanup(win.close)
+        return win
+
+    def test_default_50(self):
+        self.assertEqual(_ENV['gui'].DEFAULT_VOLTAGE, 50)
+        self.assertEqual(self.open_with(None)._txt_voltage.text(), '50')
+
+    def test_session_overrides(self):
+        self.assertEqual(self.open_with({'voltage': '80'})._txt_voltage.text(), '80')
+
+
+class TestScannerSessionNotice(unittest.TestCase):
+    """A damaged scanner session is also said in the ECOS status bar (point 3)."""
+
+    def test_forwarded(self):
+        from unittest import mock
+        sp = sys.modules['scanner_panel']
+        path = os.path.join(_ENV['tmp'], 'scanner_session.json')
+        with open(path, 'w') as f:
+            f.write('{"beam_axis": ')
+        if os.path.exists(_ENV['session']):
+            os.remove(_ENV['session'])
+        with mock.patch.object(sp, 'SESSION_FILE', path):
+            win = _ENV['gui'].EcosGUI()
+            win._timer.stop()
+            self.assertIn('Scanner: Session file', win.statusBar().currentMessage())
+            win.close()
+        self.assertTrue(os.path.exists(path + '.bak'))
 
 
 class TestDamagedSession(unittest.TestCase):
