@@ -53,7 +53,7 @@ several periods) is stored as NaN. Without PT100: NaN, an empty series and a
 warning at the start, never the (modal) manual dialog.
 
 Saving: one folder per scan, database/<PVA_..._SCAN_<ts>>/ meta.json + scan.npz
-(BD_Experimentos_PVA.save_scan_raw_32, schema scan-32-2.0), automatically at
+(BD_Experimentos_PVA.save_scan_raw_32, schema scan-32-3.3), automatically at
 the end, or on demand after a STOP. "Save to another folder…" writes a copy.
 No results: they are computed later, in the analysis. The signals are stored as
 the integer sums of counts of the averaged captures plus a per-point offset

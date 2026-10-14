@@ -55,7 +55,9 @@ class Scanner():
         # Set default speedtypes to 'rectangular'
         self.setSpeedtypes()
     
-        # Set default speeds (mm/s): 100, 100, 100, 100
+        # Set default speeds: 100, 100, 100, 100. A firmware parameter (1-65536),
+        # not mm/s: at 100 the X axis moves at about 6.7 mm/s (scanner_tab_spec.md
+        # section 1); it has no effect on R.
         self.setSpeeds()
         
         self.home = [0, 0, 0, 0]

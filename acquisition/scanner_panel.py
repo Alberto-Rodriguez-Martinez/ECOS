@@ -11,8 +11,9 @@ and the port-list wording): worker thread + command queue, status, session
 origin), free-movement mode (unlimited signed jog, no GUI/firmware limit
 protection) and STOP. Phase 2 (task_scanner_phase2.md): the panel is also
 embedded as a tab of ecos_gui.py (shutdown() is then called by the host window).
-No focus/flatness/scan tools yet (task_scanner_freemode.md point 4: those must
-gate on ScannerPanel.is_free_movement_active() once they exist).
+The focus, flatness, stability and scan tools are added by the host as sub-tab
+widgets (add_tool_widget); they gate on sequence_blocker(), which includes
+is_free_movement_active() (task_scanner_freemode.md point 4).
 
 Run standalone:
     python acquisition/scanner_panel.py          (real hardware)
@@ -299,7 +300,7 @@ class ScannerWorker(QThread):
         elif op == 'move_point':
             self._do_move_point(*cmd[1:])
         elif op == 'set_limits':
-            self._do_set_limits(cmd[1])
+            self._do_set_limits(*cmd[1:])
         elif op == 'set_zero':
             self._do_set_zero(cmd[1])
         elif op == 'set_speeds':
@@ -506,8 +507,8 @@ class ScannerWorker(QThread):
         """
         task_scanner_r_axis.md point 1: moves R by `total_degrees` (signed,
         relative) using diffMoveR, or unlimitedDiffMoveR in free-movement
-        mode. When `stepwise` is True (the default, from the 'Mover R paso a
-        paso' checkbox), it is split into independent R_STEP_UNIT (1.8 deg)
+        mode. When `stepwise` is True (the default, from the 'Move R step by
+        step' checkbox), it is split into independent R_STEP_UNIT (1.8 deg)
         commands with `pause_ms` between them -- verified on hardware
         23/09/2026: one large continuous move loses steps once the sample
         holder is mounted, but loose 1.8 deg orders do not (task_scanner_r_
@@ -580,13 +581,34 @@ class ScannerWorker(QThread):
                 self.moved_axis.emit('R', self.scanner.getAxis('R'))
 
     # -- session: limits / zero / set-value / speeds -----------------------
-    def _do_set_limits(self, limits_dict):
+    def _do_set_limits(self, limits_dict, check_position=()):
+        """
+        Send each limit (SL) and read the four back. For the axes in check_position
+        the position is read back first (never a stale GUI value) and the limit is not
+        sent if the axis is above it, so Apply can never leave an axis out of range.
+        A reply other than OK is reported (error signal), not only printed; the limits
+        shown are always the ones read back.
+        """
         if self.scanner is None:
             return
         self.busy.emit(True)
         try:
             for axis, value in limits_dict.items():
-                self.scanner.setAxisLimit(axis, value)
+                ustep = self.scanner.getuSteps(axis)
+                steps = int(round(value / ustep))
+                if axis in check_position:
+                    pos = self.scanner.getAxis(axis)
+                    self.moved_axis.emit(axis, pos)
+                    if int(round(pos / ustep)) > steps:
+                        self.error.emit(
+                            f'{axis} is at {pos:g}, above the new limit {value:g}: move it '
+                            'below first. Limit not changed.')
+                        continue
+                reply = self.scanner.write(f'SL{axis}{steps}')
+                if reply[:2] != b'OK':
+                    self.error.emit(f'The controller did not accept the limit {value:g} for '
+                                    f'{axis} (reply {reply!r}). The limit shown is the one read '
+                                    'back.')
             self.limits.emit(self.scanner.getLimits())
         finally:
             self.busy.emit(False)
@@ -712,7 +734,9 @@ class ScannerPanel(QWidget):
         """Session values into the panel state (no widgets: called before _build_ui)."""
         beam = session.get('beam_axis', 'Y')
         self._role_axis = role_axis_map(beam)
-        self._pe_side = session.get('pe_side', 'origin')
+        # Default Max: the PE transducer of the real set-up is at the high end of the
+        # beam axis. A saved session overrides it.
+        self._pe_side = session.get('pe_side', 'max')
         self._limits = {ax: float(session.get('limits', {}).get(ax, SESSION_DEFAULT_LIMITS_MM[ax]))
                         for ax in AXES}
         # task_scanner_jog.md: 'jog' replaces the old 'step' session key. An
@@ -744,7 +768,7 @@ class ScannerPanel(QWidget):
         # Free-movement banner: kept outside the scroll area, so it stays
         # visible ("bien visible en el panel") no matter where the user has
         # scrolled to (task_scanner_freemode.md point 4).
-        self._lbl_free_banner = QLabel('MOVIMIENTO LIBRE — sin protección de límites')
+        self._lbl_free_banner = QLabel('FREE MOVEMENT — no limit protection')
         self._lbl_free_banner.setAlignment(Qt.AlignCenter)
         self._lbl_free_banner.setStyleSheet(
             'background-color: #b00020; color: white; font-weight: bold; '
@@ -884,6 +908,10 @@ class ScannerPanel(QWidget):
         self._cmb_pe_side = QComboBox()
         self._cmb_pe_side.addItems(['Origin', 'Max'])
         self._cmb_pe_side.setCurrentIndex(0 if self._pe_side == 'origin' else 1)
+        self._cmb_pe_side.setToolTip(
+            'At which end of the beam-axis travel the pulse-echo (PE) transducer is: '
+            'Origin (near 0) or Max (near the limit). It sets the sign of the echo shift '
+            'when the beam axis moves (focus).')
         self._cmb_pe_side.currentIndexChanged.connect(self._on_pe_side_changed)
         cfg_row.addWidget(self._cmb_pe_side)
         layout.addLayout(cfg_row)
@@ -978,7 +1006,7 @@ class ScannerPanel(QWidget):
         # Free-movement mode toggle (task_scanner_freemode.md point 4):
         # replaces the removed "=N" maneuver for setting zero/limits. See
         # _on_free_movement_toggled for the confirm/deactivate dialogs.
-        self._btn_free_movement = QPushButton('Movimiento libre (sin límites)')
+        self._btn_free_movement = QPushButton('Free movement (no limits)')
         self._btn_free_movement.setCheckable(True)
         self._btn_free_movement.toggled.connect(self._on_free_movement_toggled)
         layout.addWidget(self._btn_free_movement)
@@ -990,11 +1018,11 @@ class ScannerPanel(QWidget):
         # between, because a single large continuous move loses steps once
         # the sample holder is mounted (verified on hardware 23/09/2026).
         r_step_row = QHBoxLayout()
-        self._chk_r_stepwise = QCheckBox('Mover R paso a paso')
+        self._chk_r_stepwise = QCheckBox('Move R step by step')
         self._chk_r_stepwise.setChecked(self._r_stepwise)
         self._chk_r_stepwise.toggled.connect(self._on_r_stepwise_toggled)
         r_step_row.addWidget(self._chk_r_stepwise)
-        r_step_row.addWidget(QLabel('Pausa entre pasos de R (ms):'))
+        r_step_row.addWidget(QLabel('Pause between R steps (ms):'))
         self._edit_r_pause_ms = QLineEdit(str(self._r_step_pause_ms))
         self._edit_r_pause_ms.setFixedWidth(50)
         self._edit_r_pause_ms.editingFinished.connect(self._on_r_pause_edited)
@@ -1003,7 +1031,7 @@ class ScannerPanel(QWidget):
         self._movement_widgets += [self._chk_r_stepwise, self._edit_r_pause_ms]
 
         r_step_note = QLabel(
-            'Sin trocear y con el soporte de muestras puesto, el eje R pierde pasos.'
+            'Not split into steps, and with the sample holder mounted, the R axis loses steps.'
         )
         r_step_note.setWordWrap(True)
         r_step_note.setStyleSheet('color: gray; font-size: 10px;')
@@ -1142,8 +1170,11 @@ class ScannerPanel(QWidget):
         # shared _LockingSerialProxy from the GUI thread, exactly so it can
         # interrupt a move while the worker is blocked inside Scanner.write's
         # own polling loop (see _LockingSerialProxy docstring for the lock).
-        # NOT verified on real hardware: what the controller replies to a
-        # move interrupted like this (scanner_tab_spec.md section 8).
+        # Verified on hardware (22-24/09/2026, scanner_tab_spec.md section 8,
+        # "Resueltos"): this STOP stops a move while the worker is blocked in
+        # Scanner.write(). The exact reply of the controller to the interrupted
+        # move is not recorded anywhere; the position is read back afterwards
+        # (read_status below) rather than taken from that reply.
         ser = self._worker.ser
         if ser is None:
             self._lbl_result.setText('STOP: not connected.')
@@ -1367,7 +1398,7 @@ class ScannerPanel(QWidget):
             if axis == 'R':
                 # task_scanner_r_axis.md point 1: R never moves with a
                 # single absolute SM; always diffMoveR/unlimitedDiffMoveR,
-                # chopped into 1-step commands unless 'Mover R paso a paso'
+                # chopped into 1-step commands unless 'Move R step by step'
                 # is off (see ScannerWorker._run_r_step_sequence).
                 rounded_jog = round_r_jog(jog)
                 if abs(rounded_jog - jog) > 1e-6:
@@ -1610,24 +1641,23 @@ class ScannerPanel(QWidget):
     def _on_free_movement_toggled(self, checked):
         if checked:
             box = QMessageBox(self)
-            box.setWindowTitle('Movimiento libre')
+            box.setWindowTitle('Free movement')
             box.setIcon(QMessageBox.Warning)
             box.setText(
-                'El firmware deja de proteger el recorrido: los botones -/+ '
-                'moverán el eje aunque se salga de [0, límite] o pase a ser '
-                'negativo.\n\n'
-                'La responsabilidad de evitar colisiones (con los '
-                'transductores u otros elementos) pasa a ser del usuario.\n\n'
-                '¿Activar el movimiento libre?'
+                'The firmware no longer protects the travel: the -/+ buttons '
+                'will move the axis even beyond [0, limit] or below zero.\n\n'
+                'Avoiding collisions (with the transducers or anything else) '
+                'becomes the responsibility of the user.\n\n'
+                'Turn free movement on?'
             )
-            btn_activate = box.addButton('Activar', QMessageBox.AcceptRole)
-            box.addButton('Cancelar', QMessageBox.RejectRole)
+            btn_activate = box.addButton('Turn on', QMessageBox.AcceptRole)
+            box.addButton('Cancel', QMessageBox.RejectRole)
             box.setDefaultButton(btn_activate)
             box.exec_()
             if box.clickedButton() is btn_activate:
                 self._free_movement = True
                 self._lbl_free_banner.setVisible(True)
-                self._lbl_result.setText('Movimiento libre activado: sin protección de límites.')
+                self._lbl_result.setText('Free movement on: no limit protection.')
                 self._update_enabled_state()
             else:
                 self._btn_free_movement.blockSignals(True)
@@ -1643,24 +1673,24 @@ class ScannerPanel(QWidget):
 
         lines = '\n'.join(
             f'  {ax}: {fmt_pos(ax, self._coords.get(ax, 0.0))} '
-            f'(límite {fmt_pos(ax, self._limits.get(ax, 0.0))})'
+            f'(limit {fmt_pos(ax, self._limits.get(ax, 0.0))})'
             for ax in out_of_range
         )
         box = QMessageBox(self)
-        box.setWindowTitle('Movimiento libre — ejes fuera de rango')
+        box.setWindowTitle('Free movement — axes out of range')
         box.setIcon(QMessageBox.Warning)
         box.setText(
-            f'Estos ejes están fuera de su rango [0, límite]:\n\n{lines}\n\n'
-            '· Fijar cero aquí: pone a cero SOLO estos ejes fuera de rango '
-            '(los demás no se tocan).\n'
-            '· Mantener posición: desactiva el modo libre sin mover nada; '
-            'los destinos absolutos (Move to / Go to origin) fallarán en '
-            'estos ejes hasta que se corrija.\n'
-            '· Seguir en modo libre: cancela la desactivación.'
+            f'These axes are out of their range [0, limit]:\n\n{lines}\n\n'
+            '· Zero here: zeroes ONLY these out-of-range axes (the others are '
+            'not touched).\n'
+            '· Keep position: turns free movement off without moving anything; '
+            'absolute targets (Move to / Go to origin) will fail on these axes '
+            'until it is corrected.\n'
+            '· Stay in free movement: cancels turning it off.'
         )
-        btn_zero = box.addButton('Fijar cero aquí', QMessageBox.AcceptRole)
-        btn_keep = box.addButton('Mantener posición', QMessageBox.DestructiveRole)
-        btn_stay = box.addButton('Seguir en modo libre', QMessageBox.RejectRole)
+        btn_zero = box.addButton('Zero here', QMessageBox.AcceptRole)
+        btn_keep = box.addButton('Keep position', QMessageBox.DestructiveRole)
+        btn_stay = box.addButton('Stay in free movement', QMessageBox.RejectRole)
         box.setDefaultButton(btn_stay)
         box.exec_()
         clicked = box.clickedButton()
@@ -1670,10 +1700,10 @@ class ScannerPanel(QWidget):
         elif clicked is btn_keep:
             self._deactivate_free_movement()
             self._lbl_result.setText(
-                'Movimiento libre desactivado con posiciones fuera de rango: '
-                'los destinos absolutos fallarán hasta corregirlo.'
+                'Free movement off with axes out of range: absolute targets '
+                'will fail until it is corrected.'
             )
-        else:  # Seguir en modo libre: cancel, keep it on.
+        else:  # Stay in free movement: cancel, keep it on.
             self._btn_free_movement.blockSignals(True)
             self._btn_free_movement.setChecked(True)
             self._btn_free_movement.blockSignals(False)
@@ -1696,7 +1726,20 @@ class ScannerPanel(QWidget):
             if value is None or value < 0:
                 QMessageBox.warning(self, 'Scanner', 'Invalid limit value.')
                 return
-            self._worker.enqueue(('set_limits', {axis: value}))
+            # The axis must not end up above its own limit. R is not checked: its
+            # counter is circular (see _run_r_step_sequence) and its limit is left as
+            # it was (task report).
+            check = () if axis == 'R' else (axis,)
+            pos = self._coords.get(axis, 0.0)
+            if check and pos > value + 1e-9:
+                text = (f'{axis} is at {fmt_pos(axis, pos)}, above the new limit '
+                        f'{value:g} mm: move it below first. Limit not changed.')
+                self._lbl_result.setText(text)
+                self._refresh_all_role_limit_fields()          # back to the limit in use
+                QMessageBox.warning(self, 'Scanner', text)
+                return
+            # The worker checks again with the position read back (never stale).
+            self._worker.enqueue(('set_limits', {axis: value}, check))
         return handler
 
     def _make_zero_handler(self, role):
@@ -1747,7 +1790,7 @@ class ScannerPanel(QWidget):
         self._cmb_beam_axis.setCurrentText(beam)
         self._cmb_beam_axis.blockSignals(False)
 
-        self._pe_side = d.get('pe_side', 'origin')
+        self._pe_side = d.get('pe_side', 'max')
         self._cmb_pe_side.blockSignals(True)
         self._cmb_pe_side.setCurrentIndex(0 if self._pe_side == 'origin' else 1)
         self._cmb_pe_side.blockSignals(False)
