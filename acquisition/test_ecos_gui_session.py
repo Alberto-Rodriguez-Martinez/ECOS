@@ -354,8 +354,9 @@ class TestAxisCwFrozen(_LiveWindow):
         win = self.win
         self.enter_manual()
         win._radio_mm.setChecked(True)
-        self.assertIn(f'c_w {win._approx_cw(20.0):.1f} m/s, manual, T = 20.0 °C', self.label())
-        self.assertEqual(win._axis_unit()[1], win._approx_cw(20.0))
+        cw20 = float(_ENV['gui'].water_temp2sos(20.0))
+        self.assertIn(f'c_w {cw20:.1f} m/s, manual, T = 20.0 °C', self.label())
+        self.assertEqual(win._axis_unit()[1], cw20)
         self.assertIsNone(win._latest_temperature())     # files: still not a reading
         self.pt100(1499.0)                               # a reading replaces it
         win._btn_retake_cw.click()
@@ -442,7 +443,7 @@ class TestPointMeasurementFlow(_LiveWindow):
         def read():
             if ok:
                 st.T1 = st.T2 = T
-                st.Cw1 = st.Cw2 = st.Cw_mean = self.win._approx_cw(T)
+                st.Cw1 = st.Cw2 = st.Cw_mean = float(_ENV['gui'].water_temp2sos(T))
             return ok
         return read
 
@@ -476,14 +477,18 @@ class TestPointMeasurementFlow(_LiveWindow):
         self.assertEqual(st.temp_readings['wp']['T1'], 20.5)
         self.assertLessEqual(st.temp_readings['pett']['time'], st.temp_readings['wp']['time'])
         self.assertEqual(st.temp_used, 'wp')                  # the calculation: the last one
-        self.assertEqual(st.Cw_mean, self.win._approx_cw(20.5))
+        self.assertEqual(st.Cw_mean, float(_ENV['gui'].water_temp2sos(20.5)))
         label = self.win._lbl_res_temps.text()
         self.assertIn('s_PE + s_TT: T1 20.00', label)
         self.assertIn('s_W: T1 20.50', label)
         self.assertIn('differ by 0.50', label)                # > TEMP_DIFF_WARN_C: a warning
-        self.win._read_temperature = self.fake_reading(20.1)
+        self.win._read_temperature = self.fake_reading(20.05)   # within 0.1 °C: no warning
         self.win._on_acquire_wp()
         self.assertNotIn('differ', self.win._lbl_res_temps.text())
+        self.win._read_temperature = self.fake_reading(20.15)   # beyond 0.1 °C: warning
+        self.win._on_acquire_wp()
+        self.assertIn('differ by 0.15', self.win._lbl_res_temps.text())
+        self.assertEqual(_ENV['gui'].TEMP_DIFF_WARN_C, 0.1)
 
     def test_both_readings_saved_new_keys_old_ones_kept(self):
         from unittest import mock
@@ -511,6 +516,7 @@ class TestPointMeasurementFlow(_LiveWindow):
         self.assertEqual(results['cw_used_from'], 's_W')
         self.assertEqual(meta['temperatures']['pett']['source'], 'assumed (no hardware)')
         self.assertIn('wp', meta['temperatures'])
+        self.assertEqual(meta['temperatures']['cw_model'], 'water_temp2sos')
         self.assertEqual(signals['Signal_Ref'].size, signals['Signal_PE'].size)
 
     def test_save_without_folder_says_so(self):
@@ -520,6 +526,53 @@ class TestPointMeasurementFlow(_LiveWindow):
         with mock.patch.object(_ENV['gui'].QFileDialog, 'getExistingDirectory', return_value=''):
             self.win._on_compute_save()
         self.assertIn('Not saved', self.win._lbl_save_status.text())
+
+
+class TestOneCwModel(_LiveWindow):
+    """The same T gives the same c_w whatever its origin: PT100, manual or demo, all by
+    water_temp2sos (the manual and demo paths used 1402.7 + 4.88·T − 0.0482·T²)."""
+
+    def test_pt100_manual_and_demo_agree(self):
+        from unittest import mock
+        gui, win, T = _ENV['gui'], self.win, 20.0
+
+        class FakeArduino:
+            def __init__(self, **kw):
+                pass
+
+            def getTemperatures(self):
+                return T, T
+
+            def close(self):
+                pass
+        with mock.patch.object(gui, '_HW_AVAILABLE', True), \
+                mock.patch.object(gui, 'Arduino', FakeArduino, create=True):
+            self.assertTrue(win._read_temperature())
+        self.assertEqual(win._temp_note['source'], 'PT100 (Acquisition tab)')
+        cw_pt100 = win._state.Cw_mean
+        with mock.patch.object(gui.QDialog, 'exec_', lambda _self: gui.QDialog.Accepted):
+            self.assertTrue(win._ask_manual_temperature())   # its default entry: 20.0 °C
+        self.assertEqual(win._manual_temp['T'], T)
+        cw_manual = win._state.Cw_mean
+        self.assertTrue(win._read_temperature())             # demo: assumed 20 °C
+        cw_demo = win._state.Cw_mean
+        expected = float(gui.water_temp2sos(T))
+        self.assertAlmostEqual(cw_pt100, expected, places=9)
+        self.assertAlmostEqual(cw_manual, expected, places=9)
+        self.assertAlmostEqual(cw_demo, expected, places=9)
+        self.assertGreater(abs(expected - (1402.7 + 4.88 * T - 0.0482 * T ** 2)), 1.0)
+        self.assertFalse(hasattr(gui.EcosGUI, '_approx_cw'))
+
+    def test_source_still_says_where_the_temperature_came_from(self):
+        from unittest import mock
+        gui, win = _ENV['gui'], self.win
+        with mock.patch.object(gui.QDialog, 'exec_', lambda _self: gui.QDialog.Accepted), \
+                mock.patch.object(win, '_read_temperature', win._ask_manual_temperature):
+            win._read_temperature_for('pett')
+        self.assertEqual(win._state.temp_readings['pett']['source'], 'manual')
+        win._read_temperature_for('wp')                       # demo reading
+        self.assertEqual(win._state.temp_readings['wp']['source'], 'assumed (no hardware)')
+        self.assertEqual(win._state.temp_used, 'wp')
 
 
 class TestOldPointFilesLoad(unittest.TestCase):

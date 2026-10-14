@@ -116,6 +116,9 @@ except Exception as _bd_err:      # keep the original naming if the module canno
     print(f"[ecos_gui] BD_Experimentos_PVA unavailable: {_bd_err}")
 
 from session_io import keep_damaged, load_session  # noqa: E402
+# The one c_w(T) model of ECOS, whatever the origin of the temperature (PT100, manual,
+# demo): also with no hardware, so the same T always gives the same c_w.
+from SpeedsoundWater import water_temp2sos  # noqa: E402
 
 _HW_ERROR = None                  # why the hardware could not be loaded (not with --demo)
 if _ARGS.demo:
@@ -133,7 +136,6 @@ else:
         from ECOS_US_ToolBox import MakeWindow, Envelope, LongVelocity_Thickness
         from temperature_Alberto_temporal import Arduino
         from BD_Experimentos_PVA import save_experiment_raw_32
-        from SpeedsoundWater import water_temp2sos
         _HW_AVAILABLE = True
         print("[ecos_gui] Hardware modules loaded OK.")
     except Exception as _hw_err:
@@ -156,9 +158,8 @@ DEFAULT_COM       = "COM3"
 AVG_MAX_ATTEMPTS_FACTOR = 4  # captures tried per requested average before giving up
 # Point measurement: the temperature read at s_PE + s_TT and at s_W are kept apart;
 # beyond this difference of their means (°C) a warning is shown (never blocks).
-# 0.2 °C ≈ 0.3 m/s of c_w near 36 °C (≈ 0.6 m/s near 20 °C), twice the 0.1 °C the
-# drift tolerance of the scans is set at.
-TEMP_DIFF_WARN_C = 0.2
+# 0.1 °C between WP and TT is about 15 ns in t_tw, about 22 µm in L for a 3 mm sample.
+TEMP_DIFF_WARN_C = 0.1
 TEMP_PURPOSES = {'pett': 's_PE + s_TT', 'wp': 's_W', 'button': 'Read from Arduino'}
 
 # ADC resolution of the SeDaq. It cannot be read from the equipment (SeDaqDLL
@@ -1452,7 +1453,7 @@ class EcosGUI(QMainWindow):
         """Read temperature from Arduino. On failure, shows manual-entry dialog."""
         if not _HW_AVAILABLE:
             T = 20.0
-            cw = self._approx_cw(T)
+            cw = float(water_temp2sos(T))
             self._state.T1 = self._state.T2 = T
             self._state.Cw1 = self._state.Cw2 = self._state.Cw_mean = cw
             self._temp_note = None        # assumed, not read: not reported as a reading
@@ -1501,7 +1502,7 @@ class EcosGUI(QMainWindow):
             T = float(txt.text())
         except ValueError:
             T = 20.0
-        cw = self._approx_cw(T)
+        cw = float(water_temp2sos(T))         # the same model as a PT100 reading
         self._state.T1 = self._state.T2 = T
         self._state.Cw1 = self._state.Cw2 = self._state.Cw_mean = cw
         self._temp_note = None            # manual, not read: not reported as a reading
@@ -1518,10 +1519,6 @@ class EcosGUI(QMainWindow):
                 f"T1: {s.T1:.2f} °C   T2: {s.T2:.2f} °C   "
                 f"Cw1: {s.Cw1:.1f} m/s   Cw2: {s.Cw2:.1f} m/s"
             )
-
-    @staticmethod
-    def _approx_cw(T):
-        return 1402.7 + 4.88 * T - 0.0482 * T ** 2
 
     # ==========================================================================
     #  Averaged acquisition helpers
@@ -1679,7 +1676,7 @@ class EcosGUI(QMainWindow):
             seq, panel, self._get_smin_smax, self._plot_stability,
             show_plot_fn=lambda: self._left_tabs.setCurrentWidget(self._plot_stability),
             temp_factory=self._open_seq_arduino,
-            sos_fn=water_temp2sos if _HW_AVAILABLE else self._approx_cw,
+            sos_fn=water_temp2sos,
             cw_fn=self._scanner_cw_no_read, gains_fn=self._scan_gains,
             acq_time_fn=lambda: getattr(self, '_t_ascan', None), parent=self)
         panel.add_tool_widget(StabilityGroup(self._stability_tool, seq), tab='calibration')
@@ -1703,7 +1700,7 @@ class EcosGUI(QMainWindow):
             counts_fn=self._last_counts_fn,
             adc_bits=ADC_BITS,
             temp_factory=self._open_seq_arduino,
-            sos_fn=water_temp2sos if _HW_AVAILABLE else self._approx_cw,
+            sos_fn=water_temp2sos,
             cw_fn=self._scanner_cw_no_read,
             info_fn=self._scan_experiment_info,
             base_dir=_DB_DIR,
@@ -1859,7 +1856,7 @@ class EcosGUI(QMainWindow):
             if manual is not None:
                 return self._state.Cw_mean, (
                     f"manual temperature T = {manual['T']:.2f} °C (Acquisition tab), c_w by "
-                    "1402.7 + 4.88·T − 0.0482·T² (_approx_cw), PT100 unavailable now")
+                    "water_temp2sos, PT100 unavailable now")
             return self._state.Cw_mean, "last temperature reading, PT100 unavailable now"
         return None
 
@@ -2350,6 +2347,10 @@ class EcosGUI(QMainWindow):
             "pett": readings.get("pett"),
             "wp": readings.get("wp"),
             "cw_used_from": TEMP_PURPOSES.get(st.temp_used, st.temp_used),
+            # c_w(T) model of every reading (PT100, manual or demo). Absent in the
+            # files saved before 2026-10-14, where a manual or demo temperature used
+            # 1402.7 + 4.88·T − 0.0482·T² instead.
+            "cw_model": "water_temp2sos",
             "note": "pett: read at 'Acquire s_PE + s_TT'; wp: at 'Acquire s_W'. Cl and d "
                     "use Cw_mean of the last reading (cw_used_from). age_s: not available "
                     "(the Arduino is opened afresh for every reading).",
