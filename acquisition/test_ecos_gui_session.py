@@ -428,6 +428,213 @@ class TestScanMetadataFields(_LiveWindow):
         self.assertTrue(win._btn_save.isEnabled())
 
 
+class TestPointMeasurementFlow(_LiveWindow):
+    """Point measurement (Acquisition tab): no silent returns (4) and the temperature of
+    each acquisition kept apart and saved (5)."""
+
+    def acquire_both(self):
+        self.win._on_acquire_pett()
+        self.win._on_acquire_wp()
+
+    def fake_reading(self, T, ok=True):
+        st = self.win._state
+
+        def read():
+            if ok:
+                st.T1 = st.T2 = T
+                st.Cw1 = st.Cw2 = st.Cw_mean = self.win._approx_cw(T)
+            return ok
+        return read
+
+    def test_apply_window_without_cw_says_what_is_missing(self):
+        from unittest import mock
+        self.acquire_both()
+        self.win._state.Cw_mean = None
+        with mock.patch.object(_ENV['gui'].QMessageBox, 'warning') as warn:
+            self.win._on_apply_window()
+        self.assertEqual(warn.call_count, 1)
+        text = warn.call_args[0][2]
+        self.assertIn('c_w', text)
+        self.assertIn('Read from Arduino', text)
+        self.assertIsNone(self.win._Cl)                       # nothing computed
+
+    def test_acquisition_without_temperature_says_so(self):
+        self.win._read_temperature = self.fake_reading(20.0, ok=False)
+        self.win._on_acquire_pett()
+        self.assertIn('NOT acquired', self.win._lbl_acq_status.text())
+        self.assertIsNone(self.win._state.PE_Ascan)
+        self.win._on_acquire_wp()
+        self.assertIn('NOT acquired', self.win._lbl_acq_status.text())
+
+    def test_two_readings_kept_apart_and_shown(self):
+        st = self.win._state
+        self.win._read_temperature = self.fake_reading(20.0)
+        self.win._on_acquire_pett()
+        self.win._read_temperature = self.fake_reading(20.5)
+        self.win._on_acquire_wp()
+        self.assertEqual(st.temp_readings['pett']['T1'], 20.0)
+        self.assertEqual(st.temp_readings['wp']['T1'], 20.5)
+        self.assertLessEqual(st.temp_readings['pett']['time'], st.temp_readings['wp']['time'])
+        self.assertEqual(st.temp_used, 'wp')                  # the calculation: the last one
+        self.assertEqual(st.Cw_mean, self.win._approx_cw(20.5))
+        label = self.win._lbl_res_temps.text()
+        self.assertIn('s_PE + s_TT: T1 20.00', label)
+        self.assertIn('s_W: T1 20.50', label)
+        self.assertIn('differ by 0.50', label)                # > TEMP_DIFF_WARN_C: a warning
+        self.win._read_temperature = self.fake_reading(20.1)
+        self.win._on_acquire_wp()
+        self.assertNotIn('differ', self.win._lbl_res_temps.text())
+
+    def test_both_readings_saved_new_keys_old_ones_kept(self):
+        from unittest import mock
+        gui = _ENV['gui']
+        sys.path.insert(0, os.path.join(_HERE, '..', 'database'))
+        import BD_Experimentos_PVA as bd
+        self.acquire_both()
+        self.win._on_apply_window()
+        self.assertIsNotNone(self.win._Cl)
+        out = tempfile.mkdtemp(prefix='ecos_point_save_')
+        self.addCleanup(shutil.rmtree, out, ignore_errors=True)
+        self.win._txt_exp_name.setText('PVA_10_PG_05_A_C003_US_20261014_120000')
+        with mock.patch.object(gui, '_HW_AVAILABLE', True), \
+                mock.patch.object(gui, 'save_experiment_raw_32', bd.save_experiment_raw_32,
+                                  create=True), \
+                mock.patch.object(gui.QFileDialog, 'getExistingDirectory', return_value=out):
+            self.win._on_compute_save()
+        folder = os.path.join(out, 'PVA_10_PG_05_A_C003_US_20261014_120000')
+        meta, results, signals, _ = bd.load_raw32(folder)
+        self.assertEqual(meta['schema_version'], 'raw-32-1.1')
+        for key in ('T1', 'T2', 'Cw1', 'Cw2', 'Cw_mean', 'Cl', 'd'):   # unchanged keys
+            self.assertIn(key, results)
+        self.assertEqual(results['temperature_pett']['purpose'], 's_PE + s_TT')
+        self.assertEqual(results['temperature_wp']['purpose'], 's_W')
+        self.assertEqual(results['cw_used_from'], 's_W')
+        self.assertEqual(meta['temperatures']['pett']['source'], 'assumed (no hardware)')
+        self.assertIn('wp', meta['temperatures'])
+        self.assertEqual(signals['Signal_Ref'].size, signals['Signal_PE'].size)
+
+    def test_save_without_folder_says_so(self):
+        from unittest import mock
+        self.acquire_both()
+        self.win._on_apply_window()
+        with mock.patch.object(_ENV['gui'].QFileDialog, 'getExistingDirectory', return_value=''):
+            self.win._on_compute_save()
+        self.assertIn('Not saved', self.win._lbl_save_status.text())
+
+
+class TestOldPointFilesLoad(unittest.TestCase):
+    """A raw-32-1.0 folder (no temperatures block) still loads (5)."""
+
+    def test_raw_32_1_0(self):
+        sys.path.insert(0, os.path.join(_HERE, '..', 'database'))
+        import BD_Experimentos_PVA as bd
+        d = tempfile.mkdtemp(prefix='ecos_old_point_')
+        self.addCleanup(shutil.rmtree, d, ignore_errors=True)
+        os.makedirs(os.path.join(d, 'signals'))
+        meta = {'schema_version': 'raw-32-1.0', 'experiment': {'id': 'X'}, 'specimen': {},
+                'equipment': {'device_1_ultrasound': {'params': {'F_muestreo': 1e8,
+                                                                 'Smin': 10}}}}
+        with open(os.path.join(d, 'meta.json'), 'w') as f:
+            json.dump(meta, f)
+        with open(os.path.join(d, 'results.json'), 'w') as f:
+            json.dump({'T1': 36.0, 'T2': 36.1, 'Cw1': 1523.0, 'Cw2': 1523.1,
+                       'Cw_mean': 1523.05, 'Cl': 1548.0, 'd': 0.02}, f)
+        np.savez_compressed(os.path.join(d, 'signals', 'signals.npz'), Signal_PE=np.zeros(5),
+                            Signal_TT=np.zeros(5), Signal_Ref=np.zeros(5))
+        m, r, s, t = bd.load_raw32(d)
+        self.assertEqual((m['schema_version'], r['Cl']), ('raw-32-1.0', 1548.0))
+        self.assertNotIn('temperatures', m)
+        try:
+            sys.path.insert(0, os.path.join(_HERE, '..', 'analysis'))
+            import ecos_loader                                   # needs pandas (64-bit env)
+        except ImportError:
+            return
+        self.assertEqual(ecos_loader.load_us(d)['Cl'], 1548.0)
+
+
+class TestDamagedSession(unittest.TestCase):
+    """A session that cannot be read: kept as .bak, defaults, said in the status bar (6)."""
+
+    def setUp(self):
+        self.path = _ENV['session']
+        for p in os.listdir(_ENV['tmp']):
+            if p.startswith(os.path.basename(self.path)):
+                os.remove(os.path.join(_ENV['tmp'], p))
+
+    def open_with(self, content):
+        with open(self.path, 'w') as f:
+            f.write(content)
+        win = _ENV['gui'].EcosGUI()
+        win._timer.stop()
+        return win
+
+    def check(self, win, content):
+        gui = _ENV['gui']
+        self.assertIn('could not be read', win.statusBar().currentMessage())
+        self.assertIn('default values are used', win.statusBar().currentMessage())
+        with open(self.path + '.bak') as f:
+            self.assertEqual(f.read(), content)                 # the damaged file, kept
+        self.assertEqual(win._txt_gain_ch1.text(), str(gui.DEFAULT_GAIN_CH1))
+        self.assertIsNotNone(gui.valid_region(win._get_smin_smax(), win._reclen))
+        win.close()
+        with open(self.path) as f:
+            json.load(f)                                        # a valid one written on close
+        with open(self.path + '.bak') as f:
+            self.assertEqual(f.read(), content)                 # never overwritten
+
+    def test_not_json(self):
+        content = '{"gain_ch1": "40", "region": [10'
+        self.check(self.open_with(content), content)
+
+    def test_wrong_types_mid_restore(self):
+        content = json.dumps({"gain_ch1": "40", "gain_ch2": 12, "region": [100, 3000]})
+        self.check(self.open_with(content), content)
+
+    def test_second_backup_does_not_overwrite_the_first(self):
+        self.open_with('garbage').close()
+        win = self.open_with('more garbage')
+        baks = sorted(p for p in os.listdir(_ENV['tmp']) if p.endswith('.bak'))
+        self.assertEqual(len(baks), 2)
+        win.close()
+
+
+class TestSimulatedAfterHardwareFailure(unittest.TestCase):
+    """The DLL fails without --demo: the simulator's session, never the hardware one, and
+    a notice on screen (7)."""
+
+    def test_session_file_for(self):
+        gui = _ENV['gui']
+        self.assertEqual(gui.session_file_for(True), gui.SIM_SESSION_FILE)
+        self.assertEqual(gui.session_file_for(False), gui.HW_SESSION_FILE)
+        self.assertEqual(gui.session_file_for(True, 'x.json'), 'x.json')
+
+    def test_fallback_uses_the_simulator_session(self):
+        from unittest import mock
+        gui = _ENV['gui']
+        sim = os.path.join(_ENV['tmp'], 'sim_session.json')
+        hw = os.path.join(_ENV['tmp'], 'hw_session.json')
+        with mock.patch.object(gui, '_SIM_MODE', False), \
+                mock.patch.object(gui, '_HW_ERROR', 'SeDaqDLL.dll not found'), \
+                mock.patch.object(gui, '_SESSION_EXPLICIT', None), \
+                mock.patch.object(gui, 'SIM_SESSION_FILE', sim), \
+                mock.patch.object(gui, 'HW_SESSION_FILE', hw):
+            win = gui.EcosGUI()
+            win._timer.stop()
+            self.assertTrue(win._demo)
+            self.assertEqual(win._session_file, sim)
+            self.assertIn('SIMULATED', win.windowTitle())
+            self.assertIn('SeDaqDLL.dll not found', win.statusBar().currentMessage())
+            win.close()
+        self.assertTrue(os.path.exists(sim))
+        self.assertFalse(os.path.exists(hw))                    # the hardware one untouched
+
+    def test_demo_flag_is_not_a_failure(self):
+        win = _ENV['gui'].EcosGUI()                             # --demo: asked for, no notice
+        win._timer.stop()
+        self.assertNotIn('SIMULATED', win.windowTitle())
+        win.close()
+
+
 class TestCorruptSessionRegion(unittest.TestCase):
     """06/10: the unit bug saved an empty Smin–Smax ([16384, 16384]) in the session."""
 

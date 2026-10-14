@@ -47,7 +47,7 @@ from PyQt5.QtWidgets import (
     QVBoxLayout, QHBoxLayout, QFormLayout,
     QGroupBox, QLabel, QLineEdit, QComboBox,
     QCheckBox, QPushButton,
-    QStackedWidget, QMessageBox,
+    QStackedWidget, QMessageBox, QProgressDialog,
     QSplitter, QScrollArea, QFileDialog,
 )
 from PyQt5.QtCore import QTimer, Qt
@@ -56,6 +56,11 @@ import pyqtgraph as pg
 
 sys.path.insert(0, _TOOLS_DIR)
 sys.path.insert(0, _HW_DIR)
+# acquisition/ itself (session_io): os.chdir(tools/) above, so not through the cwd
+_ACQ_DIR = os.path.dirname(os.path.abspath(__file__))
+if _ACQ_DIR not in sys.path:
+    sys.path.append(_ACQ_DIR)
+from session_io import keep_damaged, load_session  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # CLI arguments
@@ -64,6 +69,12 @@ _arg_parser = argparse.ArgumentParser(description="ECOS Density GUI")
 _arg_parser.add_argument(
     "--demo", action="store_true",
     help="Run in demo mode — skip hardware import, use simulated signals."
+)
+_arg_parser.add_argument(
+    "--session", metavar="FILE", default=None,
+    help="Session file to restore and save (default: density_gui_session.json next to "
+         "this script; also the ECOS_DENSITY_SESSION environment variable). Tests pass a "
+         "temporary one."
 )
 _ARGS = _arg_parser.parse_args()
 
@@ -77,7 +88,8 @@ else:
     try:
         from SeDaq import SeDaqDLL
         from GenCode_ToolBox import MakeGenCode
-        from SpeedsoundWater import water_temp2sos, get_Cw_from_arduino
+        from SpeedsoundWater import water_temp2sos
+        from temperature_Alberto_temporal import Arduino
         from ECOS_US_ToolBox import CalcToFAscanCosine_XCRFFT
         _HW_AVAILABLE = True
         print("[density_gui] Hardware modules loaded OK.")
@@ -95,11 +107,48 @@ DEFAULT_GEN_FS    = 200e6
 DEFAULT_ACQ_FS    = 100e6
 REALTIME_INTERVAL = 100      # ms
 AVG_N             = 20       # A-scans averaged per acquisition
+# Captures tried per requested average before giving up (as ecos_gui): an all-zero
+# capture (digitizer disconnected or failing) is discarded and retried, at most this
+# many times N in total, so the acquisition can never loop forever.
+AVG_MAX_ATTEMPTS_FACTOR = 4
+C_W_DEFAULT       = 1480.0   # m/s, when the temperature field is empty or not a number
+T_DEFAULT         = 20.0     # °C, shown with it
 
 _DB_DIR      = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'database')
 DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'data')
 
-SESSION_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'density_gui_session.json')
+SESSION_FILE = (_ARGS.session or os.environ.get('ECOS_DENSITY_SESSION') or os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), 'density_gui_session.json'))
+
+
+class AcquisitionError(RuntimeError):
+    """The digitizer did not deliver usable captures."""
+
+
+class AcquisitionCancelled(Exception):
+    """The user cancelled an acquisition: nothing was stored."""
+
+
+def cw_from_temperature(T):
+    """c_w [m/s] at T [°C]: water_temp2sos with the hardware modules, else the Marczak
+    approximation (demo), as the temperature handlers always did."""
+    if _HW_AVAILABLE:
+        return float(water_temp2sos(T))
+    return 1402.7 + 4.88 * T - 0.0482 * T ** 2  # Marczak approximation
+
+
+def read_arduino_once(port, factory=None):
+    """
+    (T1, T2) [°C] from an Arduino opened AND closed here, every time: get_Cw_from_arduino
+    leaves its port open (closePort=False by default), so a second reading could find
+    it busy. factory(port) -> Arduino-like (getTemperatures, close); the real class by
+    default.
+    """
+    arduino = (factory or (lambda p: Arduino(port=p, baudrate=115200, N_avg=3)))(port)
+    try:
+        return arduino.getTemperatures()
+    finally:
+        arduino.close()
 
 SIGNAL_YMIN = -0.5
 SIGNAL_YMAX =  0.5
@@ -181,8 +230,10 @@ class DensityGUI(QMainWindow):
 
         self._reclen  = DEFAULT_RECLEN
         self._running = True
-        self._cw      = 1480.0   # m/s — speed of sound in water, updated from T
-        self._T       = 20.0     # °C
+        self._cw      = C_W_DEFAULT   # m/s — speed of sound in water, updated from T
+        self._T       = T_DEFAULT     # °C
+        self._cw_source = "default"   # where _T/_cw come from: default, manual, Arduino
+        self._arduino_factory = None  # tests: factory(port) -> Arduino-like; None: the real one
 
         # Acquisition state
         self._sW1 = None
@@ -206,29 +257,39 @@ class DensityGUI(QMainWindow):
 
         self._syncing = False
 
-        # ── Restore previous session ──────────────────────────────────────
-        if os.path.exists(SESSION_FILE):
+        # ── Restore previous session (a damaged file is kept aside, defaults used) ──
+        data, notice = load_session(SESSION_FILE)
+        if data is not None:
             try:
-                with open(SESSION_FILE) as f:
-                    self._restore_session(json.load(f))
-                # Apply restored hardware values
-                try:
-                    self._sedaq.SetGain2(int(self._txt_gain_ch2.text()))
-                except Exception:
-                    pass
-                try:
-                    self._sedaq.SetExtVoltage(int(self._txt_voltage.text()))
-                except Exception:
-                    pass
-                try:
-                    reclen = int(self._txt_reclen.text())
-                    self._reclen = reclen
-                    self._sedaq.SetRecLen(reclen)
-                except Exception:
-                    pass
-                self._generate_upload()
+                self._restore_session(data)
+            except Exception as e:
+                notice = keep_damaged(SESSION_FILE, e)
+                self._restore_session({})
+            # Apply restored hardware values
+            try:
+                self._sedaq.SetGain2(int(self._txt_gain_ch2.text()))
             except Exception:
                 pass
+            try:
+                self._sedaq.SetExtVoltage(int(self._txt_voltage.text()))
+            except Exception:
+                pass
+            try:
+                reclen = int(self._txt_reclen.text())
+                self._reclen = reclen
+                self._sedaq.SetRecLen(reclen)
+            except Exception:
+                pass
+            try:
+                self._generate_upload()
+            except Exception as e:
+                print(f"[density_gui] GenCode upload after restoring the session: {e}")
+        if notice:
+            print(f"[density_gui] {notice}")
+            self.statusBar().showMessage(notice)
+        # T and c_w from what the temperature field shows (setText does not emit
+        # editingFinished), so the c_w on screen is the one the calculation uses.
+        self._on_temp_manual_changed()
 
         # ── Real-time acquisition timer ───────────────────────────────────
         self._timer = QTimer()
@@ -326,8 +387,8 @@ class DensityGUI(QMainWindow):
         try:
             with open(SESSION_FILE, 'w') as f:
                 json.dump(self._collect_session(), f, indent=2)
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"[density_gui] Session not saved to {SESSION_FILE}: {e}")
         if not self._demo:
             try:
                 self._sedaq.Close()
@@ -560,7 +621,8 @@ class DensityGUI(QMainWindow):
         btn_read.clicked.connect(self._on_read_arduino)
         layout.addWidget(btn_read)
 
-        self._lbl_cw = QLabel(f"T = {self._T:.1f} °C   cw = {self._cw:.1f} m/s")
+        self._lbl_cw = QLabel(f"T = {self._T:.1f} °C   cw = {self._cw:.1f} m/s  ({self._cw_source})")
+        self._lbl_cw.setWordWrap(True)
         layout.addWidget(self._lbl_cw)
         return box
 
@@ -858,40 +920,48 @@ class DensityGUI(QMainWindow):
     # =======================================================================
     #  Temperature
     # =======================================================================
+    def _show_cw(self, note=""):
+        """The T and c_w the calculation will use, with where they come from."""
+        self._lbl_cw.setText(f"T = {self._T:.1f} °C   cw = {self._cw:.1f} m/s  ({self._cw_source})"
+                             + (f" — {note}" if note else ""))
+        self._lbl_cw.setStyleSheet("color: rgb(230, 120, 0);" if note else "")
+
     def _on_temp_manual_changed(self):
+        """T and c_w from the 'T manual' field. Empty or not a number: the values in use
+        are kept (the default ones at start) and the label says so."""
         try:
             T = float(self._txt_temp_manual.text())
-            self._T = T
-            if _HW_AVAILABLE:
-                self._cw = water_temp2sos(T)
-            else:
-                self._cw = 1402.7 + 4.88 * T - 0.0482 * T ** 2  # Marczak approximation
-            self._lbl_cw.setText(f"T = {self._T:.1f} °C   cw = {self._cw:.1f} m/s")
         except ValueError:
-            pass
+            self._show_cw("T manual is empty or not a number: this value is used")
+            return
+        self._T = T
+        self._cw = cw_from_temperature(T)
+        self._cw_source = "manual"
+        self._show_cw()
 
     def _on_read_arduino(self):
-        if not _HW_AVAILABLE:
+        if self._arduino_factory is None and not _HW_AVAILABLE:
             QMessageBox.information(self, "Demo mode", "Arduino read not available in demo mode.")
             return
+        port = self._txt_arduino_port.text().strip()
         try:
-            port = self._txt_arduino_port.text().strip()
-            T1, T2, Cw1, Cw2 = get_Cw_from_arduino(port=port)
-            if T1 is not None and T2 is not None:
-                T = (T1 + T2) / 2.0
-                cw = (Cw1 + Cw2) / 2.0
-            elif T1 is not None:
-                T, cw = T1, Cw1
-            elif T2 is not None:
-                T, cw = T2, Cw2
-            else:
-                raise ValueError("Could not read temperature from Arduino")
-            self._T  = T
-            self._cw = cw
-            self._txt_temp_manual.setText(f"{T:.2f}")
-            self._lbl_cw.setText(f"T = {self._T:.1f} °C   cw = {self._cw:.1f} m/s")
+            T1, T2 = read_arduino_once(port, self._arduino_factory)
         except Exception as e:
-            QMessageBox.warning(self, "Arduino error", str(e))
+            QMessageBox.warning(self, "Arduino error",
+                                f"Could not read the Arduino on {port or '(no port)'}: {e}\n\n"
+                                "The temperature and c_w in use are unchanged.")
+            return
+        temps = [float(t) for t in (T1, T2) if t is not None]
+        if not temps:
+            QMessageBox.warning(self, "Arduino error",
+                                f"No temperature received from the Arduino on {port}.\n\n"
+                                "The temperature and c_w in use are unchanged.")
+            return
+        self._T = sum(temps) / len(temps)
+        self._cw = sum(cw_from_temperature(t) for t in temps) / len(temps)
+        self._cw_source = "Arduino"
+        self._txt_temp_manual.setText(f"{self._T:.2f}")
+        self._show_cw()
 
     # =======================================================================
     #  Excitation type selector + Generate & Upload
@@ -976,17 +1046,37 @@ class DensityGUI(QMainWindow):
     #  Internal: acquire AVG_N A-scans from Ch2, return averaged signal
     # =======================================================================
     def _acquire_ch2_avg(self):
+        """
+        Average of N valid Ch2 captures, in Smin–Smax. An all-zero capture is discarded
+        and retried, at most AVG_MAX_ATTEMPTS_FACTOR × N captures in all
+        (AcquisitionError beyond). A progress dialog with Cancel appears if it takes
+        more than half a second (AcquisitionCancelled).
+        """
         quant = BITS_OPTIONS[self._cmb_bits.currentText()]
         acc   = np.zeros(self._reclen)
-        n     = 0
-        n_avg = int(self._txt_n_avg.text())
-        while n < n_avg:
-            self._sedaq.GetAScan()
-            sig = self._raw_to_float(self._sedaq.DataADC2, self._reclen, quant)
-            if np.all(sig == 0.0):
-                continue
-            acc += sig
-            n   += 1
+        n = tries = 0
+        n_avg = max(1, int(self._txt_n_avg.text()))
+        max_tries = AVG_MAX_ATTEMPTS_FACTOR * n_avg
+        progress = QProgressDialog("Acquiring Ch2…", "Cancel", 0, n_avg, self)
+        progress.setWindowModality(Qt.WindowModal)
+        progress.setMinimumDuration(500)
+        try:
+            while n < n_avg:
+                if progress.wasCanceled():
+                    raise AcquisitionCancelled("Acquisition cancelled: nothing was stored.")
+                if tries >= max_tries:
+                    raise AcquisitionError(
+                        f"Acquisition failed: only {n} of {n_avg} valid captures after "
+                        f"{tries} attempts (all-zero signals; is the digitizer connected?)")
+                tries += 1
+                self._sedaq.GetAScan()
+                sig = self._raw_to_float(self._sedaq.DataADC2, self._reclen, quant)
+                if not np.all(sig == 0.0):
+                    acc += sig
+                    n   += 1
+                progress.setValue(n)          # also lets the Cancel button be pressed
+        finally:
+            progress.close()
         rmin, rmax = self._region.getRegion()
         smin = max(0, int(rmin))
         smax = min(self._reclen, int(rmax))
@@ -1001,6 +1091,8 @@ class DensityGUI(QMainWindow):
             self._sW1 = self._acquire_ch2_avg()
             self._lbl_acq_status.setText("sW1 acquired — ready for sW2")
             self._btn_compute.setEnabled(self._sW1 is not None and self._sW2 is not None)
+        except AcquisitionCancelled as e:
+            self._lbl_acq_status.setText(f"sW1: {e}")
         except Exception as e:
             QMessageBox.critical(self, "Acquisition error", str(e))
         finally:
@@ -1012,6 +1104,8 @@ class DensityGUI(QMainWindow):
             self._sW2 = self._acquire_ch2_avg()
             self._lbl_acq_status.setText("sW2 acquired — ready to compute")
             self._btn_compute.setEnabled(self._sW1 is not None and self._sW2 is not None)
+        except AcquisitionCancelled as e:
+            self._lbl_acq_status.setText(f"sW2: {e}")
         except Exception as e:
             QMessageBox.critical(self, "Acquisition error", str(e))
         finally:

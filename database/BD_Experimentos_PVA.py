@@ -17,6 +17,7 @@ from scan_counts import (ADC_BITS_DEFAULT, counts_to_float, counts_to_float_rows
                          quantizer, sum_dtype)
 
 DEFAULT_OPERATOR = "Sebas"      # save_experiment_raw_32 still writes it fixed
+POINT_SCHEMA_VERSION = "raw-32-1.1"   # point measurement (save_experiment_raw_32)
 
 
 def experiment_name(pva_pct, additive_pct, sample_id, cycles, exp_type="US", ts=None,
@@ -58,8 +59,15 @@ def save_experiment_raw_32(
     Signal_TT,       # np.ndarray (longitud Slen)
     Signal_Ref,      # np.ndarray (longitud Slen)
     base_dir="data_32",
-    exp_name=None    # si se proporciona, el directorio del experimento será base_dir/exp_name
+    exp_name=None,   # si se proporciona, el directorio del experimento será base_dir/exp_name
+    temperatures=None,  # dict opcional (raw-32-1.1): la lectura de cada adquisición
 ):
+    # Esquema de la medida de punto:
+    #   raw-32-1.0  meta.json + results.json + signals/signals.npz
+    #   raw-32-1.1  (2026-10-14) además, opcional, meta["temperatures"] con la lectura de
+    #               temperatura de cada adquisición (ecos_gui: pett, wp, cw_used_from);
+    #               nada cambia ni se quita. Los cargadores (load_raw32, ecos_loader.load_us)
+    #               no miran la versión y leen las dos.
     # Validaciones mínimas
     params = equipment1.get("params", {})
     Smin = int(params["Smin"]); Smax = int(params["Smax"]); Slen = int(params["Slen"])
@@ -75,7 +83,7 @@ def save_experiment_raw_32(
     (d / "signals").mkdir(parents=True, exist_ok=True)
 
     meta = {
-        "schema_version": "raw-32-1.0",
+        "schema_version": POINT_SCHEMA_VERSION,
         "experiment": {"id": exp_id, "timestamp_start": _now_iso(), "timestamp_end": _now_iso(), "operator": "Sebas"},
         "specimen": specimen,
         "protocol": protocol,
@@ -85,6 +93,8 @@ def save_experiment_raw_32(
         },
         "notes": ""
     }
+    if temperatures is not None:
+        meta["temperatures"] = temperatures
     # Guardar metadatos/resultado
     (d / "meta.json").write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
     (d / "results.json").write_text(json.dumps(results, ensure_ascii=False, indent=2), encoding="utf-8")

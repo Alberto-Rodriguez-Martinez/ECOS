@@ -52,3 +52,6 @@ hardware/scanner/scanner_session.json
 # GUI session (per-machine: gains, window, Arduino port)
 acquisition/ecos_gui_session.json
 acquisition/ecos_gui_session_sim.json
+
+# Debug data created by hand (local only)
+debug/

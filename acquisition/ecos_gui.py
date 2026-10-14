@@ -115,6 +115,9 @@ except Exception as _bd_err:      # keep the original naming if the module canno
     experiment_name = None
     print(f"[ecos_gui] BD_Experimentos_PVA unavailable: {_bd_err}")
 
+from session_io import keep_damaged, load_session  # noqa: E402
+
+_HW_ERROR = None                  # why the hardware could not be loaded (not with --demo)
 if _ARGS.demo:
     _HW_AVAILABLE = False
     print("[ecos_gui] Demo mode — hardware import skipped (--demo flag).")
@@ -135,6 +138,7 @@ else:
         print("[ecos_gui] Hardware modules loaded OK.")
     except Exception as _hw_err:
         _HW_AVAILABLE = False
+        _HW_ERROR = str(_hw_err)
         print(f"[ecos_gui] Demo mode — hardware not available: {_hw_err}")
 
 DEFAULT_GAIN_CH1  = 65
@@ -150,6 +154,12 @@ AVG_N             = 25
 REALTIME_INTERVAL = 34       # ms (~30 fps)
 DEFAULT_COM       = "COM3"
 AVG_MAX_ATTEMPTS_FACTOR = 4  # captures tried per requested average before giving up
+# Point measurement: the temperature read at s_PE + s_TT and at s_W are kept apart;
+# beyond this difference of their means (°C) a warning is shown (never blocks).
+# 0.2 °C ≈ 0.3 m/s of c_w near 36 °C (≈ 0.6 m/s near 20 °C), twice the 0.1 °C the
+# drift tolerance of the scans is set at.
+TEMP_DIFF_WARN_C = 0.2
+TEMP_PURPOSES = {'pett': 's_PE + s_TT', 'wp': 's_W', 'button': 'Read from Arduino'}
 
 # ADC resolution of the SeDaq. It cannot be read from the equipment (SeDaqDLL
 # gives uint16 buffers and no query), so 10 bits is ASSUMED, as everywhere in
@@ -166,9 +176,23 @@ DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'data'
 
 # The hardware session (Smin–Smax, gains... of the real set-up) is never touched by a
 # simulator run: the simulator has its own file, and tests pass a temporary one.
-SESSION_FILE = (_ARGS.session or os.environ.get('ECOS_GUI_SESSION') or os.path.join(
-    os.path.dirname(os.path.abspath(__file__)),
-    'ecos_gui_session_sim.json' if _SIM_MODE else 'ecos_gui_session.json'))
+HW_SESSION_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                               'ecos_gui_session.json')
+SIM_SESSION_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                'ecos_gui_session_sim.json')
+_SESSION_EXPLICIT = _ARGS.session or os.environ.get('ECOS_GUI_SESSION')
+
+
+def session_file_for(simulated, explicit=None):
+    """--session / ECOS_GUI_SESSION when given; else the simulator's file for any
+    simulated run (asked for, or after a hardware failure), so a simulated run never
+    writes the hardware session."""
+    if explicit:
+        return explicit
+    return SIM_SESSION_FILE if simulated else HW_SESSION_FILE
+
+
+SESSION_FILE = session_file_for(_SIM_MODE, _SESSION_EXPLICIT)
 
 SIGNAL_YMIN = -0.5
 SIGNAL_YMAX =  0.5
@@ -300,9 +324,12 @@ class AcqState:
     TT_Ascan_win = None
     WP_Ascan_win = None
 
-    # Temperature and water speed at time of capture
+    # Temperature and water speed at time of capture: the LAST reading (the one the
+    # calculation uses); every reading is also kept apart in temp_readings
     T1 = T2 = None
     Cw1 = Cw2 = Cw_mean = None
+    temp_readings = None    # {'pett' | 'wp' | 'button': record}, set per window
+    temp_used = None        # key of the reading T1/T2/Cw_mean above come from
 
     # Gains (mirrored from UI for metadata)
     Gain_Ch1 = DEFAULT_GAIN_CH1
@@ -328,6 +355,7 @@ class EcosGUI(QMainWindow):
         self.resize(1400, 850)
 
         self._state           = AcqState()
+        self._state.temp_readings = {}
         self._reclen          = DEFAULT_RECLEN
         self._running         = True
         self._inspection_mode = False
@@ -336,8 +364,10 @@ class EcosGUI(QMainWindow):
         self._axis_cw         = None        # (c_w, source) frozen for the mm axis
         self._manual_temp     = None        # {T, time} of a temperature entered by hand
         self.session_notices  = []          # what was corrected when loading / saving
+        self._startup_notices = []          # shown in the status bar (simulated run, session)
         self._Cl              = None
         self._L               = None
+        hw_failure = None if _SIM_MODE else _HW_ERROR
 
         # ── Hardware connection ───────────────────────────────────────────────
         if _HW_AVAILABLE and not _SIM_MODE:
@@ -367,6 +397,7 @@ class EcosGUI(QMainWindow):
                 )
                 self._sedaq = SimSeDaq(reclen=DEFAULT_RECLEN)
                 self._demo  = True
+                hw_failure = f"initialisation failed: {e}"
         else:
             self._sedaq = SimSeDaq(reclen=DEFAULT_RECLEN)
             self._demo  = True
@@ -399,14 +430,28 @@ class EcosGUI(QMainWindow):
         if isinstance(self._sedaq, SimSeDaq):
             self._region.setRegion(list(self._sedaq.default_window()))
 
-        # ── Restore previous session ──────────────────────────────────────────
-        if os.path.exists(SESSION_FILE):
+        # ── Session file: a run simulated because the hardware failed uses the
+        #    simulator's session, never the hardware one (session_file_for) ──────
+        self._session_file = session_file_for(self._demo or _SIM_MODE, _SESSION_EXPLICIT)
+        if self._demo and hw_failure:
+            self.setWindowTitle(self.windowTitle() + "  —  SIMULATED (hardware failed)")
+            self._show_startup_notice(
+                f"SIMULATED run: the hardware could not be used ({hw_failure}). Signals are "
+                f"synthetic; session file: {self._session_file}.")
+
+        # ── Restore previous session (a damaged file is kept aside, defaults used) ──
+        data, notice = load_session(self._session_file)
+        if data is not None:
             try:
-                with open(SESSION_FILE) as f:
-                    self._restore_session(json.load(f))
-                self._apply_restored_hw()
-            except Exception:
-                pass
+                self._restore_session(data)
+            except Exception as e:
+                notice = keep_damaged(self._session_file, e)
+                self._restore_session({})
+                self._region.setRegion(list(self._default_region(self._reclen)))
+            self._apply_restored_hw()
+        if notice:
+            self._session_notice(notice)
+            self._show_startup_notice(notice)
 
         # ── Real-time acquisition timer ───────────────────────────────────────
         self._timer = QTimer()
@@ -431,17 +476,25 @@ class EcosGUI(QMainWindow):
         file_menu.addAction(act_save)
         file_menu.addAction(act_load)
 
+    def _show_startup_notice(self, text):
+        """Something the user must know about this run (simulated after a hardware
+        failure, damaged session): in the status bar for the whole session, and the
+        console."""
+        self._startup_notices.append(text)
+        print(f"[ecos_gui] {text}")
+        self.statusBar().showMessage("   |   ".join(self._startup_notices))
+
     def _save_session_to_file(self):
         try:
-            with open(SESSION_FILE, 'w') as f:
+            with open(self._session_file, 'w') as f:
                 json.dump(self._collect_session(), f, indent=2)
-            print(f"[ecos_gui] Session saved to {SESSION_FILE}")
+            print(f"[ecos_gui] Session saved to {self._session_file}")
         except Exception as e:
             QMessageBox.warning(self, "Save error", str(e))
 
     def _load_session_from_file(self):
         path, _ = QFileDialog.getOpenFileName(
-            self, "Load Session", os.path.dirname(SESSION_FILE), "JSON (*.json)"
+            self, "Load Session", os.path.dirname(self._session_file), "JSON (*.json)"
         )
         if not path:
             return
@@ -484,10 +537,10 @@ class EcosGUI(QMainWindow):
         if self._scanner_panel is not None:
             self._scanner_panel.shutdown()
         try:
-            with open(SESSION_FILE, 'w') as f:
+            with open(self._session_file, 'w') as f:
                 json.dump(self._collect_session(), f, indent=2)
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"[ecos_gui] Session not saved to {self._session_file}: {e}")
         if not self._demo:
             try:
                 self._sedaq.Close()
@@ -947,6 +1000,10 @@ class EcosGUI(QMainWindow):
         form.addRow("T2 [°C]:",  self._lbl_res_t2)
         form.addRow("Cl [m/s]:", self._lbl_res_cl)
         form.addRow("d [mm]:",   self._lbl_res_d)
+        # The temperature read at each acquisition, kept apart (both are saved)
+        self._lbl_res_temps = QLabel("s_PE + s_TT: —\ns_W: —")
+        self._lbl_res_temps.setWordWrap(True)
+        form.addRow("Readings:", self._lbl_res_temps)
         return box
 
     # ==========================================================================
@@ -1337,7 +1394,59 @@ class EcosGUI(QMainWindow):
     #  Temperature
     # ==========================================================================
     def _on_read_arduino(self):
-        self._read_temperature()
+        self._read_temperature_for('button')
+
+    def _read_temperature_for(self, purpose):
+        """
+        _read_temperature, and the reading kept apart under `purpose` ('pett', 'wp',
+        'button'), with its time and source. T1/T2/Cw_mean of the state stay the LAST
+        reading, the one the calculation uses (temp_used says which). The age of the
+        sample is not available: every reading opens the Arduino afresh.
+        """
+        if not self._read_temperature():
+            return False
+        st = self._state
+
+        def num(v):
+            return None if v is None else float(v)
+        now = time.time()
+        source = ("manual" if self._manual_temp is not None
+                  else "PT100" if _HW_AVAILABLE else "assumed (no hardware)")
+        st.temp_readings[purpose] = {
+            "purpose": TEMP_PURPOSES.get(purpose, purpose),
+            "T1": num(st.T1), "T2": num(st.T2), "Cw1": num(st.Cw1), "Cw2": num(st.Cw2),
+            "Cw_mean": num(st.Cw_mean), "time": now,
+            "time_iso": time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(now)),
+            "source": source, "age_s": None}
+        st.temp_used = purpose
+        self._update_temp_readings_label()
+        return True
+
+    def _update_temp_readings_label(self):
+        """The readings of s_PE + s_TT and of s_W, and a warning (never blocking) when
+        their means differ by more than TEMP_DIFF_WARN_C."""
+        r = self._state.temp_readings
+        parts = []
+        for key in ("pett", "wp"):
+            rec = r.get(key)
+            if rec is None:
+                parts.append(f"{TEMP_PURPOSES[key]}: —")
+                continue
+            parts.append(f"{TEMP_PURPOSES[key]}: T1 {rec['T1']:.2f} / T2 {rec['T2']:.2f} °C at "
+                         f"{rec['time_iso'][11:]} ({rec['source']})")
+        used = self._state.temp_used
+        if used:
+            parts.append(f"c_w used: the last reading ({TEMP_PURPOSES.get(used, used)})")
+        text, style = "\n".join(parts), ""
+        if r.get("pett") and r.get("wp"):
+            diff = abs((r["pett"]["T1"] + r["pett"]["T2"]) / 2.0
+                       - (r["wp"]["T1"] + r["wp"]["T2"]) / 2.0)
+            if diff > TEMP_DIFF_WARN_C:
+                text += (f"\n⚠ The two readings differ by {diff:.2f} °C (> {TEMP_DIFF_WARN_C} °C);"
+                         " c_w comes from the last one.")
+                style = "color: rgb(230, 120, 0);"
+        self._lbl_res_temps.setText(text)
+        self._lbl_res_temps.setStyleSheet(style)
 
     def _read_temperature(self):
         """Read temperature from Arduino. On failure, shows manual-entry dialog."""
@@ -1482,7 +1591,10 @@ class EcosGUI(QMainWindow):
     def _on_acquire_pett(self):
         self._timer.stop()
         try:
-            if not self._read_temperature():
+            if not self._read_temperature_for('pett'):
+                self._lbl_acq_status.setText(
+                    "s_PE + s_TT NOT acquired: no temperature (the Arduino did not answer "
+                    "and the manual entry was cancelled).")
                 return
             smin, smax = self._get_smin_smax()
             self._state.PE_Ascan = self._acquire_ch_avg(2, smin, smax)
@@ -1498,7 +1610,10 @@ class EcosGUI(QMainWindow):
     def _on_acquire_wp(self):
         self._timer.stop()
         try:
-            if not self._read_temperature():
+            if not self._read_temperature_for('wp'):
+                self._lbl_acq_status.setText(
+                    "s_W NOT acquired: no temperature (the Arduino did not answer and the "
+                    "manual entry was cancelled).")
                 return
             smin, smax = self._get_smin_smax()
             self._state.WP_Ascan = self._acquire_ch_avg(1, smin, smax)
@@ -2108,8 +2223,19 @@ class EcosGUI(QMainWindow):
     # ==========================================================================
     def _compute_results(self):
         st = self._state
-        if any(x is None for x in (st.TT_Ascan_win, st.WP_Ascan_win,
-                                       st.PE_Ascan_win, st.Cw_mean)):
+        missing = []
+        if any(x is None for x in (st.TT_Ascan_win, st.WP_Ascan_win, st.PE_Ascan_win)):
+            missing.append("the windowed signals: acquire s_PE + s_TT and s_W, then press "
+                           "Apply window")
+        if st.Cw_mean is None:
+            missing.append("the speed of sound in water (c_w): the water temperature has not "
+                           "been read. Acquire s_PE + s_TT again (it reads the PT100, or asks "
+                           "for the temperature if the Arduino does not answer), or press "
+                           "'Read from Arduino' in the Temperature block; then Apply window")
+        if missing:
+            QMessageBox.warning(self, "Results not computed",
+                                "Cl and d cannot be computed. Missing:\n\n- "
+                                + "\n- ".join(missing))
             return
         try:
             if _HW_AVAILABLE:
@@ -2217,6 +2343,20 @@ class EcosGUI(QMainWindow):
             "Cl":      self._Cl,
             "d":       self._L,
         }
+        # The reading of each acquisition, apart (raw-32-1.1). T1/T2/Cw*/Cw_mean above
+        # stay the last reading, the one the calculation used (cw_used_from).
+        readings = st.temp_readings or {}
+        temperatures = {
+            "pett": readings.get("pett"),
+            "wp": readings.get("wp"),
+            "cw_used_from": TEMP_PURPOSES.get(st.temp_used, st.temp_used),
+            "note": "pett: read at 'Acquire s_PE + s_TT'; wp: at 'Acquire s_W'. Cl and d "
+                    "use Cw_mean of the last reading (cw_used_from). age_s: not available "
+                    "(the Arduino is opened afresh for every reading).",
+        }
+        results.update(temperature_pett=temperatures["pett"],
+                       temperature_wp=temperatures["wp"],
+                       cw_used_from=temperatures["cw_used_from"])
 
         exp_name = self._txt_exp_name.text().strip()
         if not exp_name:
@@ -2227,6 +2367,7 @@ class EcosGUI(QMainWindow):
             self, "Choose save folder", _start
         )
         if not save_dir:
+            self._lbl_save_status.setText("Not saved: no folder chosen.")
             return
 
         try:
@@ -2242,6 +2383,7 @@ class EcosGUI(QMainWindow):
                     Signal_Ref=st.WP_Ascan,
                     base_dir=save_dir,
                     exp_name=self._txt_exp_name.text().strip() or None,
+                    temperatures=temperatures,
                 )
                 self._lbl_save_status.setText(f"Saved: {os.path.basename(exp_dir)}")
                 QMessageBox.information(self, "Saved",
